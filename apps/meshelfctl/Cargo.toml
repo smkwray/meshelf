@@ -1,0 +1,12 @@
+[package]
+name = "meshelfctl"
+description = "Headless meshelf enrollment helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+meshelf-bootstrap = { path = "../../crates/meshelf-bootstrap" }

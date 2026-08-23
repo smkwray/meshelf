@@ -8,12 +8,14 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use meshelf_core::DeviceId;
+use meshelf_identity::InstallationIdentity;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -36,6 +38,200 @@ pub struct TailStatus {
     pub peers: Vec<TailNode>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SshBootstrapRequest {
+    pub device_id: DeviceId,
+    pub node_id: String,
+    pub hostname: String,
+    pub addresses: Vec<IpAddr>,
+    pub public_key: Vec<u8>,
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl SshBootstrapRequest {
+    #[must_use]
+    pub fn signed(
+        device_id: DeviceId,
+        node_id: String,
+        hostname: String,
+        addresses: Vec<IpAddr>,
+        identity: &InstallationIdentity,
+    ) -> Self {
+        let mut request = Self {
+            device_id,
+            node_id,
+            hostname,
+            addresses,
+            public_key: identity.public_key().to_vec(),
+            signature: Vec::new(),
+        };
+        request.signature = identity.sign(&request.signing_bytes());
+        request
+    }
+
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_json::to_vec(&unsigned).expect("SSH bootstrap request is serializable")
+    }
+
+    #[must_use]
+    pub fn has_valid_signature(&self) -> bool {
+        InstallationIdentity::verify(&self.public_key, &self.signing_bytes(), &self.signature)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SshBootstrapResponse {
+    pub device_id: DeviceId,
+    pub node_id: String,
+    pub hostname: String,
+    pub addresses: Vec<IpAddr>,
+    pub public_key: Vec<u8>,
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl SshBootstrapResponse {
+    #[must_use]
+    pub fn signed(
+        device_id: DeviceId,
+        node_id: String,
+        hostname: String,
+        addresses: Vec<IpAddr>,
+        identity: &InstallationIdentity,
+    ) -> Self {
+        let mut response = Self {
+            device_id,
+            node_id,
+            hostname,
+            addresses,
+            public_key: identity.public_key().to_vec(),
+            signature: Vec::new(),
+        };
+        response.signature = identity.sign(&response.signing_bytes());
+        response
+    }
+
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_json::to_vec(&unsigned).expect("SSH bootstrap response is serializable")
+    }
+
+    #[must_use]
+    pub fn has_valid_signature(&self) -> bool {
+        InstallationIdentity::verify(&self.public_key, &self.signing_bytes(), &self.signature)
+    }
+}
+
+/// Existing SSH is an explicit owner-authorized bootstrap channel only. It is never a clipboard
+/// transport and never runs during background discovery.
+#[derive(Debug, Clone)]
+pub struct SshBootstrap {
+    binary: PathBuf,
+    target: String,
+}
+
+impl SshBootstrap {
+    #[must_use]
+    pub fn discover(node: &TailNode) -> Option<Self> {
+        let binary = locate_ssh_binary()?;
+        let mut targets = Vec::with_capacity(3);
+        targets.push(node.hostname.clone());
+        if let Some(dns_name) = &node.dns_name {
+            targets.push(dns_name.clone());
+        }
+        targets.extend(node.addresses.iter().map(ToString::to_string));
+        targets.dedup();
+
+        targets.into_iter().find_map(|target| {
+            let output = Command::new(&binary)
+                .args(["-G", "-o", "BatchMode=yes", &target])
+                .output()
+                .ok()?;
+            output.status.success().then_some(Self {
+                binary: binary.clone(),
+                target,
+            })
+        })
+    }
+
+    pub fn authorize(
+        &self,
+        request: &SshBootstrapRequest,
+    ) -> Result<SshBootstrapResponse, SshBootstrapError> {
+        let payload = serde_json::to_vec(request).map_err(SshBootstrapError::Encode)?;
+        if payload.len() > MAX_BOOTSTRAP_BYTES {
+            return Err(SshBootstrapError::TooLarge(payload.len()));
+        }
+        let mut child = Command::new(&self.binary)
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ForwardX11=no",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "PermitLocalCommand=no",
+                "-o",
+                "ConnectTimeout=5",
+                &self.target,
+                "meshelfctl",
+                "pair-stdio",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(SshBootstrapError::Launch)?;
+        child
+            .stdin
+            .take()
+            .ok_or(SshBootstrapError::NoStdin)?
+            .write_all(&payload)
+            .map_err(SshBootstrapError::Io)?;
+        let output = child.wait_with_output().map_err(SshBootstrapError::Io)?;
+        if !output.status.success() {
+            return Err(SshBootstrapError::RemoteFailure {
+                code: output.status.code(),
+                stderr: bounded_lossy(&output.stderr, 4096),
+            });
+        }
+        if output.stdout.len() > MAX_BOOTSTRAP_BYTES {
+            return Err(SshBootstrapError::TooLarge(output.stdout.len()));
+        }
+        serde_json::from_slice(&output.stdout).map_err(SshBootstrapError::Decode)
+    }
+}
+
+const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Error)]
+pub enum SshBootstrapError {
+    #[error("SSH bootstrap payload is {0} bytes; maximum is {MAX_BOOTSTRAP_BYTES}")]
+    TooLarge(usize),
+    #[error("could not encode SSH bootstrap request: {0}")]
+    Encode(serde_json::Error),
+    #[error("could not decode SSH bootstrap response: {0}")]
+    Decode(serde_json::Error),
+    #[error("SSH executable could not be started: {0}")]
+    Launch(std::io::Error),
+    #[error("SSH bootstrap process has no stdin")]
+    NoStdin,
+    #[error("SSH bootstrap I/O failed: {0}")]
+    Io(std::io::Error),
+    #[error("remote SSH bootstrap failed with exit code {code:?}: {stderr}")]
+    RemoteFailure { code: Option<i32>, stderr: String },
+}
+
 impl TailStatus {
     /// Return peers that are currently usable candidates for a bounded meshelf probe.
     ///
@@ -53,6 +249,10 @@ pub struct TrustedPeer {
     pub device_id: DeviceId,
     pub hostname: String,
     pub addresses: Vec<IpAddr>,
+    /// The peer's Ed25519 installation key. An absent key is legacy state and is not trusted by
+    /// the production network gate until it is upgraded through SSH bootstrap.
+    #[serde(default)]
+    pub public_key: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -139,6 +339,51 @@ impl PeerRegistry {
             device_id,
             hostname: node.hostname.clone(),
             addresses: node.addresses.clone(),
+            public_key: Vec::new(),
+        });
+        self.peers.sort_by(|left, right| {
+            left.hostname
+                .to_ascii_lowercase()
+                .cmp(&right.hostname.to_ascii_lowercase())
+        });
+        Ok(())
+    }
+
+    /// Record reciprocal trust established by the explicit SSH bootstrap. The key is part of the
+    /// durable binding: a later process cannot reuse the node ID and address without the key.
+    pub fn accept_signed(
+        &mut self,
+        node: &TailNode,
+        device_id: DeviceId,
+        public_key: Vec<u8>,
+    ) -> Result<(), RegistryError> {
+        if public_key.len() != 32 {
+            return Err(RegistryError::InvalidPublicKey);
+        }
+        let node_id = node
+            .node_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(RegistryError::MissingNodeId)?;
+        if let Some(existing) = self.peers.iter_mut().find(|peer| peer.node_id == node_id) {
+            if existing.device_id != device_id
+                || (!existing.public_key.is_empty() && existing.public_key != public_key)
+            {
+                return Err(RegistryError::IdentityConflict {
+                    node_id: node_id.to_owned(),
+                });
+            }
+            existing.public_key = public_key;
+            existing.hostname = node.hostname.clone();
+            existing.addresses = node.addresses.clone();
+            return Ok(());
+        }
+        self.peers.push(TrustedPeer {
+            node_id: node_id.to_owned(),
+            device_id,
+            hostname: node.hostname.clone(),
+            addresses: node.addresses.clone(),
+            public_key,
         });
         self.peers.sort_by(|left, right| {
             left.hostname
@@ -194,6 +439,8 @@ const MAX_REGISTRY_BYTES: usize = 64 * 1024;
 pub enum RegistryError {
     #[error("accepted Tailscale node has no stable node ID")]
     MissingNodeId,
+    #[error("accepted meshelf identity does not contain a 32-byte public key")]
+    InvalidPublicKey,
     #[error("Tailscale node {node_id} is already bound to another meshelf identity")]
     IdentityConflict { node_id: String },
     #[error("peer registry I/O error: {0}")]
@@ -378,6 +625,24 @@ pub fn locate_tailscale_binary() -> Option<PathBuf> {
         .find(|path| is_file(path))
 }
 
+#[must_use]
+pub fn locate_ssh_binary() -> Option<PathBuf> {
+    let executable = if cfg!(windows) {
+        OsString::from("ssh.exe")
+    } else {
+        OsString::from("ssh")
+    };
+    find_on_path(&executable).or_else(|| {
+        [
+            PathBuf::from("/usr/bin/ssh"),
+            PathBuf::from("/usr/local/bin/ssh"),
+            PathBuf::from("C:\\Windows\\System32\\OpenSSH\\ssh.exe"),
+        ]
+        .into_iter()
+        .find(|path| is_file(path))
+    })
+}
+
 fn find_on_path(executable: &OsString) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|path| {
         env::split_paths(&path)
@@ -501,6 +766,34 @@ mod tests {
             .expect("first accept");
         assert!(matches!(
             registry.accept(&node, DeviceId::new()),
+            Err(RegistryError::IdentityConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn signed_acceptance_binds_public_key() {
+        let mut registry = PeerRegistry::default();
+        let identity = meshelf_identity::InstallationIdentity::generate();
+        let node = TailNode {
+            node_id: Some("bzot-node".to_owned()),
+            hostname: "BZOT".to_owned(),
+            dns_name: None,
+            addresses: vec!["100.77.0.2".parse().expect("address")],
+            online: true,
+            active: true,
+        };
+        registry
+            .accept_signed(&node, identity.device_id, identity.public_key().to_vec())
+            .expect("signed accept");
+        assert_eq!(registry.peers()[0].public_key, identity.public_key());
+        assert!(matches!(
+            registry.accept_signed(
+                &node,
+                identity.device_id,
+                meshelf_identity::InstallationIdentity::generate()
+                    .public_key()
+                    .to_vec()
+            ),
             Err(RegistryError::IdentityConflict { .. })
         ));
     }

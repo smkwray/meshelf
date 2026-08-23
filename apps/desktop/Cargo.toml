@@ -12,11 +12,14 @@ publish = false
 anyhow.workspace = true
 dirs.workspace = true
 meshelf-core = { path = "../../crates/meshelf-core" }
+meshelf-bootstrap = { path = "../../crates/meshelf-bootstrap" }
+meshelf-identity = { path = "../../crates/meshelf-identity" }
 meshelf-net = { path = "../../crates/meshelf-net" }
 meshelf-platform = { path = "../../crates/meshelf-platform" }
 meshelf-protocol = { path = "../../crates/meshelf-protocol" }
 meshelf-store = { path = "../../crates/meshelf-store" }
 meshelf-tailscale = { path = "../../crates/meshelf-tailscale" }
+serde_json.workspace = true
 slint.workspace = true
 tokio.workspace = true
 tracing.workspace = true

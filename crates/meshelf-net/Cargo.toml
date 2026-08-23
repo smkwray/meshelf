@@ -8,6 +8,7 @@ license-file.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+meshelf-identity = { path = "../meshelf-identity" }
 meshelf-core = { path = "../meshelf-core" }
 meshelf-protocol = { path = "../meshelf-protocol" }
 thiserror.workspace = true

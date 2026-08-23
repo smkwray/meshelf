@@ -9,14 +9,18 @@ use std::{
 
 use anyhow::Result;
 use meshelf_core::{DeviceId, Receipt, TextEnvelope};
+use meshelf_identity::InstallationIdentity;
 use meshelf_net::{
-    CoreEnvelopeHandler, PeerClient, ServerIdentity, TailnetPeerAllowList,
+    CoreEnvelopeHandler, PeerClient, ServerIdentity, TrustDecision, TrustGate,
     bind_discovered_tailscale_address, serve,
 };
 use meshelf_platform::{ClipboardSource, ClipboardWorker};
 use meshelf_protocol::{CAP_TEXT_CLIPBOARD_PUSH_V1, ClientHello, ServerHello};
 use meshelf_store::RedbReceiveStore;
-use meshelf_tailscale::{CliPeerDiscovery, InstallationState, PeerDiscovery, TailNode, TailStatus};
+use meshelf_tailscale::{
+    CliPeerDiscovery, InstallationState, PeerDiscovery, SshBootstrap, SshBootstrapRequest,
+    SshBootstrapResponse, TailNode, TailStatus,
+};
 use slint::ComponentHandle;
 use tokio::{runtime::Runtime, sync::watch};
 use tracing_subscriber::EnvFilter;
@@ -35,41 +39,46 @@ struct PendingPeer {
 struct PeerView {
     name: String,
     online: bool,
-    pending: bool,
+    approval_available: bool,
     status: String,
 }
 
 struct DiscoveryState {
     state_path: PathBuf,
+    identity: InstallationIdentity,
     installation: InstallationState,
     device_name: String,
     discovery: Option<CliPeerDiscovery>,
     last_status: Option<TailStatus>,
     pending: Option<PendingPeer>,
     selected_device: Option<DeviceId>,
-    gate: Arc<TailnetPeerAllowList>,
 }
 
 impl DiscoveryState {
     fn load(state_path: PathBuf, device_name: String) -> Result<Self, String> {
-        let installation = InstallationState::load(&state_path)
+        let identity = InstallationIdentity::load_or_create()
+            .map_err(|error| format!("could not load meshelf installation identity: {error}"))?;
+        let loaded = InstallationState::load(&state_path)
             .map_err(|error| format!("could not load meshelf state: {error}"))?;
-        let gate = Arc::new(TailnetPeerAllowList::new(
-            installation
-                .peers
-                .peers()
-                .iter()
-                .map(|peer| (peer.device_id, peer.addresses.clone())),
-        ));
+        let installation = if loaded.device_id == identity.device_id {
+            loaded
+        } else {
+            // A state file from another installation must never retain trust after a new
+            // credential-store identity is created or restored.
+            InstallationState {
+                device_id: identity.device_id,
+                peers: Default::default(),
+            }
+        };
         Ok(Self {
             state_path,
+            identity,
             installation,
             device_name,
             discovery: CliPeerDiscovery::discover().ok(),
             last_status: None,
             pending: None,
             selected_device: None,
-            gate,
         })
     }
 
@@ -85,7 +94,6 @@ impl DiscoveryState {
         self.installation
             .save(&self.state_path)
             .map_err(|error| format!("could not save meshelf state: {error}"))?;
-        self.replace_gate();
         self.last_status = Some(status.clone());
         self.pending = None;
         self.selected_device = None;
@@ -106,47 +114,23 @@ impl DiscoveryState {
                 {
                     continue;
                 }
-                let trusted_for_node = node
-                    .node_id
-                    .as_deref()
-                    .and_then(|node_id| self.installation.peers.by_node_id(node_id))
-                    .is_some_and(|peer| peer.device_id == server.device_id);
-                if trusted_for_node {
-                    self.selected_device = Some(server.device_id);
-                } else {
-                    self.pending = Some(PendingPeer {
-                        node: node.clone(),
-                        server,
-                    });
+                if !server.has_valid_signature() {
+                    continue;
                 }
+                self.pending = Some(PendingPeer {
+                    node: node.clone(),
+                    server,
+                });
                 return Ok(self.view());
             }
         }
         Ok(self.view())
     }
 
-    fn accept_pending(&mut self) -> Result<PeerView, String> {
-        let pending = self
-            .pending
-            .clone()
-            .ok_or_else(|| "no new meshelf device is waiting for acceptance".to_owned())?;
-        self.installation
-            .peers
-            .accept(&pending.node, pending.server.device_id)
-            .map_err(|error| format!("could not accept device: {error}"))?;
-        self.installation
-            .save(&self.state_path)
-            .map_err(|error| format!("could not save accepted device: {error}"))?;
-        self.replace_gate();
-        self.selected_device = Some(pending.server.device_id);
-        self.pending = None;
-        Ok(self.view())
-    }
-
     fn send_text(&self, text: &str) -> Result<Receipt, String> {
-        let device_id = self
-            .selected_device
-            .ok_or_else(|| "accept a discovered meshelf device first".to_owned())?;
+        let device_id = self.selected_device.ok_or_else(|| {
+            "this device is discovered but unpaired; use Trust both ways using SSH first".to_owned()
+        })?;
         let peer = self
             .installation
             .peers
@@ -159,16 +143,17 @@ impl DiscoveryState {
             .ok_or_else(|| "trusted device has no current Tailscale address".to_owned())?;
         let now = now_unix_ms();
         let envelope = TextEnvelope::clipboard_push(
-            self.installation.device_id,
+            self.identity.device_id,
             peer.device_id,
             now,
             Some(now.saturating_add(30_000)),
             text,
         );
-        let hello = ClientHello::new(
-            self.installation.device_id,
+        let hello = ClientHello::signed(
+            self.identity.device_id,
             self.device_name.clone(),
             DeviceId::new().to_string(),
+            &self.identity,
         );
         let runtime =
             Runtime::new().map_err(|error| format!("send runtime unavailable: {error}"))?;
@@ -177,18 +162,58 @@ impl DiscoveryState {
                 SocketAddr::new(address, MESHELF_PORT),
                 hello,
                 envelope,
+                &peer.public_key,
             ))
             .map_err(|error| format!("send failed: {error}"))
     }
 
-    fn replace_gate(&self) {
-        self.gate.replace(
-            self.installation
-                .peers
-                .peers()
-                .iter()
-                .map(|peer| (peer.device_id, peer.addresses.clone())),
-        );
+    fn approve_pending(&mut self) -> Result<PeerView, String> {
+        let pending = self
+            .pending
+            .clone()
+            .ok_or_else(|| "no discovered meshelf device is waiting for approval".to_owned())?;
+        let local_status = self
+            .last_status
+            .as_ref()
+            .ok_or_else(|| "local Tailscale identity is unavailable".to_owned())?;
+        let node_id = local_status
+            .self_node
+            .node_id
+            .clone()
+            .ok_or_else(|| "local Tailscale node has no stable node ID".to_owned())?;
+        let bootstrap = SshBootstrap::discover(&pending.node).ok_or_else(|| {
+            "no configured SSH route was found for this Tailscale peer".to_owned()
+        })?;
+        let response = bootstrap
+            .authorize(&SshBootstrapRequest::signed(
+                self.identity.device_id,
+                node_id,
+                local_status.self_node.hostname.clone(),
+                local_status.self_node.addresses.clone(),
+                &self.identity,
+            ))
+            .map_err(|error| format!("one-side SSH bootstrap failed: {error}"))?;
+        if response.device_id != pending.server.device_id
+            || response.node_id != pending.node.node_id.clone().unwrap_or_default()
+            || response.public_key != pending.server.public_key
+            || !response.has_valid_signature()
+        {
+            return Err("SSH bootstrap answered with a different meshelf identity".to_owned());
+        }
+        self.installation
+            .peers
+            .accept_signed(
+                &response_to_tail_node(&response),
+                pending.server.device_id,
+                response.public_key.clone(),
+            )
+            .map_err(|error| format!("could not record reciprocal peer approval: {error}"))?;
+        self.installation
+            .save(&self.state_path)
+            .map_err(|error| format!("could not save reciprocal peer approval: {error}"))?;
+        self.selected_device = Some(pending.server.device_id);
+        self.pending = None;
+        Ok(self.view())
     }
 
     fn view(&self) -> PeerView {
@@ -196,9 +221,9 @@ impl DiscoveryState {
             return PeerView {
                 name: pending.server.device_name.clone(),
                 online: false,
-                pending: true,
+                approval_available: SshBootstrap::discover(&pending.node).is_some(),
                 status: format!(
-                    "New meshelf device {} discovered on Tailscale; accept it once",
+                    "{} discovered on Tailscale; approve once via existing SSH",
                     pending.server.device_name
                 ),
             };
@@ -209,15 +234,59 @@ impl DiscoveryState {
             return PeerView {
                 name: peer.hostname.clone(),
                 online: true,
-                pending: false,
+                approval_available: false,
                 status: format!("{} is ready for explicit text sends", peer.hostname),
             };
         }
         PeerView {
             name: "Not configured".to_owned(),
             online: false,
-            pending: false,
+            approval_available: false,
             status: "No meshelf peer discovered on Tailscale".to_owned(),
+        }
+    }
+}
+
+fn response_to_tail_node(response: &SshBootstrapResponse) -> TailNode {
+    TailNode {
+        node_id: Some(response.node_id.clone()),
+        hostname: response.hostname.clone(),
+        dns_name: None,
+        addresses: response.addresses.clone(),
+        online: true,
+        active: true,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FileBackedTrustGate {
+    state_path: PathBuf,
+}
+
+impl TrustGate for FileBackedTrustGate {
+    fn authorize(
+        &self,
+        remote: SocketAddr,
+        hello: &meshelf_protocol::ClientHello,
+    ) -> TrustDecision {
+        let Ok(state) = InstallationState::load(&self.state_path) else {
+            return TrustDecision::Deny("local meshelf state is unavailable".to_owned());
+        };
+        match state.peers.by_device_id(hello.device_id) {
+            Some(peer)
+                if peer.addresses.contains(&remote.ip())
+                    && peer.public_key == hello.public_key
+                    && hello.has_valid_signature() =>
+            {
+                TrustDecision::Allow
+            }
+            Some(_) if hello.public_key.len() != 32 => {
+                TrustDecision::Deny("peer hello has no valid installation key".to_owned())
+            }
+            Some(_) => TrustDecision::Deny(
+                "approved peer key or Tailscale address does not match".to_owned(),
+            ),
+            None => TrustDecision::Deny("meshelf installation has not been approved".to_owned()),
         }
     }
 }
@@ -271,10 +340,12 @@ fn start_listener(
     let handler = Arc::new(CoreEnvelopeHandler::new(receiver));
     let (shutdown, shutdown_rx) = watch::channel(false);
     let identity = ServerIdentity {
-        device_id: state.installation.device_id,
+        signing_identity: state.identity.clone(),
         device_name: state.device_name.clone(),
     };
-    let gate = state.gate.clone();
+    let gate = Arc::new(FileBackedTrustGate {
+        state_path: state.state_path.clone(),
+    });
     let worker = thread::Builder::new()
         .name("meshelf-network".to_owned())
         .spawn(move || {
@@ -300,7 +371,7 @@ fn start_listener(
 fn apply_peer_view(window: &MainWindow, view: PeerView) {
     window.set_default_peer(view.name.into());
     window.set_default_peer_online(view.online);
-    window.set_default_peer_pending(view.pending);
+    window.set_default_peer_approval_available(view.approval_available);
     window.set_status_text(view.status.into());
 }
 
@@ -313,6 +384,12 @@ fn now_unix_ms() -> u64 {
 }
 
 fn main() -> Result<()> {
+    if std::env::args()
+        .any(|argument| argument == "pair-stdio" || argument == "--ssh-bootstrap-stdin")
+    {
+        return meshelf_bootstrap::run_stdio();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -345,7 +422,7 @@ fn main() -> Result<()> {
             Err(error) => PeerView {
                 name: "Not configured".to_owned(),
                 online: false,
-                pending: false,
+                approval_available: false,
                 status: error,
             },
         }
@@ -438,14 +515,14 @@ fn main() -> Result<()> {
     {
         let window_weak = window.as_weak();
         let app_state = app_state.clone();
-        window.on_accept_default(move || {
+        window.on_approve_default(move || {
             let Some(window) = window_weak.upgrade() else {
                 return;
             };
             let result = app_state
                 .lock()
                 .map_err(|_| "app state is unavailable".to_owned())
-                .and_then(|mut state| state.accept_pending());
+                .and_then(|mut state| state.approve_pending());
             match result {
                 Ok(view) => apply_peer_view(&window, view),
                 Err(error) => window.set_status_text(error.into()),

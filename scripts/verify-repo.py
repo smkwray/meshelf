@@ -53,6 +53,10 @@ def digest(path: Path) -> str:
     return value.hexdigest()
 
 
+def is_sync_artifact(part: str) -> bool:
+    return part.startswith("~syncthing~") or "sync-conflict-" in part
+
+
 def check_required() -> None:
     missing = [relative for relative in REQUIRED if not (ROOT / relative).is_file()]
     if missing:
@@ -63,7 +67,7 @@ def check_text_and_structured_files() -> None:
     for path in sorted(ROOT.rglob("*")):
         if not path.is_file() or any(
             part in {".git", "target", "__pycache__", ".venv", "do", "status", "_icon_work"}
-            or part.startswith("~syncthing~")
+            or is_sync_artifact(part)
             for part in path.relative_to(ROOT).parts
         ) or path.name in {"AGENTS.md", "CLAUDE.md", ".env"} or path.suffix in {".pyc", ".pyo"}:
             continue
@@ -161,7 +165,7 @@ def check_manifest(allow_stale: bool) -> None:
         and path.name not in {"AGENTS.md", "CLAUDE.md", ".env"}
         and not any(
             part in {".git", "target", ".idea", ".vscode", "local-data", "__pycache__", ".venv", "do", "status", "_icon_work"}
-            or part.startswith("~syncthing~")
+            or is_sync_artifact(part)
             for part in path.relative_to(ROOT).parts
         )
     }
@@ -197,7 +201,7 @@ def main() -> int:
         and "do" not in path.parts
         and "status" not in path.parts
         and "_icon_work" not in path.parts
-        and not any(part.startswith("~syncthing~") for part in path.parts)
+        and not any(is_sync_artifact(part) for part in path.parts)
     )
     print(f"PASS: meshelf repository structure and integrity checks ({files} files)")
     return 0

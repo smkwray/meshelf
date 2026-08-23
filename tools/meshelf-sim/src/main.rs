@@ -5,9 +5,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use meshelf_core::{
-    ClipboardError, ClipboardSink, DeviceId, MemoryReceiveStore, ReceiptCode, ReceiverService,
-    TextEnvelope,
+    ClipboardError, ClipboardSink, MemoryReceiveStore, ReceiptCode, ReceiverService, TextEnvelope,
 };
+use meshelf_identity::InstallationIdentity;
 use meshelf_net::{CoreEnvelopeHandler, ExactDeviceAllowList, PeerClient, ServerIdentity, serve};
 use meshelf_protocol::ClientHello;
 use tokio::{net::TcpListener, sync::watch};
@@ -27,8 +27,10 @@ impl ClipboardSink for SimClipboard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let bmst = DeviceId::new();
-    let bzot = DeviceId::new();
+    let bmst_identity = InstallationIdentity::generate();
+    let bzot_identity = InstallationIdentity::generate();
+    let bmst = bmst_identity.device_id;
+    let bzot = bzot_identity.device_id;
     let clipboard = Arc::new(SimClipboard::default());
     let service = Arc::new(ReceiverService::new(
         bzot,
@@ -43,7 +45,7 @@ async fn main() -> Result<()> {
     let server = tokio::spawn(serve(
         listener,
         ServerIdentity {
-            device_id: bzot,
+            signing_identity: bzot_identity.clone(),
             device_name: "BZOT".to_owned(),
         },
         Arc::new(ExactDeviceAllowList::new([bmst])),
@@ -63,16 +65,18 @@ async fn main() -> Result<()> {
     let first = client
         .push(
             address,
-            ClientHello::new(bmst, "BMST", "simulation-1"),
+            ClientHello::signed(bmst, "BMST", "simulation-1", &bmst_identity),
             message.clone(),
+            &bzot_identity.public_key(),
         )
         .await
         .context("first send")?;
     let duplicate = client
         .push(
             address,
-            ClientHello::new(bmst, "BMST", "simulation-2"),
+            ClientHello::signed(bmst, "BMST", "simulation-2", &bmst_identity),
             message,
+            &bzot_identity.public_key(),
         )
         .await
         .context("duplicate send")?;

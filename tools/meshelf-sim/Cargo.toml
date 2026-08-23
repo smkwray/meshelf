@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 meshelf-core = { path = "../../crates/meshelf-core" }
+meshelf-identity = { path = "../../crates/meshelf-identity" }
 meshelf-net = { path = "../../crates/meshelf-net" }
 meshelf-protocol = { path = "../../crates/meshelf-protocol" }
 tokio.workspace = true

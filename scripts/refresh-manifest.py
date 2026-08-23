@@ -29,13 +29,17 @@ EXCLUDED_FILES = {
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 
 
+def is_sync_artifact(part: str) -> bool:
+    return part.startswith("~syncthing~") or "sync-conflict-" in part
+
+
 def included_files() -> list[Path]:
     result: list[Path] = []
     for path in ROOT.rglob("*"):
         if not path.is_file():
             continue
         if any(
-            part in EXCLUDED_PARTS or part.startswith("~syncthing~")
+            part in EXCLUDED_PARTS or is_sync_artifact(part)
             for part in path.relative_to(ROOT).parts
         ):
             continue

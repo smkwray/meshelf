@@ -16,14 +16,14 @@ export component MainWindow inherits Window {
     in property <string> device-name: "This device";
     in property <string> default-peer: "Not configured";
     in property <bool> default-peer-online: false;
-    in property <bool> default-peer-pending: false;
+    in property <bool> default-peer-approval-available: false;
     in-out property <string> draft-text: "";
-    in-out property <string> status-text: "Tailscale discovery is ready; accept a device once before sending";
+    in-out property <string> status-text: "Tailscale discovery is ready; signed pairing is required before sending";
 
     callback paste-clipboard();
     callback send-default(string);
     callback refresh-peers();
-    callback accept-default();
+    callback approve-default();
 
     VerticalBox {
         padding: 22px;
@@ -117,9 +117,9 @@ export component MainWindow inherits Window {
             }
             Rectangle { horizontal-stretch: 1; }
             Button {
-                text: "Accept device";
-                enabled: root.default-peer-pending;
-                clicked => { root.accept-default(); }
+                text: "Trust both ways using SSH";
+                enabled: root.default-peer-approval-available;
+                clicked => { root.approve-default(); }
             }
             Button {
                 text: "Refresh peers";
@@ -152,7 +152,7 @@ export component MainWindow inherits Window {
         }
 
         Text {
-        text: "Send is available only while this window is active and a device is accepted.";
+        text: "Send is available only while this window is active and signed pairing is complete.";
             color: #747d88;
             font-size: 11px;
             horizontal-alignment: center;

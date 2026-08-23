@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 
 use meshelf_core::{DeviceId, MAX_TEXT_BYTES, PROTOCOL_VERSION, Receipt, TextEnvelope};
+use meshelf_identity::InstallationIdentity;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -19,6 +20,10 @@ pub struct ClientHello {
     pub device_name: String,
     pub nonce: String,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub public_key: Vec<u8>,
+    #[serde(default)]
+    pub signature: Vec<u8>,
 }
 
 impl ClientHello {
@@ -34,7 +39,34 @@ impl ClientHello {
             device_name: device_name.into(),
             nonce: nonce.into(),
             capabilities: vec![CAP_TEXT_CLIPBOARD_PUSH_V1.to_owned()],
+            public_key: Vec::new(),
+            signature: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn signed(
+        device_id: DeviceId,
+        device_name: impl Into<String>,
+        nonce: impl Into<String>,
+        identity: &InstallationIdentity,
+    ) -> Self {
+        let mut hello = Self::new(device_id, device_name, nonce);
+        hello.public_key = identity.public_key().to_vec();
+        hello.signature = identity.sign(&hello.signing_bytes());
+        hello
+    }
+
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_json::to_vec(&unsigned).expect("client hello is serializable")
+    }
+
+    #[must_use]
+    pub fn has_valid_signature(&self) -> bool {
+        InstallationIdentity::verify(&self.public_key, &self.signing_bytes(), &self.signature)
     }
 }
 
@@ -46,6 +78,48 @@ pub struct ServerHello {
     pub accepted: bool,
     pub reason: Option<String>,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub public_key: Vec<u8>,
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl ServerHello {
+    #[must_use]
+    pub fn signed(
+        protocol_version: u16,
+        device_id: DeviceId,
+        device_name: String,
+        accepted: bool,
+        reason: Option<String>,
+        capabilities: Vec<String>,
+        identity: &InstallationIdentity,
+    ) -> Self {
+        let mut hello = Self {
+            protocol_version,
+            device_id,
+            device_name,
+            accepted,
+            reason,
+            capabilities,
+            public_key: identity.public_key().to_vec(),
+            signature: Vec::new(),
+        };
+        hello.signature = identity.sign(&hello.signing_bytes());
+        hello
+    }
+
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_json::to_vec(&unsigned).expect("server hello is serializable")
+    }
+
+    #[must_use]
+    pub fn has_valid_signature(&self) -> bool {
+        InstallationIdentity::verify(&self.public_key, &self.signing_bytes(), &self.signature)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +252,18 @@ mod tests {
         frame.extend_from_slice(b"tiny");
         let error = read_frame(&mut Cursor::new(frame)).expect_err("truncated frame");
         assert!(matches!(error, ProtocolError::Io(_)));
+    }
+
+    #[test]
+    fn signed_hello_rejects_field_and_signature_mutations() {
+        let identity = InstallationIdentity::generate();
+        let mut hello = ClientHello::signed(identity.device_id, "BMST", "nonce", &identity);
+        assert!(hello.has_valid_signature());
+        hello.device_name = "forged".to_owned();
+        assert!(!hello.has_valid_signature());
+        hello.device_name = "BMST".to_owned();
+        hello.signature[0] ^= 1;
+        assert!(!hello.has_valid_signature());
     }
 
     #[tokio::test]

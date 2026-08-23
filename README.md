@@ -10,7 +10,7 @@ open meshelf -> click Paste clipboard -> click Send -> paste normally on the oth
 
 No machine is a controller, server, primary, leader, or canonical store. Every installation has the same role. A normal copy operation never causes network activity. Only an explicit meshelf action reads or sends clipboard content.
 
-This repository is an **agent-ready implementation seed**, not a production release. It contains the locked product contract, architecture, protocol/state-machine foundations, a cross-platform UI shell, on-demand Tailscale discovery, persisted one-time peer acceptance, platform adapters, local simulation, bounded work orders, test plan, release scaffolding, and audit materials needed for local agents to continue implementation without reopening settled architecture.
+This repository is an **agent-ready implementation seed**, not a production release. It contains the locked product contract, architecture, protocol/state-machine foundations, a cross-platform UI shell, on-demand Tailscale discovery of untrusted meshelf candidates, platform adapters, local simulation, bounded work orders, test plan, release scaffolding, and audit materials needed for local agents to continue implementation without reopening settled architecture.
 
 ## Locked v1 behavior
 
@@ -84,8 +84,10 @@ The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may requi
 - Direct one-message TCP client/listener with timeouts.
 - Deny-by-default trust gate.
 - Tailscale `status --json` parser and binary locator.
-- On-demand Tailscale peer probes, a persisted one-time acceptance registry, and a listener bound only to a discovered Tailscale address.
-- Explicit text send/receive wiring through the desktop UI after a peer is accepted.
+- On-demand Tailscale peer probes and a listener bound only to a discovered Tailscale address.
+- Protected per-installation Ed25519 identity, signed hellos, and durable peer-key bindings.
+- Tailscale discovery plus one-sided `Trust both ways using SSH` enrollment; the remote side needs
+  no physical click, and ordinary clipboard sends use direct meshelf TCP afterward.
 - Cross-platform explicit clipboard adapter using `arboard`.
 - Window-local explicit send controls; meshelf does not register global hotkeys.
 - Slint 1.17 desktop window and system-tray shell.
@@ -94,6 +96,6 @@ The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may requi
 
 ## Deliberately unfinished
 
-The project is not safe for everyday clipboard use until the release gate in [`docs/05_TEST_PLAN.md`](docs/05_TEST_PLAN.md) passes. The largest open items are application-level key generation and signed pairing/revocation, native notifications, start-at-login, installers/signing, and real two-device plus three-platform testing. The current low-friction acceptance gate binds a remembered meshelf identity to a Tailscale node and address; it is an MVP tailnet trust path, not the final signed-identity design.
+The project is not safe for everyday clipboard use until the release gate in [`docs/05_TEST_PLAN.md`](docs/05_TEST_PLAN.md) passes. The largest open items are native credential-store evidence on all three platforms, Tailscale `WhoIs`, a packaged `meshelfctl` bootstrap path, listener lifecycle, notifications, start-at-login, installers/signing, and real two-device plus three-platform testing. Discovery never creates trust; only an explicit one-sided SSH enrollment (or a future human-verification path) creates the signed reciprocal binding.
 
 See the private `do/state.md` note in a synced development workspace for the exact boundary.

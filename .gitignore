@@ -25,6 +25,7 @@ docs/
 /~syncthing~*
 **/~syncthing~*
 **/.syncthing*
+**/*.sync-conflict-*
 assets/~syncthing~*
 apps/desktop/assets/~syncthing~*
 /status/

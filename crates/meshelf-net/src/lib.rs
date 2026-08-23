@@ -27,8 +27,20 @@ use tokio::{
 
 #[derive(Debug, Clone)]
 pub struct ServerIdentity {
-    pub device_id: DeviceId,
+    pub signing_identity: meshelf_identity::InstallationIdentity,
     pub device_name: String,
+}
+
+impl ServerIdentity {
+    #[must_use]
+    pub fn device_id(&self) -> DeviceId {
+        self.signing_identity.device_id
+    }
+
+    #[must_use]
+    pub fn public_key(&self) -> Vec<u8> {
+        self.signing_identity.public_key().to_vec()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,12 +87,10 @@ impl TrustGate for ExactDeviceAllowList {
     }
 }
 
-/// Minimal one-time-acceptance gate for a trusted Tailscale peer.
+/// Development-only address gate for test scaffolding.
 ///
-/// The registry that builds this gate is responsible for binding the accepted meshelf identity
-/// to the current Tailscale node addresses. This gate then checks both the claimed device ID and
-/// the actual source address. It intentionally does not authorize a device merely because it is
-/// somewhere on the tailnet.
+/// This is not application authorization: it verifies only a claimed device ID and source
+/// address. Production composition must use signed pairing and remains `DenyAll` until then.
 #[derive(Debug, Clone, Default)]
 pub struct TailnetPeerAllowList {
     allowed: Arc<RwLock<HashMap<DeviceId, HashSet<IpAddr>>>>,
@@ -229,6 +239,7 @@ impl PeerClient {
         address: SocketAddr,
         hello: ClientHello,
         envelope: TextEnvelope,
+        expected_server_public_key: &[u8],
     ) -> Result<Receipt, NetError> {
         if hello.device_id != envelope.source_device {
             return Err(NetError::IdentityMismatch(
@@ -257,6 +268,14 @@ impl PeerClient {
         let WireMessage::ServerHello(server_hello) = server_hello else {
             return Err(NetError::UnexpectedMessage("expected server_hello"));
         };
+        if !server_hello.has_valid_signature()
+            || (!expected_server_public_key.is_empty()
+                && server_hello.public_key != expected_server_public_key)
+        {
+            return Err(NetError::IdentityMismatch(
+                "server hello signature or public key is invalid".to_owned(),
+            ));
+        }
         if server_hello.device_id != envelope.target_device {
             return Err(NetError::IdentityMismatch(
                 "server hello does not match envelope target".to_owned(),
@@ -388,8 +407,10 @@ where
     };
 
     let protocol_ok = hello.protocol_version == meshelf_core::PROTOCOL_VERSION;
-    let trust = if protocol_ok {
+    let trust = if protocol_ok && hello.has_valid_signature() {
         gate.authorize(remote, &hello)
+    } else if protocol_ok {
+        TrustDecision::Deny("client hello signature is invalid".to_owned())
     } else {
         TrustDecision::Deny(format!(
             "unsupported protocol version {}",
@@ -400,14 +421,15 @@ where
         TrustDecision::Allow => (true, None),
         TrustDecision::Deny(reason) => (false, Some(reason)),
     };
-    let server_hello = WireMessage::ServerHello(ServerHello {
-        protocol_version: meshelf_core::PROTOCOL_VERSION,
-        device_id: identity.device_id,
-        device_name: identity.device_name,
+    let server_hello = WireMessage::ServerHello(ServerHello::signed(
+        meshelf_core::PROTOCOL_VERSION,
+        identity.device_id(),
+        identity.device_name.clone(),
         accepted,
         reason,
-        capabilities: vec![CAP_TEXT_CLIPBOARD_PUSH_V1.to_owned()],
-    });
+        vec![CAP_TEXT_CLIPBOARD_PUSH_V1.to_owned()],
+        &identity.signing_identity,
+    ));
     io_timeout(
         io_timeout_duration,
         write_frame_async(&mut stream, &server_hello),
@@ -441,7 +463,7 @@ where
         .await?;
         return Ok(());
     }
-    if envelope.target_device != identity.device_id {
+    if envelope.target_device != identity.device_id() {
         let receipt = Receipt::rejected(
             envelope.message_id,
             ReceiptCode::RejectedWrongTarget,
@@ -530,8 +552,10 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_delivery_is_duplicate_safe() {
-        let source = DeviceId::new();
-        let target = DeviceId::new();
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let target_identity = meshelf_identity::InstallationIdentity::generate();
+        let source = source_identity.device_id;
+        let target = target_identity.device_id;
         let clipboard = Arc::new(TestClipboard::default());
         let receiver = Arc::new(ReceiverService::new(
             target,
@@ -548,7 +572,7 @@ mod tests {
         let server = tokio::spawn(serve(
             listener,
             ServerIdentity {
-                device_id: target,
+                signing_identity: target_identity.clone(),
                 device_name: "BZOT".to_owned(),
             },
             gate,
@@ -562,16 +586,18 @@ mod tests {
         let first = client
             .push(
                 address,
-                ClientHello::new(source, "BMST", "nonce-1"),
+                ClientHello::signed(source, "BMST", "nonce-1", &source_identity),
                 message.clone(),
+                &target_identity.public_key(),
             )
             .await
             .expect("first push");
         let duplicate = client
             .push(
                 address,
-                ClientHello::new(source, "BMST", "nonce-2"),
+                ClientHello::signed(source, "BMST", "nonce-2", &source_identity),
                 message,
+                &target_identity.public_key(),
             )
             .await
             .expect("duplicate push");
@@ -589,8 +615,10 @@ mod tests {
 
     #[tokio::test]
     async fn deny_all_rejects_before_payload() {
-        let source = DeviceId::new();
-        let target = DeviceId::new();
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let target_identity = meshelf_identity::InstallationIdentity::generate();
+        let source = source_identity.device_id;
+        let target = target_identity.device_id;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind loopback");
@@ -604,7 +632,7 @@ mod tests {
         let server = tokio::spawn(serve(
             listener,
             ServerIdentity {
-                device_id: target,
+                signing_identity: target_identity.clone(),
                 device_name: "BZOT".to_owned(),
             },
             Arc::new(DenyAll),
@@ -630,8 +658,9 @@ mod tests {
         let error = PeerClient::default()
             .push(
                 address,
-                ClientHello::new(source, "BMST", "nonce"),
+                ClientHello::signed(source, "BMST", "nonce", &source_identity),
                 TextEnvelope::clipboard_push(source, target, now_unix_ms(), None, "secret"),
+                &target_identity.public_key(),
             )
             .await
             .expect_err("deny all");

@@ -1,15 +1,18 @@
 [package]
-name = "meshelf-protocol"
-description = "Bounded, versioned wire messages for meshelf"
+name = "meshelf-identity"
+description = "Per-installation signing identity and credential-store boundary for meshelf"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 
 [dependencies]
-meshelf-identity = { path = "../meshelf-identity" }
+ed25519-dalek.workspace = true
+keyring.workspace = true
 meshelf-core = { path = "../meshelf-core" }
+rand_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+
+[dev-dependencies]

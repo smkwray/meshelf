@@ -44,13 +44,13 @@ cargo run -p meshelf-desktop
 
 ## Expected first-run state
 
-The desktop shell is intentionally conservative. It renders the window, tray, draft editor, status surfaces, explicit local clipboard-read/send actions, on-demand Tailscale discovery, and one-time peer acceptance. Global hotkeys are deliberately absent. Recent-history persistence, signed identity, notifications, and release packaging remain open. Do not “make it work” by changing the default trust gate to allow all tailnet nodes.
+The desktop shell is intentionally conservative. It renders the window, tray, draft editor, status surfaces, explicit local clipboard-read/send actions, and on-demand Tailscale discovery. Global hotkeys are deliberately absent. The intended first approval is one local **Trust both ways using SSH** action; the remote side does not need a physical click, and later sends use signed direct TCP. Real two-device proof, native credential-store evidence, listener lifecycle, notifications, and release packaging remain open. Do not “make it work” by changing the trust gate to allow all tailnet nodes.
 
 ## Recommended local agent sequence
 
 1. Run Work Order 01 and close any core/storage compilation defects.
-2. Run Work Order 02 to implement signed identity and pairing.
-3. Run Work Order 03 to complete peer discovery and secure direct transfer.
+2. Run Work Order 02 to harden signed identity and one-sided SSH pairing.
+3. Run Work Order 03 to complete peer discovery, Tailscale source verification, and secure direct transfer.
 4. Run Work Order 04 to finish clipboard, notifications, and autostart without adding global hotkeys.
 5. Run Work Order 05 to finish the active-window UI and runtime integration.
 6. Run Work Order 06 for packaging and release evidence.

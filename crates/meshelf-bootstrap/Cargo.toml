@@ -1,15 +1,14 @@
 [package]
-name = "meshelf-protocol"
-description = "Bounded, versioned wire messages for meshelf"
+name = "meshelf-bootstrap"
+description = "Headless one-sided SSH enrollment for meshelf"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+dirs.workspace = true
 meshelf-identity = { path = "../meshelf-identity" }
-meshelf-core = { path = "../meshelf-core" }
-serde.workspace = true
+meshelf-tailscale = { path = "../meshelf-tailscale" }
 serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
