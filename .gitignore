@@ -1,0 +1,47 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+*.log
+*.redb
+*.redb.repair
+/local/
+/dist/
+release/
+Cargo.lock.tmp
+
+# Agent orchestration (contract, state, delegates) — private, never tracked
+do/
+CLAUDE.md
+AGENTS.md
+
+# Internal docs not for the repo
+docs/
+
+# Environment
+.env
+/.venv/
+
+# Plans
+*.plan.md
+plan.md
+plans/
+
+# Data and generated outputs (project-local working state)
+/data/
+/var/
+/outputs/
+/tmp/
+
+# Python artifacts (defense in depth)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+
+# .githooks/ is INTENTIONALLY NOT IGNORED — it ships the pre-commit hook

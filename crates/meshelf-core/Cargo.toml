@@ -1,0 +1,12 @@
+[package]
+name = "meshelf-core"
+description = "Pure domain semantics and at-most-once clipboard receive state machine for meshelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
