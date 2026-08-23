@@ -25,6 +25,7 @@ docs/
 /~syncthing~*
 assets/~syncthing~*
 apps/desktop/assets/~syncthing~*
+/status/
 
 # Plans
 *.plan.md
