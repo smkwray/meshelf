@@ -90,6 +90,10 @@ The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may requi
   no physical click, and ordinary clipboard sends use direct meshelf TCP afterward.
 - Cross-platform explicit clipboard adapter using `arboard`.
 - Window-local explicit send controls; meshelf does not register global hotkeys.
+- `meshelfctl` equivalents for status/refresh, one-sided SSH trust, clipboard read, and explicit
+  text/stdin/clipboard sends.
+- Transparent tray icon wiring and Windows executable icon resource wiring from the supplied
+  artwork; macOS/Linux bundle/icon verification remains a release task.
 - Slint 1.17 desktop window and system-tray shell.
 - Loopback simulation and unit-test scaffolding.
 - CI, packaging scripts, source manifest, and agent/audit handoffs.

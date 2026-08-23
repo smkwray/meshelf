@@ -4,6 +4,7 @@ members = [
     "apps/meshelfctl",
     "crates/meshelf-core",
     "crates/meshelf-bootstrap",
+    "crates/meshelf-control",
     "crates/meshelf-identity",
     "crates/meshelf-net",
     "crates/meshelf-platform",
@@ -40,3 +41,4 @@ tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
+winresource = "0.1.20"

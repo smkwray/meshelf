@@ -149,7 +149,9 @@ impl SshBootstrap {
         targets.dedup();
 
         targets.into_iter().find_map(|target| {
-            let output = Command::new(&binary)
+            let mut command = Command::new(&binary);
+            hide_console(&mut command);
+            let output = command
                 .args(["-G", "-o", "BatchMode=yes", &target])
                 .output()
                 .ok()?;
@@ -168,7 +170,9 @@ impl SshBootstrap {
         if payload.len() > MAX_BOOTSTRAP_BYTES {
             return Err(SshBootstrapError::TooLarge(payload.len()));
         }
-        let mut child = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        hide_console(&mut command);
+        let mut child = command
             .args([
                 "-T",
                 "-o",
@@ -482,7 +486,9 @@ impl CliPeerDiscovery {
 
 impl PeerDiscovery for CliPeerDiscovery {
     fn refresh(&self) -> Result<TailStatus, DiscoveryError> {
-        let output = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        hide_console(&mut command);
+        let output = command
             .args(["status", "--json"])
             .output()
             .map_err(DiscoveryError::Launch)?;
@@ -501,6 +507,16 @@ impl PeerDiscovery for CliPeerDiscovery {
         parse_status_json(&output.stdout)
     }
 }
+
+#[cfg(windows)]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(0x0800_0000);
+}
+
+#[cfg(not(windows))]
+fn hide_console(_command: &mut Command) {}
 
 #[derive(Debug, Error)]
 pub enum DiscoveryError {

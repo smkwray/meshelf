@@ -44,7 +44,7 @@ cargo run -p meshelf-desktop
 
 ## Expected first-run state
 
-The desktop shell is intentionally conservative. It renders the window, tray, draft editor, status surfaces, explicit local clipboard-read/send actions, and on-demand Tailscale discovery. Global hotkeys are deliberately absent. The intended first approval is one local **Trust both ways using SSH** action; the remote side does not need a physical click, and later sends use signed direct TCP. Real two-device proof, native credential-store evidence, listener lifecycle, notifications, and release packaging remain open. Do not “make it work” by changing the trust gate to allow all tailnet nodes.
+The desktop shell is intentionally conservative. It renders the window, tray, draft editor, status surfaces, explicit local clipboard-read/send actions, and on-demand Tailscale discovery. `meshelfctl` supports the same operational actions without the UI. Global hotkeys are deliberately absent. The intended first approval is one local **Trust both ways using SSH** action; the remote side does not need a physical click, and later sends use signed direct TCP. Real two-device proof, native credential-store evidence, listener lifecycle, notifications, and release packaging/icon verification remain open. Do not “make it work” by changing the trust gate to allow all tailnet nodes.
 
 ## Recommended local agent sequence
 

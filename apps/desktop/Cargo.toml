@@ -13,6 +13,7 @@ anyhow.workspace = true
 dirs.workspace = true
 meshelf-core = { path = "../../crates/meshelf-core" }
 meshelf-bootstrap = { path = "../../crates/meshelf-bootstrap" }
+meshelf-control = { path = "../../crates/meshelf-control" }
 meshelf-identity = { path = "../../crates/meshelf-identity" }
 meshelf-net = { path = "../../crates/meshelf-net" }
 meshelf-platform = { path = "../../crates/meshelf-platform" }
@@ -27,3 +28,6 @@ tracing-subscriber.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
