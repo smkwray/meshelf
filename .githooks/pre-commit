@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# pre-commit — Repo hygiene guard.
+#
+# Two checks before any commit lands:
+#
+#   1. Refuse staged paths inside gitignored zones (do/, docs/, var/, data/,
+#      outputs/, dist/). Catches `git add -f` accidents.
+#
+#   2. Run scripts/hygiene_check.sh --staged on staged files: fails on
+#      absolute system paths, data.md references in src/tests/configs,
+#      and git diff --check issues. AI tool name mentions are reported as
+#      warnings only.
+#
+# Install once per clone:
+#   git config core.hooksPath .githooks
+#
+# Bypass (rare, intentional):
+#   git commit --no-verify
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+# --- Rule 0: control-file integrity, ALWAYS ---
+# do/ is gitignored and Rule 1 below refuses to stage it, so a staged-file scan
+# can never see the control surface. This runs before the no-staged-files exit
+# so a commit is never the moment a corrupt ledger slips through unchecked.
+if [[ -x scripts/hygiene_check.sh && -f scripts/control_check.py ]]; then
+  if ! scripts/hygiene_check.sh --controls; then
+    echo "" >&2
+    echo "pre-commit: REJECT — control-file integrity check failed." >&2
+    echo "Fix the FAIL rows above, or 'git commit --no-verify' to bypass intentionally." >&2
+    exit 1
+  fi
+fi
+
+staged="$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)"
+
+if [[ -z "$staged" ]]; then
+  exit 0
+fi
+
+# --- Rule 1: refuse staged paths under gitignored zones ---
+banned_zones='^(do|docs|var|data|output|outputs|dist)/'
+banned_hits="$(printf '%s\n' "$staged" | grep -E "$banned_zones" || true)"
+
+if [[ -n "$banned_hits" ]]; then
+  echo "pre-commit: REJECT — the following staged paths live in gitignored zones:" >&2
+  printf '  %s\n' $banned_hits >&2
+  echo "" >&2
+  echo "These directories are private working state in this project and must never be committed:" >&2
+  printf '%s
+' "$banned_zones" | tr -d '^()/' | tr '|' '
+' | sed 's|^|  |; s|$|/|' >&2
+  echo "" >&2
+  echo "If something needs to be shared publicly, copy it to a tracked location" >&2
+  echo "(README.md, src/, tests/, configs/, scripts/) and recommit." >&2
+  exit 1
+fi
+
+# --- Rule 2: hygiene_check on staged files only ---
+# Fail CLOSED: if the hook is installed (core.hooksPath=.githooks) but its check
+# script is missing or non-executable, the hygiene gate cannot run — reject rather
+# than silently letting the commit through.
+if [[ -x scripts/hygiene_check.sh ]]; then
+  if ! scripts/hygiene_check.sh --staged; then
+    echo "" >&2
+    echo "pre-commit: REJECT — hygiene_check failed on staged files." >&2
+    echo "Fix the reported violations, re-stage, and retry." >&2
+    echo "(Use 'git commit --no-verify' only when intentionally bypassing.)" >&2
+    exit 1
+  fi
+elif [[ -f scripts/hygiene_check.sh ]]; then
+  echo "pre-commit: REJECT — scripts/hygiene_check.sh exists but is not executable; the hygiene gate cannot run." >&2
+  echo "Fix: chmod +x scripts/hygiene_check.sh (or 'git commit --no-verify' to bypass intentionally)." >&2
+  exit 1
+else
+  echo "pre-commit: REJECT — scripts/hygiene_check.sh is missing; the hygiene gate cannot run." >&2
+  echo "This hook is installed but its check script is absent — restore it from the templates" >&2
+  echo "(or 'git commit --no-verify' to bypass intentionally)." >&2
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,12 @@
+{
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["tag:meshelf-device"],
+      "ip": ["tcp:45832"]
+    }
+  ],
+  "tagOwners": {
+    "tag:meshelf-device": ["autogroup:admin"]
+  }
+}

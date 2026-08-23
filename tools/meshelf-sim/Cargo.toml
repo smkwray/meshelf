@@ -1,0 +1,15 @@
+[package]
+name = "meshelf-sim"
+description = "Two-peer loopback acceptance simulation for meshelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+meshelf-core = { path = "../../crates/meshelf-core" }
+meshelf-net = { path = "../../crates/meshelf-net" }
+meshelf-protocol = { path = "../../crates/meshelf-protocol" }
+tokio.workspace = true

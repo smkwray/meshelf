@@ -1,0 +1,15 @@
+[package]
+name = "meshelf-store"
+description = "redb-backed durable receive ledger for meshelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[dependencies]
+meshelf-core = { path = "../meshelf-core" }
+redb.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

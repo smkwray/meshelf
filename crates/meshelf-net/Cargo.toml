@@ -1,0 +1,18 @@
+[package]
+name = "meshelf-net"
+description = "Direct one-message peer transport and deny-by-default trust boundary for meshelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+meshelf-core = { path = "../meshelf-core" }
+meshelf-protocol = { path = "../meshelf-protocol" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+meshelf-store = { path = "../meshelf-store" }

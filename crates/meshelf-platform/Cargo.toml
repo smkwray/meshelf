@@ -1,0 +1,13 @@
+[package]
+name = "meshelf-platform"
+description = "Serialized clipboard and global-hotkey adapters for meshelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[dependencies]
+arboard.workspace = true
+global-hotkey.workspace = true
+meshelf-core = { path = "../meshelf-core" }
+thiserror.workspace = true

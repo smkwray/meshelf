@@ -1,0 +1,187 @@
+import {
+    Button,
+    HorizontalBox,
+    TextEdit,
+    VerticalBox,
+} from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "meshelf";
+    preferred-width: 720px;
+    preferred-height: 600px;
+    min-width: 520px;
+    min-height: 460px;
+    background: #111418;
+
+    in property <string> device-name: "This device";
+    in property <string> default-peer: "Not configured";
+    in property <bool> default-peer-online: false;
+    in-out property <string> draft-text: "";
+    in-out property <string> status-text: "Safety gate active: sending disabled until signed pairing is integrated";
+
+    callback paste-clipboard();
+    callback send-default(string);
+    callback refresh-peers();
+
+    VerticalBox {
+        padding: 22px;
+        spacing: 14px;
+
+        HorizontalBox {
+            spacing: 12px;
+            Text {
+                text: "meshelf";
+                color: #f3f5f7;
+                font-size: 26px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            VerticalBox {
+                alignment: end;
+                spacing: 2px;
+                Text {
+                    text: root.device-name;
+                    color: #f3f5f7;
+                    horizontal-alignment: right;
+                }
+                Text {
+                    text: root.default-peer-online ? "default peer online" : "no authenticated peer";
+                    color: root.default-peer-online ? #76d69a : #9da5af;
+                    font-size: 12px;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #2a3038;
+        }
+
+        Text {
+            text: "Paste or type text";
+            color: #d8dde3;
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        TextEdit {
+            text <=> root.draft-text;
+            height: 180px;
+            wrap: word-wrap;
+        }
+
+        HorizontalBox {
+            spacing: 10px;
+            Button {
+                text: "Paste clipboard";
+                clicked => { root.paste-clipboard(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: root.default-peer == "Not configured"
+                    ? "Send to default peer"
+                    : "Send to " + root.default-peer;
+                enabled: root.default-peer-online && root.draft-text != "";
+                clicked => { root.send-default(root.draft-text); }
+            }
+        }
+
+        Rectangle {
+            height: 58px;
+            border-radius: 7px;
+            background: #1b2027;
+            border-width: 1px;
+            border-color: #303844;
+            Text {
+                x: 14px;
+                y: 9px;
+                width: parent.width - 28px;
+                height: parent.height - 18px;
+                text: root.status-text;
+                color: #b9c1cb;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+        }
+
+        HorizontalBox {
+            Text {
+                text: "RECENT";
+                color: #8f98a4;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Refresh peers";
+                clicked => { root.refresh-peers(); }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            min-height: 115px;
+            border-radius: 8px;
+            background: #161a20;
+            border-width: 1px;
+            border-color: #282e36;
+            VerticalBox {
+                padding: 18px;
+                alignment: center;
+                Text {
+                    text: "No local history yet";
+                    color: #d0d5dc;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Received text will be stored locally before clipboard application.";
+                    color: #858e99;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        Text {
+            text: "Ctrl+Alt+V / Control+Option+V sends only after explicit pairing is complete.";
+            color: #747d88;
+            font-size: 11px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+export component MeshelfTray inherits SystemTrayIcon {
+    in property <string> tooltip-text: "meshelf";
+    icon: @image-url("../assets/meshelf-tray.png");
+    tooltip: root.tooltip-text;
+    title: "";
+
+    callback open-window();
+    callback send-default();
+    callback choose-target();
+    callback quit();
+
+    Menu {
+        MenuItem {
+            title: "Open meshelf";
+            activated => { root.open-window(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "Send clipboard to default peer";
+            activated => { root.send-default(); }
+        }
+        MenuItem {
+            title: "Choose target…";
+            activated => { root.choose-target(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "Quit";
+            activated => { root.quit(); }
+        }
+    }
+}

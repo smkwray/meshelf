@@ -1,0 +1,30 @@
+{
+  "Version": "1.88.0",
+  "BackendState": "Running",
+  "Self": {
+    "ID": "self-node",
+    "HostName": "BMST",
+    "DNSName": "bmst.example.ts.net.",
+    "TailscaleIPs": ["100.77.0.1", "fd7a:115c:a1e0::1"],
+    "Online": true,
+    "Active": true
+  },
+  "Peer": {
+    "nodekey:spark": {
+      "ID": "spark-node",
+      "HostName": "SPARK",
+      "DNSName": "spark.example.ts.net.",
+      "TailscaleIPs": ["100.77.0.3"],
+      "Online": false,
+      "Active": false
+    },
+    "nodekey:bzot": {
+      "ID": "bzot-node",
+      "HostName": "BZOT",
+      "DNSName": "bzot.example.ts.net.",
+      "TailscaleIPs": ["100.77.0.2"],
+      "Online": true,
+      "Active": true
+    }
+  }
+}

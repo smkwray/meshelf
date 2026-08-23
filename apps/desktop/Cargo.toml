@@ -1,0 +1,24 @@
+[package]
+name = "meshelf-desktop"
+description = "Native Slint desktop and tray shell for meshelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+build = "build.rs"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+meshelf-core = { path = "../../crates/meshelf-core" }
+meshelf-net = { path = "../../crates/meshelf-net" }
+meshelf-platform = { path = "../../crates/meshelf-platform" }
+meshelf-protocol = { path = "../../crates/meshelf-protocol" }
+meshelf-store = { path = "../../crates/meshelf-store" }
+meshelf-tailscale = { path = "../../crates/meshelf-tailscale" }
+slint.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
