@@ -4,9 +4,9 @@
 //! default; `ExactDeviceAllowList` exists only for loopback simulation and bounded development.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -75,6 +75,62 @@ impl TrustGate for ExactDeviceAllowList {
     }
 }
 
+/// Minimal one-time-acceptance gate for a trusted Tailscale peer.
+///
+/// The registry that builds this gate is responsible for binding the accepted meshelf identity
+/// to the current Tailscale node addresses. This gate then checks both the claimed device ID and
+/// the actual source address. It intentionally does not authorize a device merely because it is
+/// somewhere on the tailnet.
+#[derive(Debug, Clone, Default)]
+pub struct TailnetPeerAllowList {
+    allowed: Arc<RwLock<HashMap<DeviceId, HashSet<IpAddr>>>>,
+}
+
+impl TailnetPeerAllowList {
+    #[must_use]
+    pub fn new(
+        peers: impl IntoIterator<Item = (DeviceId, impl IntoIterator<Item = IpAddr>)>,
+    ) -> Self {
+        Self {
+            allowed: Arc::new(RwLock::new(
+                peers
+                    .into_iter()
+                    .map(|(device_id, addresses)| (device_id, addresses.into_iter().collect()))
+                    .collect(),
+            )),
+        }
+    }
+
+    pub fn replace(
+        &self,
+        peers: impl IntoIterator<Item = (DeviceId, impl IntoIterator<Item = IpAddr>)>,
+    ) {
+        let replacement = peers
+            .into_iter()
+            .map(|(device_id, addresses)| (device_id, addresses.into_iter().collect()))
+            .collect();
+        if let Ok(mut allowed) = self.allowed.write() {
+            *allowed = replacement;
+        }
+    }
+}
+
+impl TrustGate for TailnetPeerAllowList {
+    fn authorize(&self, remote: SocketAddr, hello: &ClientHello) -> TrustDecision {
+        let Ok(allowed) = self.allowed.read() else {
+            return TrustDecision::Deny("tailnet peer registry is unavailable".to_owned());
+        };
+        match allowed.get(&hello.device_id) {
+            Some(addresses) if addresses.contains(&remote.ip()) => TrustDecision::Allow,
+            Some(_) => TrustDecision::Deny(
+                "accepted meshelf identity arrived from an unrecognized Tailscale address"
+                    .to_owned(),
+            ),
+            None => TrustDecision::Deny("meshelf device has not been accepted".to_owned()),
+        }
+    }
+}
+
 #[async_trait]
 pub trait EnvelopeHandler: Send + Sync + 'static {
     async fn handle(&self, envelope: TextEnvelope, now_unix_ms: u64) -> Receipt;
@@ -134,6 +190,38 @@ impl PeerClient {
             connect_timeout,
             io_timeout,
         }
+    }
+
+    /// Discover whether a meshelf listener is present without sending clipboard content.
+    ///
+    /// A probe intentionally receives the peer's normal server hello even when the peer
+    /// rejects the probe under its current trust policy. The caller can therefore display a
+    /// pending device for the one-time acceptance flow while the receiver remains deny-by-default.
+    pub async fn probe(&self, address: SocketAddr) -> Result<ServerHello, NetError> {
+        let mut stream = timeout(self.connect_timeout, TcpStream::connect(address))
+            .await
+            .map_err(|_| NetError::Timeout("probe connect"))??;
+        stream.set_nodelay(true)?;
+
+        let probe_device = DeviceId::new();
+        let hello = ClientHello::new(probe_device, "meshelf-discovery", probe_device.to_string());
+        io_timeout(
+            self.io_timeout,
+            write_frame_async(&mut stream, &WireMessage::ClientHello(hello)),
+            "write probe hello",
+        )
+        .await?;
+
+        let response = io_timeout(
+            self.io_timeout,
+            read_frame_async(&mut stream),
+            "read probe response",
+        )
+        .await?;
+        let WireMessage::ServerHello(server_hello) = response else {
+            return Err(NetError::UnexpectedMessage("expected server_hello"));
+        };
+        Ok(server_hello)
     }
 
     pub async fn push(
@@ -525,6 +613,20 @@ mod tests {
             shutdown_rx,
         ));
 
+        let advertisement = PeerClient::default()
+            .probe(address)
+            .await
+            .expect("probe discovers deny-all listener");
+        assert_eq!(advertisement.device_id, target);
+        assert_eq!(advertisement.device_name, "BZOT");
+        assert!(!advertisement.accepted);
+        assert!(
+            advertisement
+                .capabilities
+                .iter()
+                .any(|capability| capability == CAP_TEXT_CLIPBOARD_PUSH_V1)
+        );
+
         let error = PeerClient::default()
             .push(
                 address,
@@ -537,6 +639,29 @@ mod tests {
 
         shutdown_tx.send(true).expect("request shutdown");
         server.await.expect("server task").expect("clean server");
+    }
+
+    #[test]
+    fn tailnet_gate_requires_both_device_and_current_address() {
+        let device = DeviceId::new();
+        let gate = TailnetPeerAllowList::new([(device, ["100.77.0.2".parse().expect("address")])]);
+        let hello = ClientHello::new(device, "BZOT", "probe");
+
+        assert_eq!(
+            gate.authorize("100.77.0.2:45832".parse().expect("socket"), &hello),
+            TrustDecision::Allow
+        );
+        assert!(matches!(
+            gate.authorize("100.77.0.3:45832".parse().expect("socket"), &hello),
+            TrustDecision::Deny(_)
+        ));
+        assert!(matches!(
+            gate.authorize(
+                "100.77.0.2:45832".parse().expect("socket"),
+                &ClientHello::new(DeviceId::new(), "other", "probe")
+            ),
+            TrustDecision::Deny(_)
+        ));
     }
 
     #[tokio::test]

@@ -61,7 +61,11 @@ def check_required() -> None:
 
 def check_text_and_structured_files() -> None:
     for path in sorted(ROOT.rglob("*")):
-        if not path.is_file() or any(part in {".git", "target", "__pycache__", ".venv", "do"} for part in path.relative_to(ROOT).parts) or path.name in {"AGENTS.md", "CLAUDE.md", ".env"} or path.suffix in {".pyc", ".pyo"}:
+        if not path.is_file() or any(
+            part in {".git", "target", "__pycache__", ".venv", "do", "status", "_icon_work"}
+            or part.startswith("~syncthing~")
+            for part in path.relative_to(ROOT).parts
+        ) or path.name in {"AGENTS.md", "CLAUDE.md", ".env"} or path.suffix in {".pyc", ".pyo"}:
             continue
         if path.suffix.lower() in TEXT_SUFFIXES or path.name in {".editorconfig", ".gitattributes", ".gitignore"}:
             data = path.read_bytes()
@@ -155,7 +159,11 @@ def check_manifest(allow_stale: bool) -> None:
         and path != MANIFEST
         and path.suffix not in {".pyc", ".pyo"}
         and path.name not in {"AGENTS.md", "CLAUDE.md", ".env"}
-        and not any(part in {".git", "target", ".idea", ".vscode", "local-data", "__pycache__", ".venv", "do"} for part in path.relative_to(ROOT).parts)
+        and not any(
+            part in {".git", "target", ".idea", ".vscode", "local-data", "__pycache__", ".venv", "do", "status", "_icon_work"}
+            or part.startswith("~syncthing~")
+            for part in path.relative_to(ROOT).parts
+        )
     }
     extra = sorted(expected_paths - entries.keys())
     mismatches.extend(f"unmanifested {relative}" for relative in extra)
@@ -187,6 +195,9 @@ def main() -> int:
         and "__pycache__" not in path.parts
         and ".venv" not in path.parts
         and "do" not in path.parts
+        and "status" not in path.parts
+        and "_icon_work" not in path.parts
+        and not any(part.startswith("~syncthing~") for part in path.parts)
     )
     print(f"PASS: meshelf repository structure and integrity checks ({files} files)")
     return 0

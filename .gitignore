@@ -23,6 +23,8 @@ docs/
 .env
 /.venv/
 /~syncthing~*
+**/~syncthing~*
+**/.syncthing*
 assets/~syncthing~*
 apps/desktop/assets/~syncthing~*
 /status/

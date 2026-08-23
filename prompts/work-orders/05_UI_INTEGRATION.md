@@ -1,4 +1,4 @@
-# Work Order 05 — one-hotkey UI and runtime integration
+# Work Order 05 — active-window UI and runtime integration
 
 ## Ownership
 
@@ -11,7 +11,7 @@ Wire the Slint window, target chooser, tray, engine, recent history, settings, a
 ## Required workflow
 
 - default target configured once;
-- one hotkey sends current clipboard;
+- active-window controls send explicitly selected clipboard text;
 - chooser appears focused and keyboard-operable;
 - receiver notification identifies source;
 - main window may remain closed;
@@ -22,4 +22,4 @@ Wire the Slint window, target chooser, tray, engine, recent history, settings, a
 
 ## Acceptance
 
-A user can copy on BMST, press one hotkey, switch to BZOT, and paste with no mouse and no intermediate window. LocalSend-style destination/file-picker steps are absent.
+A user can open meshelf on BMST, click Paste clipboard, click Send, switch to BZOT, and paste. No global shortcut or intermediate destination/file-picker step is required.

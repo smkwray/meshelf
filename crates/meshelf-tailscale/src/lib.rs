@@ -7,11 +7,13 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
+    fs,
     net::IpAddr,
     path::{Path, PathBuf},
     process::Command,
 };
 
+use meshelf_core::DeviceId;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -32,6 +34,174 @@ pub struct TailStatus {
     pub backend_state: String,
     pub self_node: TailNode,
     pub peers: Vec<TailNode>,
+}
+
+impl TailStatus {
+    /// Return peers that are currently usable candidates for a bounded meshelf probe.
+    ///
+    /// Tailscale tells us which nodes exist and which are online; the meshelf network probe
+    /// decides whether the application is actually present. This deliberately does not scan
+    /// SSH or treat tailnet membership as application trust.
+    pub fn online_peers(&self) -> impl Iterator<Item = &TailNode> {
+        self.peers.iter().filter(|peer| peer.online && peer.active)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrustedPeer {
+    pub node_id: String,
+    pub device_id: DeviceId,
+    pub hostname: String,
+    pub addresses: Vec<IpAddr>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerRegistry {
+    peers: Vec<TrustedPeer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InstallationState {
+    pub device_id: DeviceId,
+    pub peers: PeerRegistry,
+}
+
+impl Default for InstallationState {
+    fn default() -> Self {
+        Self {
+            device_id: DeviceId::new(),
+            peers: PeerRegistry::default(),
+        }
+    }
+}
+
+impl InstallationState {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
+        let path = path.as_ref();
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(RegistryError::Io(error)),
+        };
+        if bytes.len() > MAX_REGISTRY_BYTES {
+            return Err(RegistryError::TooLarge {
+                bytes: bytes.len(),
+                maximum: MAX_REGISTRY_BYTES,
+            });
+        }
+        serde_json::from_slice(&bytes).map_err(RegistryError::Json)
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), RegistryError> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(RegistryError::Json)?;
+        fs::write(path, bytes).map_err(RegistryError::Io)
+    }
+}
+
+impl PeerRegistry {
+    #[must_use]
+    pub fn peers(&self) -> &[TrustedPeer] {
+        &self.peers
+    }
+
+    #[must_use]
+    pub fn by_device_id(&self, device_id: DeviceId) -> Option<&TrustedPeer> {
+        self.peers.iter().find(|peer| peer.device_id == device_id)
+    }
+
+    #[must_use]
+    pub fn by_node_id(&self, node_id: &str) -> Option<&TrustedPeer> {
+        self.peers.iter().find(|peer| peer.node_id == node_id)
+    }
+
+    /// Record one explicit acceptance, preserving the original device identity for that
+    /// Tailscale node. Re-accepting the same node with a different meshelf identity is refused.
+    pub fn accept(&mut self, node: &TailNode, device_id: DeviceId) -> Result<(), RegistryError> {
+        let node_id = node
+            .node_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(RegistryError::MissingNodeId)?;
+        if let Some(existing) = self.peers.iter_mut().find(|peer| peer.node_id == node_id) {
+            if existing.device_id != device_id {
+                return Err(RegistryError::IdentityConflict {
+                    node_id: node_id.to_owned(),
+                });
+            }
+            existing.hostname = node.hostname.clone();
+            existing.addresses = node.addresses.clone();
+            return Ok(());
+        }
+        self.peers.push(TrustedPeer {
+            node_id: node_id.to_owned(),
+            device_id,
+            hostname: node.hostname.clone(),
+            addresses: node.addresses.clone(),
+        });
+        self.peers.sort_by(|left, right| {
+            left.hostname
+                .to_ascii_lowercase()
+                .cmp(&right.hostname.to_ascii_lowercase())
+        });
+        Ok(())
+    }
+
+    /// Refresh accepted peers' display names and current Tailscale addresses without changing
+    /// the one-time acceptance decision.
+    pub fn refresh_addresses(&mut self, status: &TailStatus) {
+        for trusted in &mut self.peers {
+            let Some(node) = status
+                .peers
+                .iter()
+                .find(|node| node.node_id.as_deref() == Some(trusted.node_id.as_str()))
+            else {
+                continue;
+            };
+            trusted.hostname = node.hostname.clone();
+            trusted.addresses = node.addresses.clone();
+        }
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
+        let path = path.as_ref();
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(RegistryError::Io(error)),
+        };
+        if bytes.len() > MAX_REGISTRY_BYTES {
+            return Err(RegistryError::TooLarge {
+                bytes: bytes.len(),
+                maximum: MAX_REGISTRY_BYTES,
+            });
+        }
+        serde_json::from_slice(&bytes).map_err(RegistryError::Json)
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), RegistryError> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(RegistryError::Json)?;
+        fs::write(path, bytes).map_err(RegistryError::Io)
+    }
+}
+
+const MAX_REGISTRY_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Error)]
+pub enum RegistryError {
+    #[error("accepted Tailscale node has no stable node ID")]
+    MissingNodeId,
+    #[error("Tailscale node {node_id} is already bound to another meshelf identity")]
+    IdentityConflict { node_id: String },
+    #[error("peer registry I/O error: {0}")]
+    Io(#[source] std::io::Error),
+    #[error("peer registry JSON error: {0}")]
+    Json(#[source] serde_json::Error),
+    #[error("peer registry is {bytes} bytes; maximum is {maximum}")]
+    TooLarge { bytes: usize, maximum: usize },
 }
 
 pub trait PeerDiscovery: Send + Sync + 'static {
@@ -261,6 +431,13 @@ mod tests {
         assert_eq!(status.peers[0].hostname, "BZOT");
         assert_eq!(status.peers[1].hostname, "SPARK");
         assert_eq!(status.peers[0].addresses[0].to_string(), "100.77.0.2");
+        assert_eq!(
+            status
+                .online_peers()
+                .map(|peer| peer.hostname.as_str())
+                .collect::<Vec<_>>(),
+            ["BZOT"]
+        );
     }
 
     #[test]
@@ -273,6 +450,58 @@ mod tests {
         assert!(matches!(
             parse_status_json(input),
             Err(DiscoveryError::MissingAddress { .. })
+        ));
+    }
+
+    #[test]
+    fn one_time_acceptance_persists_and_refreshes_addresses() {
+        let mut registry = PeerRegistry::default();
+        let device_id = DeviceId::new();
+        let node = TailNode {
+            node_id: Some("bzot-node".to_owned()),
+            hostname: "BZOT".to_owned(),
+            dns_name: Some("bzot.example.ts.net".to_owned()),
+            addresses: vec!["100.77.0.2".parse().expect("address")],
+            online: true,
+            active: true,
+        };
+        registry.accept(&node, device_id).expect("accept peer");
+
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("peers.json");
+        registry.save(&path).expect("save registry");
+        let mut reopened = PeerRegistry::load(&path).expect("load registry");
+        assert_eq!(reopened.peers(), registry.peers());
+
+        let status = TailStatus {
+            backend_state: "Running".to_owned(),
+            self_node: node.clone(),
+            peers: vec![TailNode {
+                addresses: vec!["100.77.0.22".parse().expect("updated address")],
+                ..node
+            }],
+        };
+        reopened.refresh_addresses(&status);
+        assert_eq!(reopened.peers()[0].addresses[0].to_string(), "100.77.0.22");
+    }
+
+    #[test]
+    fn refuses_identity_replacement_for_accepted_node() {
+        let mut registry = PeerRegistry::default();
+        let node = TailNode {
+            node_id: Some("bzot-node".to_owned()),
+            hostname: "BZOT".to_owned(),
+            dns_name: None,
+            addresses: vec!["100.77.0.2".parse().expect("address")],
+            online: true,
+            active: true,
+        };
+        registry
+            .accept(&node, DeviceId::new())
+            .expect("first accept");
+        assert!(matches!(
+            registry.accept(&node, DeviceId::new()),
+            Err(RegistryError::IdentityConflict { .. })
         ));
     }
 }

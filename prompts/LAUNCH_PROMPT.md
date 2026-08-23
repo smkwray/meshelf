@@ -9,7 +9,7 @@ Read, in order:
 3. `docs/01_ARCHITECTURE.md`
 4. `docs/02_PROTOCOL.md`
 5. `docs/03_SECURITY.md`
-6. `status/PROJECT_STATE.md`
+6. The private `do/state.md` note when working in a synced development workspace.
 7. your assigned file under `prompts/work-orders/`
 
 Architecture is settled: all devices are symmetric peers; there is no controller or canonical host. Ordinary clipboard copies do nothing. A direct clipboard push is initiated only by an explicit meshelf action, is online-only, and must never be replayed later into the clipboard. File transfer is frozen until text v1 is accepted.

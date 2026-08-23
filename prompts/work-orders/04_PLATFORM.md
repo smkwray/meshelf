@@ -1,4 +1,4 @@
-# Work Order 04 — clipboard, global shortcuts, notifications, autostart
+# Work Order 04 — clipboard, notifications, autostart
 
 ## Ownership
 
@@ -12,14 +12,12 @@ Finish native platform adapters without moving product rules into platform code.
 
 - serialized explicit clipboard reads/writes;
 - no watcher or polling;
-- default and chooser shortcuts;
-- event-driven hotkey delivery;
-- X11 plus Wayland portal path;
+- active-window button and tray-open path;
 - bounded clipboard-busy handling;
 - notifications without clipboard body by default;
 - reversible per-user start at login;
 - no elevation;
-- graceful hotkey conflict fallback to tray/buttons.
+- no global input registration or shortcut conflict surface.
 
 ## Acceptance
 

@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+dirs.workspace = true
 meshelf-core = { path = "../../crates/meshelf-core" }
 meshelf-net = { path = "../../crates/meshelf-net" }
 meshelf-platform = { path = "../../crates/meshelf-platform" }
@@ -17,6 +18,7 @@ meshelf-protocol = { path = "../../crates/meshelf-protocol" }
 meshelf-store = { path = "../../crates/meshelf-store" }
 meshelf-tailscale = { path = "../../crates/meshelf-tailscale" }
 slint.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

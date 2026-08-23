@@ -8,7 +8,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "manifests" / "FILES.sha256"
-EXCLUDED_PARTS = {".git", "target", ".idea", ".vscode", "local-data", "__pycache__", ".venv", "do"}
+EXCLUDED_PARTS = {
+    ".git",
+    "target",
+    ".idea",
+    ".vscode",
+    "local-data",
+    "__pycache__",
+    ".venv",
+    "do",
+    "status",
+    "_icon_work",
+}
 EXCLUDED_FILES = {
     MANIFEST.resolve(),
     (ROOT / "AGENTS.md").resolve(),
@@ -23,7 +34,10 @@ def included_files() -> list[Path]:
     for path in ROOT.rglob("*"):
         if not path.is_file():
             continue
-        if any(part in EXCLUDED_PARTS for part in path.relative_to(ROOT).parts):
+        if any(
+            part in EXCLUDED_PARTS or part.startswith("~syncthing~")
+            for part in path.relative_to(ROOT).parts
+        ):
             continue
         if path.resolve() in EXCLUDED_FILES or path.suffix in EXCLUDED_SUFFIXES:
             continue

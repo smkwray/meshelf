@@ -16,12 +16,14 @@ export component MainWindow inherits Window {
     in property <string> device-name: "This device";
     in property <string> default-peer: "Not configured";
     in property <bool> default-peer-online: false;
+    in property <bool> default-peer-pending: false;
     in-out property <string> draft-text: "";
-    in-out property <string> status-text: "Safety gate active: sending disabled until signed pairing is integrated";
+    in-out property <string> status-text: "Tailscale discovery is ready; accept a device once before sending";
 
     callback paste-clipboard();
     callback send-default(string);
     callback refresh-peers();
+    callback accept-default();
 
     VerticalBox {
         padding: 22px;
@@ -115,6 +117,11 @@ export component MainWindow inherits Window {
             }
             Rectangle { horizontal-stretch: 1; }
             Button {
+                text: "Accept device";
+                enabled: root.default-peer-pending;
+                clicked => { root.accept-default(); }
+            }
+            Button {
                 text: "Refresh peers";
                 clicked => { root.refresh-peers(); }
             }
@@ -145,7 +152,7 @@ export component MainWindow inherits Window {
         }
 
         Text {
-            text: "Ctrl+Alt+V / Control+Option+V sends only after explicit pairing is complete.";
+        text: "Send is available only while this window is active and a device is accepted.";
             color: #747d88;
             font-size: 11px;
             horizontal-alignment: center;
@@ -171,11 +178,11 @@ export component MeshelfTray inherits SystemTrayIcon {
         }
         MenuSeparator { }
         MenuItem {
-            title: "Send clipboard to default peer";
+            title: "Open meshelf to send clipboard";
             activated => { root.send-default(); }
         }
         MenuItem {
-            title: "Choose target…";
+            title: "Open meshelf to choose target…";
             activated => { root.choose-target(); }
         }
         MenuSeparator { }

@@ -1,15 +1,11 @@
-//! Platform boundary for explicit clipboard access and global shortcuts.
+//! Platform boundary for explicit clipboard access.
 //!
 //! There is no clipboard watcher in this crate. A dedicated worker owns the native clipboard
 //! object and performs a read or write only in response to an explicit command.
 
 mod clipboard;
-mod hotkey;
 
 pub use clipboard::{ClipboardSource, ClipboardWorker, PlatformClipboardError};
-pub use hotkey::{
-    HotkeyAction, HotkeyError, HotkeyService, ShortcutAvailability, shortcut_availability,
-};
 
 pub trait Notifier: Send + Sync + 'static {
     fn received_clipboard(&self, source_name: &str) -> Result<(), String>;

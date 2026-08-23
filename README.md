@@ -5,12 +5,12 @@
 The primary interaction is deliberately minimal:
 
 ```text
-copy normally -> press one global hotkey -> switch devices -> paste normally
+open meshelf -> click Paste clipboard -> click Send -> paste normally on the other device
 ```
 
 No machine is a controller, server, primary, leader, or canonical store. Every installation has the same role. A normal copy operation never causes network activity. Only an explicit meshelf action reads or sends clipboard content.
 
-This repository is an **agent-ready implementation seed**, not a production release. It contains the locked product contract, architecture, protocol/state-machine foundations, cross-platform UI shell, platform adapters, local simulation, bounded work orders, test plan, release scaffolding, and audit materials needed for local agents to continue implementation without reopening settled architecture.
+This repository is an **agent-ready implementation seed**, not a production release. It contains the locked product contract, architecture, protocol/state-machine foundations, a cross-platform UI shell, on-demand Tailscale discovery, persisted one-time peer acceptance, platform adapters, local simulation, bounded work orders, test plan, release scaffolding, and audit materials needed for local agents to continue implementation without reopening settled architecture.
 
 ## Locked v1 behavior
 
@@ -18,8 +18,7 @@ This repository is an **agent-ready implementation seed**, not a production rele
 - Same binary role on every device.
 - Tailscale provides reachability; meshelf does not create another VPN.
 - Plain Unicode text only in v1.
-- `Ctrl+Alt+V` / `Control+Option+V`: send current clipboard to the configured default peer.
-- `Ctrl+Alt+Shift+V` / `Control+Option+Shift+V`: open the keyboard-first target chooser.
+- Window-local buttons send only after the meshelf window is active and the user explicitly loads or types text.
 - Direct clipboard push is immediate and online-only.
 - Offline failure is visible and is never replayed later into the destination clipboard.
 - Received text is durably recorded before the application attempts the clipboard side effect.
@@ -34,7 +33,7 @@ File transfer is reserved in the architecture but intentionally not implemented 
 1. Read [`START_HERE.md`](START_HERE.md).
 2. Read [`AGENTS.md`](AGENTS.md); its invariants are binding.
 3. Read [`docs/00_PRODUCT_CONTRACT.md`](docs/00_PRODUCT_CONTRACT.md) and [`docs/01_ARCHITECTURE.md`](docs/01_ARCHITECTURE.md).
-4. Read [`status/PROJECT_STATE.md`](status/PROJECT_STATE.md) before changing code.
+4. Read [`docs/05_TEST_PLAN.md`](docs/05_TEST_PLAN.md) before changing code; in a synced development workspace, also inspect the private `do/state.md` note.
 5. Use one bounded work order from [`prompts/work-orders/`](prompts/work-orders/).
 
 ## Repository map
@@ -43,7 +42,7 @@ File transfer is reserved in the architecture but intentionally not implemented 
 apps/desktop/          Slint desktop UI and tray shell
 crates/meshelf-core/   Domain model, policy, idempotent receive state machine
 crates/meshelf-net/    One-shot peer listener/client and trust-gate abstraction
-crates/meshelf-platform/ Clipboard and hotkey adapters
+crates/meshelf-platform/ Explicit clipboard adapter
 crates/meshelf-protocol/ Framing and versioned wire messages
 crates/meshelf-store/  redb-backed receive ledger
 crates/meshelf-tailscale/ Tailscale status discovery adapter
@@ -52,7 +51,7 @@ config/                Example local configuration and Tailscale policy
 docs/                  Binding design, security, protocol, and test documents
 prompts/                Launch prompt and bounded agent work orders
 scripts/                Bootstrap, validation, and source-package helpers
-status/                 Current implementation and validation ledger
+do/                     Private local state, audit dispatches, and operator notes (not committed)
 ```
 
 ## Build commands
@@ -85,14 +84,16 @@ The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may requi
 - Direct one-message TCP client/listener with timeouts.
 - Deny-by-default trust gate.
 - Tailscale `status --json` parser and binary locator.
+- On-demand Tailscale peer probes, a persisted one-time acceptance registry, and a listener bound only to a discovered Tailscale address.
+- Explicit text send/receive wiring through the desktop UI after a peer is accepted.
 - Cross-platform explicit clipboard adapter using `arboard`.
-- Global-hotkey adapter for Windows, macOS, and Linux X11.
+- Window-local explicit send controls; meshelf does not register global hotkeys.
 - Slint 1.17 desktop window and system-tray shell.
 - Loopback simulation and unit-test scaffolding.
 - CI, packaging scripts, source manifest, and agent/audit handoffs.
 
 ## Deliberately unfinished
 
-The project is not safe for everyday clipboard use until the release gate in [`docs/05_TEST_PLAN.md`](docs/05_TEST_PLAN.md) passes. The largest open items are application-level key generation and signed pairing, wiring the hotkeys/tray to the network engine, secure peer discovery/probing, native notifications, start-at-login, Linux Wayland portal shortcuts, installers/signing, and real three-platform testing.
+The project is not safe for everyday clipboard use until the release gate in [`docs/05_TEST_PLAN.md`](docs/05_TEST_PLAN.md) passes. The largest open items are application-level key generation and signed pairing/revocation, native notifications, start-at-login, installers/signing, and real two-device plus three-platform testing. The current low-friction acceptance gate binds a remembered meshelf identity to a Tailscale node and address; it is an MVP tailnet trust path, not the final signed-identity design.
 
-See [`status/PROJECT_STATE.md`](status/PROJECT_STATE.md) for the exact boundary.
+See the private `do/state.md` note in a synced development workspace for the exact boundary.
