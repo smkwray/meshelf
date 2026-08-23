@@ -22,6 +22,9 @@ docs/
 # Environment
 .env
 /.venv/
+/~syncthing~*
+assets/~syncthing~*
+apps/desktop/assets/~syncthing~*
 
 # Plans
 *.plan.md
@@ -33,6 +36,7 @@ plans/
 /var/
 /outputs/
 /tmp/
+/assets/_icon_work/
 
 # Python artifacts (defense in depth)
 __pycache__/
