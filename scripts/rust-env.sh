@@ -14,3 +14,5 @@ if ((CARGO_BUILD_JOBS < 1)); then
 fi
 
 echo "Rust build jobs: $CARGO_BUILD_JOBS of $meshelf_logical_cores logical cores"
+
+export CARGO_INCREMENTAL=0

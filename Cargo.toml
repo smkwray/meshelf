@@ -15,6 +15,16 @@ members = [
 ]
 resolver = "3"
 
+# Build-size policy. `target/` reached 18 GB before this: 7.3 GB of dependency
+# rlibs carrying full DWARF, 4.5 GB of incremental state. Line tables keep
+# backtraces useful while dropping the variable/type debug info nothing here
+# reads, and the gate scripts are full builds where incremental buys nothing.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
