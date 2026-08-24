@@ -23,7 +23,7 @@ use meshelf_net::{
     CoreEnvelopeHandler, ServerIdentity, TrustDecision, TrustGate,
     bind_discovered_tailscale_std_listener, serve_with_files,
 };
-use meshelf_platform::{ClipboardItem, ClipboardSource, ClipboardWorker};
+use meshelf_platform::{ClipboardItem, ClipboardSource, ClipboardWorker, listen, signal};
 use meshelf_store::RedbReceiveStore;
 use meshelf_tailscale::InstallationStore;
 use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
@@ -69,6 +69,14 @@ impl TrustGate for FileBackedTrustGate {
 struct ServerHandle {
     shutdown: watch::Sender<bool>,
     worker: Option<JoinHandle<()>>,
+}
+
+struct ActivationCleanup(PathBuf);
+
+impl Drop for ActivationCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -429,10 +437,22 @@ fn main() -> Result<()> {
         .truncate(false)
         .open(data_dir.join("desktop.lock"))?;
     if instance_lock.try_lock().is_err() {
-        tracing::info!("meshelf desktop is already running");
+        let signalled = signal(&data_dir);
+        tracing::info!(signalled, "meshelf desktop is already running");
         return Ok(());
     }
     let _instance_lock = instance_lock;
+    let window_weak = window.as_weak();
+    listen(&data_dir, move || {
+        let window_weak = window_weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = window_weak.upgrade() {
+                raise_window(&window);
+            }
+        });
+    })
+    .map_err(|error| anyhow::anyhow!("could not start activation listener: {error}"))?;
+    let _activation_cleanup = ActivationCleanup(data_dir.join("activation"));
     let state_path = data_dir.join("state.json");
     let receive_store = Arc::new(
         RedbReceiveStore::open(data_dir.join("meshelf.redb"))

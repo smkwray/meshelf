@@ -3,8 +3,10 @@
 //! There is no clipboard watcher in this crate. A dedicated worker owns the native clipboard
 //! object and performs a read or write only in response to an explicit command.
 
+mod activation;
 mod clipboard;
 
+pub use activation::{listen, signal};
 pub use clipboard::{ClipboardItem, ClipboardSource, ClipboardWorker, PlatformClipboardError};
 
 pub trait Notifier: Send + Sync + 'static {
