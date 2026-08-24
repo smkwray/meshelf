@@ -8,7 +8,11 @@ use meshelf_core::{
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-const RECEIVE_LEDGER: TableDefinition<&str, &[u8]> = TableDefinition::new("receive_ledger_v1");
+mod v2;
+pub use v2::RedbV2Store;
+
+pub(crate) const RECEIVE_LEDGER: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("receive_ledger_v1");
 
 #[derive(Debug)]
 pub struct RedbReceiveStore {
@@ -130,7 +134,7 @@ fn decode_record(bytes: &[u8]) -> Result<ReceiveRecord, StoreError> {
     serde_json::from_slice(bytes).map_err(|error| StoreError::new(error.to_string()))
 }
 
-fn map_redb_error(error: impl std::fmt::Display) -> StoreError {
+pub(crate) fn map_redb_error(error: impl std::fmt::Display) -> StoreError {
     StoreError::new(error.to_string())
 }
 

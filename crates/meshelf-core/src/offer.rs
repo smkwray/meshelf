@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{fmt, path::PathBuf, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,6 +11,8 @@ pub const MAX_OFFER_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_OFFER_TRANSFER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const MAX_OFFER_MANIFEST_ENTRIES: u32 = 4096;
 pub const MAX_OFFER_PORTABLE_COMPONENT_BYTES: usize = 255;
+pub const V2_MAX_LIVE_ENTRIES: u32 = 10;
+pub const MAX_OFFER_ATTEMPT_DETAIL_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -59,6 +61,79 @@ pub enum CardAvailability {
     Available,
     SourceUnavailable,
     SourceChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OfferSource {
+    Text {
+        text: String,
+    },
+    File {
+        canonical_path: PathBuf,
+        metadata_commitment: Vec<u8>,
+    },
+    Folder {
+        canonical_path: PathBuf,
+        metadata_commitment: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum OfferSourceError {
+    #[error("source does not match its offer descriptor")]
+    DescriptorMismatch,
+    #[error("stored text is {bytes} bytes; maximum is {maximum}")]
+    TextTooLarge { bytes: usize, maximum: usize },
+    #[error("source path must be absolute")]
+    PathNotAbsolute,
+    #[error("metadata commitment must be 32 bytes")]
+    MetadataCommitmentWrongLength,
+}
+
+impl OfferSource {
+    pub fn validate_for(&self, descriptor: &OfferDescriptor) -> Result<(), OfferSourceError> {
+        match (self, descriptor) {
+            (Self::Text { text }, OfferDescriptor::Text { .. }) => {
+                if text.len() > MAX_TEXT_BYTES {
+                    return Err(OfferSourceError::TextTooLarge {
+                        bytes: text.len(),
+                        maximum: MAX_TEXT_BYTES,
+                    });
+                }
+                let expected = OfferDescriptor::text(text)
+                    .map_err(|_| OfferSourceError::DescriptorMismatch)?;
+                if &expected == descriptor {
+                    Ok(())
+                } else {
+                    Err(OfferSourceError::DescriptorMismatch)
+                }
+            }
+            (
+                Self::File {
+                    canonical_path,
+                    metadata_commitment,
+                },
+                OfferDescriptor::File { .. },
+            )
+            | (
+                Self::Folder {
+                    canonical_path,
+                    metadata_commitment,
+                },
+                OfferDescriptor::Folder { .. },
+            ) => {
+                if !canonical_path.is_absolute() {
+                    return Err(OfferSourceError::PathNotAbsolute);
+                }
+                if metadata_commitment.len() != 32 {
+                    return Err(OfferSourceError::MetadataCommitmentWrongLength);
+                }
+                Ok(())
+            }
+            _ => Err(OfferSourceError::DescriptorMismatch),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
