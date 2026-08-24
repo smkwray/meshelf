@@ -2,6 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+source scripts/rust-env.sh
+
 python3 scripts/verify-repo.py --allow-stale-manifest
 cargo fmt --all -- --check
 cargo check --workspace --all-targets

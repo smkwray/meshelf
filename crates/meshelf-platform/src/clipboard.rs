@@ -1,7 +1,8 @@
 use std::{
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
 };
@@ -9,8 +10,24 @@ use std::{
 use meshelf_core::{ClipboardError, ClipboardSink};
 use thiserror::Error;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardItem {
+    Text(String),
+    Files(Vec<PathBuf>),
+}
+
 pub trait ClipboardSource: Send + Sync + 'static {
-    fn read_text(&self) -> Result<String, PlatformClipboardError>;
+    fn read_item(&self) -> Result<ClipboardItem, PlatformClipboardError>;
+
+    fn read_text(&self) -> Result<String, PlatformClipboardError> {
+        match self.read_item()? {
+            ClipboardItem::Text(text) => Ok(text),
+            ClipboardItem::Files(paths) => Err(PlatformClipboardError::new(format!(
+                "clipboard contains {} file item(s), not text",
+                paths.len()
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -29,14 +46,15 @@ impl PlatformClipboardError {
 }
 
 enum ClipboardCommand {
-    Read(Sender<Result<String, String>>),
+    Read(Sender<Result<ClipboardItem, String>>),
     Write(String, Sender<Result<(), String>>),
+    WriteFiles(Vec<PathBuf>, Sender<Result<(), String>>),
     Shutdown,
 }
 
 #[derive(Debug)]
 struct ClipboardWorkerInner {
-    commands: Sender<ClipboardCommand>,
+    commands: SyncSender<ClipboardCommand>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -62,7 +80,7 @@ pub struct ClipboardWorker {
 
 impl ClipboardWorker {
     pub fn new() -> Result<Self, PlatformClipboardError> {
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("meshelf-clipboard".to_owned())
@@ -94,17 +112,32 @@ impl ClipboardWorker {
         let (response_tx, response_rx) = mpsc::channel();
         self.inner
             .commands
-            .send(make_command(response_tx))
-            .map_err(|error| PlatformClipboardError::new(error.to_string()))?;
+            .try_send(make_command(response_tx))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    PlatformClipboardError::new("another clipboard operation is already queued")
+                }
+                TrySendError::Disconnected(_) => {
+                    PlatformClipboardError::new("clipboard worker is unavailable")
+                }
+            })?;
         response_rx
             .recv()
             .map_err(|error| PlatformClipboardError::new(error.to_string()))?
             .map_err(PlatformClipboardError::new)
     }
+
+    pub fn set_files(&self, paths: &[impl AsRef<Path>]) -> Result<(), PlatformClipboardError> {
+        let paths = paths
+            .iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect();
+        self.request(|response| ClipboardCommand::WriteFiles(paths, response))
+    }
 }
 
 impl ClipboardSource for ClipboardWorker {
-    fn read_text(&self) -> Result<String, PlatformClipboardError> {
+    fn read_item(&self) -> Result<ClipboardItem, PlatformClipboardError> {
         self.request(ClipboardCommand::Read)
     }
 }
@@ -134,11 +167,28 @@ fn clipboard_thread(
     while let Ok(command) = commands.recv() {
         match command {
             ClipboardCommand::Read(response) => {
-                let result = clipboard.get_text().map_err(|error| error.to_string());
+                let result = match clipboard.get().file_list() {
+                    Ok(paths) if !paths.is_empty() => Ok(ClipboardItem::Files(paths)),
+                    Ok(_) | Err(_) => clipboard
+                        .get_text()
+                        .map(ClipboardItem::Text)
+                        .map_err(|error| error.to_string()),
+                };
                 let _ = response.send(result);
             }
             ClipboardCommand::Write(text, response) => {
                 let result = clipboard.set_text(text).map_err(|error| error.to_string());
+                let _ = response.send(result);
+            }
+            ClipboardCommand::WriteFiles(paths, response) => {
+                let result = if paths.is_empty() {
+                    Err("cannot place an empty file list on the clipboard".to_owned())
+                } else {
+                    clipboard
+                        .clear()
+                        .and_then(|()| clipboard.set().file_list(&paths))
+                        .map_err(|error| error.to_string())
+                };
                 let _ = response.send(result);
             }
             ClipboardCommand::Shutdown => break,

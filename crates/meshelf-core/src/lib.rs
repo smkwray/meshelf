@@ -11,8 +11,8 @@ mod store;
 
 pub use memory_store::MemoryReceiveStore;
 pub use model::{
-    DeliveryMode, DeviceId, EnvelopeValidationError, MAX_TEXT_BYTES, MessageId, PROTOCOL_VERSION,
-    Receipt, ReceiptCode, TextEnvelope,
+    ContentKind, DeliveryMode, DeviceId, EnvelopeValidationError, MAX_TEXT_BYTES, MessageId,
+    PROTOCOL_VERSION, Receipt, ReceiptCode, TextEnvelope,
 };
 pub use receiver::{ClipboardError, ClipboardSink, ReceiverService};
 pub use store::{

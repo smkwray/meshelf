@@ -7,13 +7,14 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
-    fs,
+    fs::{self, File, OpenOptions},
     io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
+use atomic_write_file::AtomicWriteFile;
 use meshelf_core::DeviceId;
 use meshelf_identity::InstallationIdentity;
 use serde::Deserialize;
@@ -243,7 +244,7 @@ impl TailStatus {
     /// decides whether the application is actually present. This deliberately does not scan
     /// SSH or treat tailnet membership as application trust.
     pub fn online_peers(&self) -> impl Iterator<Item = &TailNode> {
-        self.peers.iter().filter(|peer| peer.online && peer.active)
+        self.peers.iter().filter(|peer| peer.online)
     }
 }
 
@@ -268,6 +269,17 @@ pub struct PeerRegistry {
 pub struct InstallationState {
     pub device_id: DeviceId,
     pub peers: PeerRegistry,
+}
+
+/// Cross-process transaction boundary for the shared per-user installation state.
+///
+/// The desktop and the SSH bootstrap helper are separate processes. Every production read and
+/// mutation goes through the same sidecar lock, and every mutation atomically replaces the state
+/// file while that lock remains held.
+#[derive(Debug, Clone)]
+pub struct InstallationStore {
+    state_path: PathBuf,
+    lock_path: PathBuf,
 }
 
 impl Default for InstallationState {
@@ -300,7 +312,86 @@ impl InstallationState {
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), RegistryError> {
         let bytes = serde_json::to_vec_pretty(self).map_err(RegistryError::Json)?;
-        fs::write(path, bytes).map_err(RegistryError::Io)
+        let mut file = AtomicWriteFile::open(path).map_err(RegistryError::Io)?;
+        file.write_all(&bytes).map_err(RegistryError::Io)?;
+        file.sync_all().map_err(RegistryError::Io)?;
+        file.commit().map_err(RegistryError::Io)
+    }
+}
+
+impl InstallationStore {
+    #[must_use]
+    pub fn new(state_path: impl Into<PathBuf>) -> Self {
+        let state_path = state_path.into();
+        let mut lock_name = OsString::from(state_path.as_os_str());
+        lock_name.push(".lock");
+        Self {
+            state_path,
+            lock_path: PathBuf::from(lock_name),
+        }
+    }
+
+    pub fn load_for_identity(
+        &self,
+        identity: DeviceId,
+    ) -> Result<InstallationState, RegistryError> {
+        self.with_exclusive_lock(|| self.load_reconciled(identity))
+    }
+
+    pub fn update<F>(
+        &self,
+        identity: DeviceId,
+        update: F,
+    ) -> Result<InstallationState, RegistryError>
+    where
+        F: FnOnce(&mut InstallationState) -> Result<(), RegistryError>,
+    {
+        self.with_exclusive_lock(|| {
+            let mut latest = self.load_reconciled(identity)?;
+            update(&mut latest)?;
+            latest.save(&self.state_path)?;
+            Ok(latest)
+        })
+    }
+
+    fn load_reconciled(&self, identity: DeviceId) -> Result<InstallationState, RegistryError> {
+        let loaded = InstallationState::load(&self.state_path)?;
+        if loaded.device_id == identity {
+            Ok(loaded)
+        } else {
+            Ok(InstallationState {
+                device_id: identity,
+                peers: PeerRegistry::default(),
+            })
+        }
+    }
+
+    fn with_exclusive_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, RegistryError>,
+    ) -> Result<T, RegistryError> {
+        if let Some(parent) = self
+            .state_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(RegistryError::Io)?;
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lock_path)
+            .map_err(RegistryError::Io)?;
+        File::lock(&lock).map_err(RegistryError::Io)?;
+        let result = operation();
+        let unlock = File::unlock(&lock).map_err(RegistryError::Io);
+        match (result, unlock) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 }
 
@@ -353,8 +444,9 @@ impl PeerRegistry {
         Ok(())
     }
 
-    /// Record reciprocal trust established by the explicit SSH bootstrap. The key is part of the
-    /// durable binding: a later process cannot reuse the node ID and address without the key.
+    /// Record a signed Meshelf installation discovered on a Tailscale node. During private
+    /// functional testing, reinstalling Meshelf on the same Tailscale node replaces its prior app
+    /// identity automatically. A hardened release must add explicit revocation/rotation policy.
     pub fn accept_signed(
         &mut self,
         node: &TailNode,
@@ -370,13 +462,7 @@ impl PeerRegistry {
             .filter(|value| !value.trim().is_empty())
             .ok_or(RegistryError::MissingNodeId)?;
         if let Some(existing) = self.peers.iter_mut().find(|peer| peer.node_id == node_id) {
-            if existing.device_id != device_id
-                || (!existing.public_key.is_empty() && existing.public_key != public_key)
-            {
-                return Err(RegistryError::IdentityConflict {
-                    node_id: node_id.to_owned(),
-                });
-            }
+            existing.device_id = device_id;
             existing.public_key = public_key;
             existing.hostname = node.hostname.clone();
             existing.addresses = node.addresses.clone();
@@ -672,10 +758,18 @@ fn known_binary_locations() -> Vec<PathBuf> {
         PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
         PathBuf::from("/usr/bin/tailscale"),
         PathBuf::from("/usr/local/bin/tailscale"),
+        PathBuf::from("/opt/homebrew/bin/tailscale"),
     ];
     if let Some(program_files) = env::var_os("ProgramFiles") {
         locations.push(
             PathBuf::from(program_files)
+                .join("Tailscale")
+                .join("tailscale.exe"),
+        );
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        locations.push(
+            PathBuf::from(local_app_data)
                 .join("Tailscale")
                 .join("tailscale.exe"),
         );
@@ -703,6 +797,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_gui_launch_locations_include_apple_silicon_homebrew() {
+        assert!(known_binary_locations().contains(&PathBuf::from("/opt/homebrew/bin/tailscale")));
+    }
+
+    #[test]
     fn parses_fixture_and_sorts_peers() {
         let status = parse_status_json(include_bytes!("../fixtures/tailscale-status.json"))
             .expect("parse fixture");
@@ -719,6 +818,142 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["BZOT"]
         );
+    }
+
+    #[test]
+    fn online_but_idle_peer_remains_probe_candidate() {
+        let status = TailStatus {
+            backend_state: "Running".to_owned(),
+            self_node: TailNode {
+                node_id: Some("node-local".to_owned()),
+                hostname: "BMST".to_owned(),
+                dns_name: None,
+                addresses: vec!["100.71.19.72".parse().expect("local address")],
+                online: true,
+                active: true,
+            },
+            peers: vec![TailNode {
+                node_id: Some("node-idle".to_owned()),
+                hostname: "BZOT".to_owned(),
+                dns_name: None,
+                addresses: vec!["100.90.118.120".parse().expect("peer address")],
+                online: true,
+                active: false,
+            }],
+        };
+
+        assert_eq!(
+            status
+                .online_peers()
+                .map(|peer| peer.hostname.as_str())
+                .collect::<Vec<_>>(),
+            ["BZOT"]
+        );
+    }
+
+    #[test]
+    fn concurrent_refresh_and_bootstrap_do_not_lose_peer() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state_path = directory.path().join("state.json");
+        let local_device = DeviceId::new();
+        let peer_device = DeviceId::new();
+        let peer = TailNode {
+            node_id: Some("node-bzot".to_owned()),
+            hostname: "BZOT".to_owned(),
+            dns_name: None,
+            addresses: vec!["100.90.118.120".parse().expect("peer address")],
+            online: true,
+            active: false,
+        };
+        InstallationStore::new(state_path.clone())
+            .update(local_device, |_| Ok(()))
+            .expect("initialize state");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let refresh_store = InstallationStore::new(state_path.clone());
+        let refresh_barrier = barrier.clone();
+        let refresh_peer = peer.clone();
+        let refresh = std::thread::spawn(move || {
+            refresh_barrier.wait();
+            refresh_store
+                .update(local_device, |latest| {
+                    latest.peers.refresh_addresses(&TailStatus {
+                        backend_state: "Running".to_owned(),
+                        self_node: TailNode {
+                            node_id: Some("node-bmst".to_owned()),
+                            hostname: "BMST".to_owned(),
+                            dns_name: None,
+                            addresses: vec!["100.71.19.72".parse().expect("local address")],
+                            online: true,
+                            active: true,
+                        },
+                        peers: vec![refresh_peer],
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    Ok(())
+                })
+                .expect("refresh transaction");
+        });
+        let bootstrap_store = InstallationStore::new(state_path.clone());
+        let bootstrap_barrier = barrier.clone();
+        let bootstrap = std::thread::spawn(move || {
+            bootstrap_barrier.wait();
+            bootstrap_store
+                .update(local_device, |latest| {
+                    latest
+                        .peers
+                        .accept_signed(&peer, peer_device, vec![7; 32])?;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    Ok(())
+                })
+                .expect("bootstrap transaction");
+        });
+        barrier.wait();
+        refresh.join().expect("refresh thread");
+        bootstrap.join().expect("bootstrap thread");
+
+        let committed = InstallationStore::new(state_path)
+            .load_for_identity(local_device)
+            .expect("load committed state");
+        assert_eq!(
+            committed
+                .peers
+                .by_device_id(peer_device)
+                .expect("bootstrap peer preserved")
+                .public_key,
+            vec![7; 32]
+        );
+    }
+
+    #[test]
+    fn identity_change_is_reconciled_inside_locked_transaction() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = InstallationStore::new(directory.path().join("state.json"));
+        let old_device = DeviceId::new();
+        let new_device = DeviceId::new();
+        let peer_device = DeviceId::new();
+        store
+            .update(old_device, |latest| {
+                latest.peers.accept_signed(
+                    &TailNode {
+                        node_id: Some("node-peer".to_owned()),
+                        hostname: "peer".to_owned(),
+                        dns_name: None,
+                        addresses: vec!["100.64.0.2".parse().expect("peer address")],
+                        online: true,
+                        active: true,
+                    },
+                    peer_device,
+                    vec![9; 32],
+                )
+            })
+            .expect("save old identity state");
+
+        let reconciled = store
+            .update(new_device, |_| Ok(()))
+            .expect("reconcile new identity");
+        assert_eq!(reconciled.device_id, new_device);
+        assert!(reconciled.peers.peers().is_empty());
     }
 
     #[test]
@@ -802,15 +1037,15 @@ mod tests {
             .accept_signed(&node, identity.device_id, identity.public_key().to_vec())
             .expect("signed accept");
         assert_eq!(registry.peers()[0].public_key, identity.public_key());
-        assert!(matches!(
-            registry.accept_signed(
+        let replacement = meshelf_identity::InstallationIdentity::generate();
+        registry
+            .accept_signed(
                 &node,
-                identity.device_id,
-                meshelf_identity::InstallationIdentity::generate()
-                    .public_key()
-                    .to_vec()
-            ),
-            Err(RegistryError::IdentityConflict { .. })
-        ));
+                replacement.device_id,
+                replacement.public_key().to_vec(),
+            )
+            .expect("same Tailscale node rotates its Meshelf installation automatically");
+        assert_eq!(registry.peers()[0].device_id, replacement.device_id);
+        assert_eq!(registry.peers()[0].public_key, replacement.public_key());
     }
 }

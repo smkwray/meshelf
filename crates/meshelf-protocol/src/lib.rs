@@ -2,7 +2,9 @@
 
 use std::io::{Read, Write};
 
-use meshelf_core::{DeviceId, MAX_TEXT_BYTES, PROTOCOL_VERSION, Receipt, TextEnvelope};
+use meshelf_core::{
+    ContentKind, DeviceId, MAX_TEXT_BYTES, MessageId, PROTOCOL_VERSION, Receipt, TextEnvelope,
+};
 use meshelf_identity::InstallationIdentity;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -12,6 +14,10 @@ pub const MAX_FRAME_BYTES: usize = MAX_TEXT_BYTES + 64 * 1024;
 pub const CAP_TEXT_CLIPBOARD_PUSH_V1: &str = "text-clipboard-push-v1";
 pub const CAP_TEXT_SHELF_V1: &str = "text-shelf-v1";
 pub const CAP_FILE_STREAM_V1: &str = "file-stream-v1";
+pub const MAX_FILE_ENTRIES: usize = 4096;
+pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const MAX_TRANSFER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const MAX_RELATIVE_PATH_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -38,7 +44,7 @@ impl ClientHello {
             device_id,
             device_name: device_name.into(),
             nonce: nonce.into(),
-            capabilities: vec![CAP_TEXT_CLIPBOARD_PUSH_V1.to_owned()],
+            capabilities: vec![CAP_TEXT_SHELF_V1.to_owned(), CAP_FILE_STREAM_V1.to_owned()],
             public_key: Vec::new(),
             signature: Vec::new(),
         }
@@ -82,6 +88,42 @@ pub struct ServerHello {
     pub public_key: Vec<u8>,
     #[serde(default)]
     pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferEntry {
+    pub relative_path: String,
+    pub kind: FileEntryKind,
+    pub byte_len: u64,
+    #[serde(default)]
+    pub sha256: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferOffer {
+    pub protocol_version: u16,
+    pub transfer_id: MessageId,
+    pub source_device: DeviceId,
+    pub target_device: DeviceId,
+    pub content_kind: ContentKind,
+    pub root_name: String,
+    pub total_bytes: u64,
+    pub entries: Vec<FileTransferEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileAdmission {
+    pub transfer_id: MessageId,
+    pub accepted: bool,
+    pub already_complete: bool,
+    pub detail: Option<String>,
 }
 
 impl ServerHello {
@@ -128,6 +170,8 @@ pub enum WireMessage {
     ClientHello(ClientHello),
     ServerHello(ServerHello),
     PushEnvelope(TextEnvelope),
+    FileOffer(FileTransferOffer),
+    FileAdmission(FileAdmission),
     Receipt(Receipt),
 }
 

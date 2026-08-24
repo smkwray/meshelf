@@ -96,6 +96,16 @@ pub enum DeliveryMode {
     ShelfItem,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentKind {
+    #[default]
+    Text,
+    Path,
+    File,
+    Folder,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextEnvelope {
     pub protocol_version: u16,
@@ -105,6 +115,8 @@ pub struct TextEnvelope {
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: Option<u64>,
     pub delivery_mode: DeliveryMode,
+    #[serde(default)]
+    pub content_kind: ContentKind,
     pub text: String,
 }
 
@@ -125,6 +137,50 @@ impl TextEnvelope {
             created_at_unix_ms,
             expires_at_unix_ms,
             delivery_mode: DeliveryMode::ClipboardPush,
+            content_kind: ContentKind::Text,
+            text: text.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn shelf_item(
+        source_device: DeviceId,
+        target_device: DeviceId,
+        created_at_unix_ms: u64,
+        expires_at_unix_ms: Option<u64>,
+        content_kind: ContentKind,
+        text: impl Into<String>,
+    ) -> Self {
+        Self::shelf_item_with_id(
+            MessageId::new(),
+            source_device,
+            target_device,
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            content_kind,
+            text,
+        )
+    }
+
+    #[must_use]
+    pub fn shelf_item_with_id(
+        message_id: MessageId,
+        source_device: DeviceId,
+        target_device: DeviceId,
+        created_at_unix_ms: u64,
+        expires_at_unix_ms: Option<u64>,
+        content_kind: ContentKind,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            message_id,
+            source_device,
+            target_device,
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            delivery_mode: DeliveryMode::ShelfItem,
+            content_kind,
             text: text.into(),
         }
     }
@@ -181,6 +237,7 @@ pub enum EnvelopeValidationError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptCode {
+    Stored,
     Applied,
     DuplicateApplied,
     ClipboardFailed,

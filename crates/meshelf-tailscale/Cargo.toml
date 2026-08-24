@@ -7,6 +7,7 @@ rust-version.workspace = true
 license-file.workspace = true
 
 [dependencies]
+atomic-write-file.workspace = true
 meshelf-core = { path = "../meshelf-core" }
 meshelf-identity = { path = "../meshelf-identity" }
 serde.workspace = true

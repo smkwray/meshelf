@@ -1,268 +1,41 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::{
-    fs,
+    collections::HashMap,
+    fs::{self, OpenOptions},
     net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
+#[cfg(target_os = "macos")]
+use std::process::Command;
+
 use anyhow::Result;
-use meshelf_core::{DeviceId, Receipt, TextEnvelope};
-use meshelf_identity::InstallationIdentity;
+use meshelf_control::{Controller, MESHELF_PORT, PeerView};
+use meshelf_core::{ClipboardError, ClipboardSink, ContentKind, DeviceId, ReceiveRecord};
 use meshelf_net::{
-    CoreEnvelopeHandler, PeerClient, ServerIdentity, TrustDecision, TrustGate,
-    bind_discovered_tailscale_address, serve,
+    CoreEnvelopeHandler, ServerIdentity, TrustDecision, TrustGate,
+    bind_discovered_tailscale_std_listener, serve_with_files,
 };
-use meshelf_platform::{ClipboardSource, ClipboardWorker};
-use meshelf_protocol::{CAP_TEXT_CLIPBOARD_PUSH_V1, ClientHello, ServerHello};
+use meshelf_platform::{ClipboardItem, ClipboardSource, ClipboardWorker};
 use meshelf_store::RedbReceiveStore;
-use meshelf_tailscale::{
-    CliPeerDiscovery, InstallationState, PeerDiscovery, SshBootstrap, SshBootstrapRequest,
-    SshBootstrapResponse, TailNode, TailStatus,
-};
-use slint::ComponentHandle;
+use meshelf_tailscale::InstallationStore;
+use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
 use tokio::{runtime::Runtime, sync::watch};
 use tracing_subscriber::EnvFilter;
 
 slint::include_modules!();
 
-const MESHELF_PORT: u16 = 45_832;
-
-#[derive(Debug, Clone)]
-struct PendingPeer {
-    node: TailNode,
-    server: ServerHello,
-}
-
-#[derive(Debug, Clone)]
-struct PeerView {
-    name: String,
-    online: bool,
-    approval_available: bool,
-    status: String,
-}
-
-struct DiscoveryState {
-    state_path: PathBuf,
-    identity: InstallationIdentity,
-    installation: InstallationState,
-    device_name: String,
-    discovery: Option<CliPeerDiscovery>,
-    last_status: Option<TailStatus>,
-    pending: Option<PendingPeer>,
-    selected_device: Option<DeviceId>,
-}
-
-impl DiscoveryState {
-    fn load(state_path: PathBuf, device_name: String) -> Result<Self, String> {
-        let identity = InstallationIdentity::load_or_create()
-            .map_err(|error| format!("could not load meshelf installation identity: {error}"))?;
-        let loaded = InstallationState::load(&state_path)
-            .map_err(|error| format!("could not load meshelf state: {error}"))?;
-        let installation = if loaded.device_id == identity.device_id {
-            loaded
-        } else {
-            // A state file from another installation must never retain trust after a new
-            // credential-store identity is created or restored.
-            InstallationState {
-                device_id: identity.device_id,
-                peers: Default::default(),
-            }
-        };
-        Ok(Self {
-            state_path,
-            identity,
-            installation,
-            device_name,
-            discovery: CliPeerDiscovery::discover().ok(),
-            last_status: None,
-            pending: None,
-            selected_device: None,
-        })
-    }
-
-    fn refresh(&mut self) -> Result<PeerView, String> {
-        let discovery = self
-            .discovery
-            .as_ref()
-            .ok_or_else(|| "Tailscale was not found; install Tailscale and retry".to_owned())?;
-        let status = discovery
-            .refresh()
-            .map_err(|error| format!("Tailscale discovery failed: {error}"))?;
-        self.installation.peers.refresh_addresses(&status);
-        self.installation
-            .save(&self.state_path)
-            .map_err(|error| format!("could not save meshelf state: {error}"))?;
-        self.last_status = Some(status.clone());
-        self.pending = None;
-        self.selected_device = None;
-
-        let runtime =
-            Runtime::new().map_err(|error| format!("probe runtime unavailable: {error}"))?;
-        let client = PeerClient::with_timeouts(Duration::from_secs(1), Duration::from_secs(2));
-        for node in status.online_peers() {
-            for address in &node.addresses {
-                let socket = SocketAddr::new(*address, MESHELF_PORT);
-                let Ok(server) = runtime.block_on(client.probe(socket)) else {
-                    continue;
-                };
-                if !server
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == CAP_TEXT_CLIPBOARD_PUSH_V1)
-                {
-                    continue;
-                }
-                if !server.has_valid_signature() {
-                    continue;
-                }
-                self.pending = Some(PendingPeer {
-                    node: node.clone(),
-                    server,
-                });
-                return Ok(self.view());
-            }
-        }
-        Ok(self.view())
-    }
-
-    fn send_text(&self, text: &str) -> Result<Receipt, String> {
-        let device_id = self.selected_device.ok_or_else(|| {
-            "this device is discovered but unpaired; use Trust both ways using SSH first".to_owned()
-        })?;
-        let peer = self
-            .installation
-            .peers
-            .by_device_id(device_id)
-            .ok_or_else(|| "selected meshelf device is no longer trusted".to_owned())?;
-        let address = peer
-            .addresses
-            .first()
-            .copied()
-            .ok_or_else(|| "trusted device has no current Tailscale address".to_owned())?;
-        let now = now_unix_ms();
-        let envelope = TextEnvelope::clipboard_push(
-            self.identity.device_id,
-            peer.device_id,
-            now,
-            Some(now.saturating_add(30_000)),
-            text,
-        );
-        let hello = ClientHello::signed(
-            self.identity.device_id,
-            self.device_name.clone(),
-            DeviceId::new().to_string(),
-            &self.identity,
-        );
-        let runtime =
-            Runtime::new().map_err(|error| format!("send runtime unavailable: {error}"))?;
-        runtime
-            .block_on(PeerClient::default().push(
-                SocketAddr::new(address, MESHELF_PORT),
-                hello,
-                envelope,
-                &peer.public_key,
-            ))
-            .map_err(|error| format!("send failed: {error}"))
-    }
-
-    fn approve_pending(&mut self) -> Result<PeerView, String> {
-        let pending = self
-            .pending
-            .clone()
-            .ok_or_else(|| "no discovered meshelf device is waiting for approval".to_owned())?;
-        let local_status = self
-            .last_status
-            .as_ref()
-            .ok_or_else(|| "local Tailscale identity is unavailable".to_owned())?;
-        let node_id = local_status
-            .self_node
-            .node_id
-            .clone()
-            .ok_or_else(|| "local Tailscale node has no stable node ID".to_owned())?;
-        let bootstrap = SshBootstrap::discover(&pending.node).ok_or_else(|| {
-            "no configured SSH route was found for this Tailscale peer".to_owned()
-        })?;
-        let response = bootstrap
-            .authorize(&SshBootstrapRequest::signed(
-                self.identity.device_id,
-                node_id,
-                local_status.self_node.hostname.clone(),
-                local_status.self_node.addresses.clone(),
-                &self.identity,
-            ))
-            .map_err(|error| format!("one-side SSH bootstrap failed: {error}"))?;
-        if response.device_id != pending.server.device_id
-            || response.node_id != pending.node.node_id.clone().unwrap_or_default()
-            || response.public_key != pending.server.public_key
-            || !response.has_valid_signature()
-        {
-            return Err("SSH bootstrap answered with a different meshelf identity".to_owned());
-        }
-        self.installation
-            .peers
-            .accept_signed(
-                &response_to_tail_node(&response),
-                pending.server.device_id,
-                response.public_key.clone(),
-            )
-            .map_err(|error| format!("could not record reciprocal peer approval: {error}"))?;
-        self.installation
-            .save(&self.state_path)
-            .map_err(|error| format!("could not save reciprocal peer approval: {error}"))?;
-        self.selected_device = Some(pending.server.device_id);
-        self.pending = None;
-        Ok(self.view())
-    }
-
-    fn view(&self) -> PeerView {
-        if let Some(pending) = &self.pending {
-            return PeerView {
-                name: pending.server.device_name.clone(),
-                online: false,
-                approval_available: SshBootstrap::discover(&pending.node).is_some(),
-                status: format!(
-                    "{} discovered on Tailscale; approve once via existing SSH",
-                    pending.server.device_name
-                ),
-            };
-        }
-        if let Some(device_id) = self.selected_device
-            && let Some(peer) = self.installation.peers.by_device_id(device_id)
-        {
-            return PeerView {
-                name: peer.hostname.clone(),
-                online: true,
-                approval_available: false,
-                status: format!("{} is ready for explicit text sends", peer.hostname),
-            };
-        }
-        PeerView {
-            name: "Not configured".to_owned(),
-            online: false,
-            approval_available: false,
-            status: "No meshelf peer discovered on Tailscale".to_owned(),
-        }
-    }
-}
-
-fn response_to_tail_node(response: &SshBootstrapResponse) -> TailNode {
-    TailNode {
-        node_id: Some(response.node_id.clone()),
-        hostname: response.hostname.clone(),
-        dns_name: None,
-        addresses: response.addresses.clone(),
-        online: true,
-        active: true,
-    }
-}
-
 #[derive(Debug, Clone)]
 struct FileBackedTrustGate {
-    state_path: PathBuf,
+    store: InstallationStore,
+    identity: meshelf_core::DeviceId,
 }
 
 impl TrustGate for FileBackedTrustGate {
@@ -271,7 +44,7 @@ impl TrustGate for FileBackedTrustGate {
         remote: SocketAddr,
         hello: &meshelf_protocol::ClientHello,
     ) -> TrustDecision {
-        let Ok(state) = InstallationState::load(&self.state_path) else {
+        let Ok(state) = self.store.load_for_identity(self.identity) else {
             return TrustDecision::Deny("local meshelf state is unavailable".to_owned());
         };
         match state.peers.by_device_id(hello.device_id) {
@@ -298,6 +71,50 @@ struct ServerHandle {
     worker: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct OperationGate {
+    busy: Arc<AtomicBool>,
+}
+
+impl OperationGate {
+    fn try_enter(&self) -> Option<OperationPermit> {
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| OperationPermit {
+                busy: self.busy.clone(),
+            })
+    }
+}
+
+#[derive(Debug)]
+struct OperationPermit {
+    busy: Arc<AtomicBool>,
+}
+
+impl Drop for OperationPermit {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct ShelfSnapshot {
+    records: Vec<ReceiveRecord>,
+    peer_names: HashMap<DeviceId, String>,
+}
+
+#[derive(Debug, Default)]
+struct ShelfOnlyClipboard;
+
+impl ClipboardSink for ShelfOnlyClipboard {
+    fn set_text(&self, _text: &str) -> Result<(), ClipboardError> {
+        Err(ClipboardError::new(
+            "received shelf items require an explicit local copy action",
+        ))
+    }
+}
+
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
@@ -308,9 +125,8 @@ impl Drop for ServerHandle {
 }
 
 fn start_listener(
-    state: &DiscoveryState,
-    clipboard: &ClipboardWorker,
-    data_dir: &Path,
+    state: &Controller,
+    receive_store: Arc<RedbReceiveStore>,
 ) -> Result<ServerHandle, String> {
     let status = state
         .last_status
@@ -324,20 +140,15 @@ fn start_listener(
         .find(|address| address.is_ipv4())
         .or_else(|| status.self_node.addresses.first().copied())
         .ok_or_else(|| "Tailscale supplied no local address".to_owned())?;
-    let runtime =
-        Runtime::new().map_err(|error| format!("listener runtime unavailable: {error}"))?;
-    let listener = runtime
-        .block_on(bind_discovered_tailscale_address(
-            SocketAddr::new(address, MESHELF_PORT),
-            &status.self_node.addresses,
-        ))
-        .map_err(|error| format!("could not bind Tailscale listener: {error}"))?;
-    let store = RedbReceiveStore::open(data_dir.join("meshelf.redb"))
-        .map_err(|error| format!("could not open receive ledger: {error}"))?;
+    let listener = bind_discovered_tailscale_std_listener(
+        SocketAddr::new(address, MESHELF_PORT),
+        &status.self_node.addresses,
+    )
+    .map_err(|error| format!("could not bind Tailscale listener: {error}"))?;
     let receiver = Arc::new(meshelf_core::ReceiverService::new(
         state.installation.device_id,
-        Arc::new(store),
-        Arc::new(clipboard.clone()),
+        receive_store,
+        Arc::new(ShelfOnlyClipboard),
     ));
     let handler = Arc::new(CoreEnvelopeHandler::new(receiver));
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -346,22 +157,42 @@ fn start_listener(
         device_name: state.device_name.clone(),
     };
     let gate = Arc::new(FileBackedTrustGate {
-        state_path: state.state_path.clone(),
+        store: InstallationStore::new(state.state_path.clone()),
+        identity: state.identity.device_id,
     });
+    let incoming_directory = dirs::download_dir()
+        .unwrap_or_else(|| {
+            state
+                .state_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        })
+        .join("Meshelf Incoming");
     let worker = thread::Builder::new()
         .name("meshelf-network".to_owned())
         .spawn(move || {
             let Ok(runtime) = Runtime::new() else {
+                tracing::error!("meshelf listener runtime could not be created");
                 return;
             };
-            let _ = runtime.block_on(serve(
+            let Ok(listener) =
+                runtime.block_on(async move { tokio::net::TcpListener::from_std(listener) })
+            else {
+                tracing::error!("meshelf listener could not attach to its server runtime");
+                return;
+            };
+            if let Err(error) = runtime.block_on(serve_with_files(
                 listener,
                 identity,
                 gate,
                 handler,
+                incoming_directory,
                 Duration::from_secs(5),
                 shutdown_rx,
-            ));
+            )) {
+                tracing::error!(%error, "meshelf listener stopped unexpectedly");
+            }
         })
         .map_err(|error| format!("could not start Tailscale listener: {error}"))?;
     Ok(ServerHandle {
@@ -373,16 +204,196 @@ fn start_listener(
 fn apply_peer_view(window: &MainWindow, view: PeerView) {
     window.set_default_peer(view.name.into());
     window.set_default_peer_online(view.online);
-    window.set_default_peer_approval_available(view.approval_available);
     window.set_status_text(view.status.into());
 }
 
-fn now_unix_ms() -> u64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    u64::try_from(millis).unwrap_or(u64::MAX)
+fn load_shelf_snapshot(
+    receive_store: &RedbReceiveStore,
+    peer_names: &Mutex<HashMap<DeviceId, String>>,
+) -> Result<ShelfSnapshot, String> {
+    let records = receive_store
+        .recent(10)
+        .map_err(|error| format!("Could not read local shelf: {error}"))?;
+    let peer_names = peer_names
+        .lock()
+        .map_err(|_| "peer names are unavailable".to_owned())?
+        .clone();
+    Ok(ShelfSnapshot {
+        records,
+        peer_names,
+    })
+}
+
+fn apply_shelf_snapshot(window: &MainWindow, snapshot: ShelfSnapshot) {
+    let rows = snapshot
+        .records
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| shelf_row(&snapshot.peer_names, index, record))
+        .collect::<Vec<_>>();
+    window.set_shelf_items(ModelRc::new(VecModel::from(rows)));
+}
+
+fn refresh_shelf_in_background(
+    window_weak: slint::Weak<MainWindow>,
+    receive_store: Arc<RedbReceiveStore>,
+    peer_names: Arc<Mutex<HashMap<DeviceId, String>>>,
+    gate: OperationGate,
+) {
+    let Some(permit) = gate.try_enter() else {
+        return;
+    };
+    thread::spawn(move || {
+        let result = load_shelf_snapshot(&receive_store, &peer_names);
+        drop(permit);
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = window_weak.upgrade() {
+                match result {
+                    Ok(snapshot) => apply_shelf_snapshot(&window, snapshot),
+                    Err(error) => window.set_status_text(error.into()),
+                }
+            }
+        });
+    });
+}
+
+fn shelf_row(
+    peer_names: &HashMap<DeviceId, String>,
+    index: usize,
+    record: ReceiveRecord,
+) -> ShelfRow {
+    let source = peer_names
+        .get(&record.envelope.source_device)
+        .cloned()
+        .unwrap_or_else(|| record.envelope.source_device.to_string());
+    ShelfRow {
+        icon: match record.envelope.content_kind {
+            ContentKind::Text => "📝",
+            ContentKind::Path => "↗",
+            ContentKind::File => "📄",
+            ContentKind::Folder => "📁",
+        }
+        .into(),
+        preview: preview(&record.envelope.text).into(),
+        detail: format!("From {source} · click to copy").into(),
+        payload: record.envelope.text.into(),
+        file_item: matches!(
+            record.envelope.content_kind,
+            ContentKind::File | ContentKind::Folder
+        ),
+        shortcut: if index < 5 {
+            item_shortcut(index + 1).into()
+        } else {
+            "click".into()
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn paste_shortcut() -> &'static str {
+    "⌘V"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn paste_shortcut() -> &'static str {
+    "Ctrl+V"
+}
+
+#[cfg(target_os = "macos")]
+fn shelf_shortcut_help() -> &'static str {
+    "click or ⌘1–5 to copy"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shelf_shortcut_help() -> &'static str {
+    "click or Ctrl+1–5 to copy"
+}
+
+#[cfg(target_os = "macos")]
+fn item_shortcut(index: usize) -> String {
+    format!("⌘{index}")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn item_shortcut(index: usize) -> String {
+    format!("Ctrl+{index}")
+}
+
+fn capture_peer_names(state: &Controller) -> HashMap<DeviceId, String> {
+    state
+        .installation
+        .peers
+        .peers()
+        .iter()
+        .map(|peer| (peer.device_id, peer.hostname.clone()))
+        .collect()
+}
+
+fn raise_window(window: &MainWindow) {
+    window.window().set_minimized(false);
+    let _ = window.show();
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("/usr/bin/open")
+            .args(["-a", "meshelf"])
+            .spawn();
+    }
+}
+
+fn refresh_in_background(
+    window_weak: slint::Weak<MainWindow>,
+    app_state: Arc<Mutex<Controller>>,
+    peer_names: Arc<Mutex<HashMap<DeviceId, String>>>,
+    server: Arc<Mutex<Option<ServerHandle>>>,
+    receive_store: Arc<RedbReceiveStore>,
+    gate: OperationGate,
+) -> bool {
+    let Some(permit) = gate.try_enter() else {
+        return false;
+    };
+    thread::spawn(move || {
+        let result = app_state
+            .lock()
+            .map_err(|_| "app state is unavailable".to_owned())
+            .and_then(|mut state| {
+                let view = state.refresh()?;
+                if let Ok(mut names) = peer_names.lock() {
+                    *names = capture_peer_names(&state);
+                }
+                let needs_server = server.lock().map(|slot| slot.is_none()).unwrap_or(false);
+                if needs_server {
+                    let listener = start_listener(&state, receive_store.clone())?;
+                    if let Ok(mut slot) = server.lock()
+                        && slot.is_none()
+                    {
+                        *slot = Some(listener);
+                    }
+                }
+                Ok(Some(view))
+            });
+        drop(permit);
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = window_weak.upgrade() {
+                match result {
+                    Ok(Some(view)) => apply_peer_view(&window, view),
+                    Ok(None) => {}
+                    Err(error) => window.set_status_text(error.into()),
+                }
+            }
+        });
+    });
+    true
+}
+
+fn preview(text: &str) -> String {
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = single_line.chars();
+    let preview = chars.by_ref().take(180).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 fn main() -> Result<()> {
@@ -401,35 +412,43 @@ fn main() -> Result<()> {
 
     let window = MainWindow::new()?;
     let tray = MeshelfTray::new()?;
+    window.set_paste_shortcut(paste_shortcut().into());
+    window.set_shelf_shortcut_help(shelf_shortcut_help().into());
     let device_name = std::env::var("MESHELF_DEVICE_NAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "This device".to_owned());
-    window.set_device_name(device_name.clone().into());
-    tray.set_tooltip_text(format!("meshelf — {device_name}").into());
-
     let data_dir = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("meshelf");
     fs::create_dir_all(&data_dir)?;
+    let instance_lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(data_dir.join("desktop.lock"))?;
+    if instance_lock.try_lock().is_err() {
+        tracing::info!("meshelf desktop is already running");
+        return Ok(());
+    }
+    let _instance_lock = instance_lock;
     let state_path = data_dir.join("state.json");
+    let receive_store = Arc::new(
+        RedbReceiveStore::open(data_dir.join("meshelf.redb"))
+            .map_err(|error| anyhow::anyhow!("could not open receive ledger: {error}"))?,
+    );
     let app_state = Arc::new(Mutex::new(
-        DiscoveryState::load(state_path, device_name.clone())
-            .map_err(|error| anyhow::anyhow!(error))?,
+        Controller::load(state_path, device_name).map_err(|error| anyhow::anyhow!(error))?,
     ));
-    let initial_view = {
-        let mut state = app_state.lock().expect("app state mutex");
-        match state.refresh() {
-            Ok(view) => view,
-            Err(error) => PeerView {
-                name: "Not configured".to_owned(),
-                online: false,
-                approval_available: false,
-                status: error,
-            },
-        }
+    let (device_name, initial_peer_names) = {
+        let state = app_state.lock().expect("app state mutex");
+        (state.device_name.clone(), capture_peer_names(&state))
     };
-    apply_peer_view(&window, initial_view);
+    let peer_names = Arc::new(Mutex::new(initial_peer_names));
+    window.set_device_name(device_name.clone().into());
+    tray.set_tooltip_text(format!("meshelf — {device_name}").into());
+    window.set_status_text("Finding meshelf devices on Tailscale…".into());
 
     let clipboard = match ClipboardWorker::new() {
         Ok(clipboard) => Some(clipboard),
@@ -438,97 +457,135 @@ fn main() -> Result<()> {
             None
         }
     };
-    let _server = clipboard.as_ref().and_then(|clipboard| {
-        let state = app_state.lock().ok()?;
-        match start_listener(&state, clipboard, &data_dir) {
-            Ok(server) => Some(server),
-            Err(error) => {
-                window.set_status_text(error.into());
-                None
-            }
-        }
-    });
+    let server = Arc::new(Mutex::new(None::<ServerHandle>));
+    let send_gate = OperationGate::default();
+    let copy_gate = OperationGate::default();
+    let refresh_gate = OperationGate::default();
+    let shelf_gate = OperationGate::default();
 
     {
         let window_weak = window.as_weak();
         let clipboard = clipboard.clone();
-        window.on_paste_clipboard(move || {
+        let app_state = app_state.clone();
+        let send_gate = send_gate.clone();
+        window.on_paste_and_send(move || {
             let Some(window) = window_weak.upgrade() else {
                 return;
             };
-            let Some(clipboard) = clipboard.as_ref() else {
+            let Some(clipboard) = clipboard.clone() else {
                 window.set_status_text("Clipboard adapter is unavailable".into());
                 return;
             };
-            match clipboard.read_text() {
-                Ok(text) => {
-                    window.set_draft_text(text.into());
-                    window
-                        .set_status_text("Clipboard loaded locally; nothing has been sent".into());
-                }
-                Err(error) => {
-                    window.set_status_text(format!("Could not read clipboard: {error}").into());
-                }
-            }
+            let Some(permit) = send_gate.try_enter() else {
+                window.set_status_text("A mesh send is already in progress".into());
+                return;
+            };
+            window.set_status_text("Sending clipboard item to the mesh…".into());
+            let window_weak = window_weak.clone();
+            let app_state = app_state.clone();
+            thread::spawn(move || {
+                let result = clipboard
+                    .read_item()
+                    .map_err(|error| format!("Could not read clipboard: {error}"))
+                    .and_then(|item| {
+                        let state = app_state
+                            .lock()
+                            .map_err(|_| "app state is unavailable".to_owned())?;
+                        match item {
+                            ClipboardItem::Text(text) => {
+                                if text.trim().is_empty() {
+                                    return Err("Clipboard contains no text to send".to_owned());
+                                }
+                                state.send_to_mesh(&text).map(|report| report.status())
+                            }
+                            ClipboardItem::Files(paths) => state.send_paths_to_mesh(&paths),
+                        }
+                    });
+                drop(permit);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = window_weak.upgrade() {
+                        window.set_status_text(result.unwrap_or_else(|error| error).into());
+                    }
+                });
+            });
         });
     }
 
     {
         let window_weak = window.as_weak();
-        let app_state = app_state.clone();
-        window.on_send_default(move |draft| {
+        let clipboard = clipboard.clone();
+        let copy_gate = copy_gate.clone();
+        window.on_copy_item(move |text, file_item| {
             let Some(window) = window_weak.upgrade() else {
                 return;
             };
-            if draft.trim().is_empty() {
-                window.set_status_text("Nothing to send".into());
+            let Some(clipboard) = clipboard.clone() else {
+                window.set_status_text("Clipboard adapter is unavailable".into());
                 return;
-            }
-            let result = app_state
-                .lock()
-                .map_err(|_| "app state is unavailable".to_owned())
-                .and_then(|state| {
-                    state
-                        .send_text(&draft)
-                        .map(|receipt| format!("Send result: {:?}", receipt.code))
+            };
+            let Some(permit) = copy_gate.try_enter() else {
+                window.set_status_text("A shelf copy is already in progress".into());
+                return;
+            };
+            window.set_status_text("Copying shelf item…".into());
+            let window_weak = window_weak.clone();
+            thread::spawn(move || {
+                let result = if file_item {
+                    let path = PathBuf::from(text.as_str());
+                    if !path.exists() {
+                        Err(format!(
+                            "Received file is no longer present: {}",
+                            path.display()
+                        ))
+                    } else {
+                        clipboard
+                            .set_files(&[path])
+                            .map(|()| "Copied file to this clipboard".to_owned())
+                            .map_err(|error| format!("Could not update clipboard: {error}"))
+                    }
+                } else {
+                    clipboard
+                        .set_text(text.as_str())
+                        .map(|()| "Copied shelf item to this clipboard".to_owned())
+                        .map_err(|error| format!("Could not update clipboard: {error}"))
+                };
+                drop(permit);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = window_weak.upgrade() {
+                        window.set_status_text(result.unwrap_or_else(|error| error).into());
+                    }
                 });
-            window.set_status_text(result.unwrap_or_else(|error| error).into());
+            });
         });
     }
 
     {
         let window_weak = window.as_weak();
         let app_state = app_state.clone();
+        let peer_names = peer_names.clone();
+        let server = server.clone();
+        let receive_store = receive_store.clone();
+        let refresh_gate = refresh_gate.clone();
         window.on_refresh_peers(move || {
             let Some(window) = window_weak.upgrade() else {
                 return;
             };
-            let result = app_state
-                .lock()
-                .map_err(|_| "app state is unavailable".to_owned())
-                .and_then(|mut state| state.refresh());
-            match result {
-                Ok(view) => apply_peer_view(&window, view),
-                Err(error) => window.set_status_text(error.into()),
-            }
-        });
-    }
-
-    {
-        let window_weak = window.as_weak();
-        let app_state = app_state.clone();
-        window.on_approve_default(move || {
-            let Some(window) = window_weak.upgrade() else {
-                return;
-            };
-            let result = app_state
-                .lock()
-                .map_err(|_| "app state is unavailable".to_owned())
-                .and_then(|mut state| state.approve_pending());
-            match result {
-                Ok(view) => apply_peer_view(&window, view),
-                Err(error) => window.set_status_text(error.into()),
-            }
+            let started = refresh_in_background(
+                window_weak.clone(),
+                app_state.clone(),
+                peer_names.clone(),
+                server.clone(),
+                receive_store.clone(),
+                refresh_gate.clone(),
+            );
+            window.set_status_text(
+                if started {
+                    "Refreshing mesh devices…"
+                } else {
+                    "Mesh refresh is already in progress"
+                }
+                .into(),
+            );
         });
     }
 
@@ -536,7 +593,7 @@ fn main() -> Result<()> {
         let window_weak = window.as_weak();
         tray.on_open_window(move || {
             if let Some(window) = window_weak.upgrade() {
-                let _ = window.show();
+                raise_window(&window);
             }
         });
     }
@@ -545,19 +602,14 @@ fn main() -> Result<()> {
         let window_weak = window.as_weak();
         tray.on_send_default(move || {
             if let Some(window) = window_weak.upgrade() {
-                window.set_status_text("Open meshelf to review the explicit send".into());
-                let _ = window.show();
-            }
-        });
-    }
-
-    {
-        let window_weak = window.as_weak();
-        tray.on_choose_target(move || {
-            if let Some(window) = window_weak.upgrade() {
-                window
-                    .set_status_text("Refresh peers to discover a Tailscale meshelf device".into());
-                let _ = window.show();
+                window.set_status_text(
+                    format!(
+                        "Press {} to add the clipboard to the mesh",
+                        paste_shortcut()
+                    )
+                    .into(),
+                );
+                raise_window(&window);
             }
         });
     }
@@ -566,8 +618,161 @@ fn main() -> Result<()> {
         let _ = slint::quit_event_loop();
     });
 
+    let shelf_timer = Timer::default();
+    {
+        let window_weak = window.as_weak();
+        let receive_store = receive_store.clone();
+        let peer_names = peer_names.clone();
+        let shelf_gate = shelf_gate.clone();
+        shelf_timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
+            refresh_shelf_in_background(
+                window_weak.clone(),
+                receive_store.clone(),
+                peer_names.clone(),
+                shelf_gate.clone(),
+            );
+        });
+    }
+
+    let mesh_timer = Timer::default();
+    {
+        let window_weak = window.as_weak();
+        let app_state = app_state.clone();
+        let peer_names = peer_names.clone();
+        let server = server.clone();
+        let receive_store = receive_store.clone();
+        let refresh_gate = refresh_gate.clone();
+        mesh_timer.start(TimerMode::Repeated, Duration::from_secs(8), move || {
+            refresh_in_background(
+                window_weak.clone(),
+                app_state.clone(),
+                peer_names.clone(),
+                server.clone(),
+                receive_store.clone(),
+                refresh_gate.clone(),
+            );
+        });
+    }
+
     window.show()?;
     tray.show()?;
+    refresh_shelf_in_background(
+        window.as_weak(),
+        receive_store.clone(),
+        peer_names.clone(),
+        shelf_gate,
+    );
+    refresh_in_background(
+        window.as_weak(),
+        app_state,
+        peer_names,
+        server,
+        receive_store,
+        refresh_gate,
+    );
     slint::run_event_loop()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slint::platform::{Key, WindowEvent};
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn operation_gate_allows_only_one_in_flight_operation() {
+        let gate = OperationGate::default();
+        let first = gate.try_enter().expect("first operation starts");
+        assert!(gate.try_enter().is_none());
+        drop(first);
+        assert!(gate.try_enter().is_some());
+    }
+
+    #[test]
+    fn shortcuts_accept_control_once_and_ignore_meta() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().expect("test window");
+        let paste_count = Arc::new(AtomicUsize::new(0));
+        let callback_count = paste_count.clone();
+        window.on_paste_and_send(move || {
+            callback_count.fetch_add(1, Ordering::Relaxed);
+        });
+        let copied = Arc::new(Mutex::new(None::<(String, bool)>));
+        let copied_item = copied.clone();
+        window.on_copy_item(move |text, file_item| {
+            *copied_item.lock().expect("copy result") = Some((text.to_string(), file_item));
+        });
+        window.set_shelf_items(ModelRc::new(VecModel::from(vec![ShelfRow {
+            icon: "📝".into(),
+            preview: "first".into(),
+            detail: "test".into(),
+            payload: "first payload".into(),
+            file_item: false,
+            shortcut: "Ctrl+1".into(),
+        }])));
+
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyPressed { text: "v".into() });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyPressRepeated { text: "v".into() });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyReleased { text: "v".into() });
+        window.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
+        assert_eq!(paste_count.load(Ordering::Relaxed), 1);
+
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyPressed { text: "1".into() });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyReleased { text: "1".into() });
+        window.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
+        assert_eq!(
+            *copied.lock().expect("copy result"),
+            Some(("first payload".to_owned(), false))
+        );
+
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Meta.into(),
+        });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyPressed { text: "v".into() });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyReleased { text: "v".into() });
+        window.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Meta.into(),
+        });
+        assert_eq!(paste_count.load(Ordering::Relaxed), 1);
+
+        *copied.lock().expect("copy result") = None;
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Meta.into(),
+        });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyPressed { text: "1".into() });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyReleased { text: "1".into() });
+        window.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Meta.into(),
+        });
+        assert_eq!(*copied.lock().expect("copy result"), None);
+    }
 }

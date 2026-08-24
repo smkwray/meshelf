@@ -13,7 +13,7 @@ use std::{
 use anyhow::Result;
 use meshelf_identity::InstallationIdentity;
 use meshelf_tailscale::{
-    CliPeerDiscovery, InstallationState, PeerDiscovery, SshBootstrapRequest, SshBootstrapResponse,
+    CliPeerDiscovery, InstallationStore, PeerDiscovery, SshBootstrapRequest, SshBootstrapResponse,
     TailNode,
 };
 
@@ -65,34 +65,22 @@ pub fn run_stdio() -> Result<()> {
     let state_path = data_dir.join("state.json");
     let identity = InstallationIdentity::load_or_create()
         .map_err(|error| anyhow::anyhow!("could not load remote meshelf identity: {error}"))?;
-    let loaded = InstallationState::load(&state_path)
-        .map_err(|error| anyhow::anyhow!("could not load remote meshelf state: {error}"))?;
-    let mut installation = if loaded.device_id == identity.device_id {
-        loaded
-    } else {
-        InstallationState {
-            device_id: identity.device_id,
-            peers: Default::default(),
-        }
-    };
-    installation
-        .peers
-        .accept_signed(
-            &TailNode {
-                node_id: Some(request.node_id),
-                hostname: request.hostname,
-                dns_name: None,
-                addresses: request.addresses,
-                online: true,
-                active: true,
-            },
-            request.device_id,
-            request.public_key,
-        )
+    InstallationStore::new(state_path)
+        .update(identity.device_id, |latest| {
+            latest.peers.accept_signed(
+                &TailNode {
+                    node_id: Some(request.node_id),
+                    hostname: request.hostname,
+                    dns_name: None,
+                    addresses: request.addresses,
+                    online: true,
+                    active: true,
+                },
+                request.device_id,
+                request.public_key,
+            )
+        })
         .map_err(|error| anyhow::anyhow!("could not record SSH-approved peer: {error}"))?;
-    installation
-        .save(&state_path)
-        .map_err(|error| anyhow::anyhow!("could not save remote meshelf state: {error}"))?;
 
     let node_id = status
         .self_node

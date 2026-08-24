@@ -26,6 +26,19 @@ impl RedbReceiveStore {
         write.commit().map_err(map_redb_error)?;
         Ok(Self { database })
     }
+
+    pub fn recent(&self, limit: usize) -> Result<Vec<ReceiveRecord>, StoreError> {
+        let read = self.database.begin_read().map_err(map_redb_error)?;
+        let table = read.open_table(RECEIVE_LEDGER).map_err(map_redb_error)?;
+        let mut records = Vec::new();
+        for entry in table.iter().map_err(map_redb_error)? {
+            let (_, value) = entry.map_err(map_redb_error)?;
+            records.push(decode_record(value.value())?);
+        }
+        records.sort_by_key(|record| std::cmp::Reverse(record.first_seen_unix_ms));
+        records.truncate(limit);
+        Ok(records)
+    }
 }
 
 impl ReceiveStore for RedbReceiveStore {
@@ -176,5 +189,35 @@ mod tests {
         store.record_if_absent(&first, 100).expect("insert first");
         let existing = store.record_if_absent(&second, 101).expect("read existing");
         assert_eq!(existing.envelope.text, "first");
+    }
+
+    #[test]
+    fn recent_returns_newest_records_first() {
+        let directory = tempdir().expect("temp directory");
+        let store =
+            RedbReceiveStore::open(directory.path().join("meshelf.redb")).expect("open store");
+        let first = TextEnvelope::shelf_item(
+            DeviceId::new(),
+            DeviceId::new(),
+            100,
+            None,
+            meshelf_core::ContentKind::Text,
+            "first",
+        );
+        let second = TextEnvelope::shelf_item(
+            DeviceId::new(),
+            DeviceId::new(),
+            200,
+            None,
+            meshelf_core::ContentKind::Path,
+            "/tmp/second",
+        );
+        store.record_if_absent(&first, 100).expect("insert first");
+        store.record_if_absent(&second, 200).expect("insert second");
+
+        let records = store.recent(2).expect("read recent");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].envelope.text, "/tmp/second");
+        assert_eq!(records[1].envelope.text, "first");
     }
 }

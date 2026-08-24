@@ -19,6 +19,7 @@ EXCLUDED_PARTS = {
     "do",
     "status",
     "_icon_work",
+    "release",
 }
 EXCLUDED_FILES = {
     MANIFEST.resolve(),
@@ -27,10 +28,15 @@ EXCLUDED_FILES = {
     (ROOT / ".env").resolve(),
 }
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
+EXCLUDED_NAMES = {".DS_Store"}
 
 
 def is_sync_artifact(part: str) -> bool:
-    return part.startswith("~syncthing~") or "sync-conflict-" in part
+    return (
+        part.startswith("~syncthing~")
+        or part.startswith(".syncthing.")
+        or "sync-conflict-" in part
+    )
 
 
 def included_files() -> list[Path]:
@@ -43,7 +49,11 @@ def included_files() -> list[Path]:
             for part in path.relative_to(ROOT).parts
         ):
             continue
-        if path.resolve() in EXCLUDED_FILES or path.suffix in EXCLUDED_SUFFIXES:
+        if (
+            path.resolve() in EXCLUDED_FILES
+            or path.name in EXCLUDED_NAMES
+            or path.suffix in EXCLUDED_SUFFIXES
+        ):
             continue
         result.append(path)
     return sorted(result, key=lambda value: value.relative_to(ROOT).as_posix())

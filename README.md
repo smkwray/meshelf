@@ -5,7 +5,8 @@
 The primary interaction is deliberately minimal:
 
 ```text
-open meshelf -> click Paste clipboard -> click Send -> paste normally on the other device
+sender: open meshelf -> press Cmd/Ctrl+V once
+receiver: open meshelf -> click an item or press Cmd/Ctrl+1–5
 ```
 
 No machine is a controller, server, primary, leader, or canonical store. Every installation has the same role. A normal copy operation never causes network activity. Only an explicit meshelf action reads or sends clipboard content.
@@ -17,16 +18,15 @@ This repository is an **agent-ready implementation seed**, not a production rele
 - Windows, macOS, and desktop Linux.
 - Same binary role on every device.
 - Tailscale provides reachability; meshelf does not create another VPN.
-- Plain Unicode text only in v1.
-- Window-local buttons send only after the meshelf window is active and the user explicitly loads or types text.
-- Direct clipboard push is immediate and online-only.
-- Offline failure is visible and is never replayed later into the destination clipboard.
-- Received text is durably recorded before the application attempts the clipboard side effect.
+- Plain Unicode text plus direct file/folder transfer from native Finder/Explorer file copies or an existing textual path.
+- Cmd/Ctrl+V in the focused meshelf window reads the clipboard once and fans the item out to every paired online peer.
+- Received items are stored on the local shelf and never replace the receiver clipboard automatically.
+- Clicking a card or pressing Cmd/Ctrl+1–5 explicitly copies that shelf item on the receiving device.
+- Offline failure is visible and is never replayed later.
 - Message IDs make retries duplicate-safe.
 - The main window may be closed while a tray/menu-bar process remains available.
-- No automatic clipboard watcher, periodic clipboard polling, remote command execution, rich text, images, or file transfer in v1.
-
-File transfer is reserved in the architecture but intentionally not implemented in the first tranche.
+- No automatic clipboard watcher, periodic clipboard polling, remote command execution, rich text, or images.
+- File/folder senders and receivers must be online together; transfer is streamed directly and is not queued.
 
 ## Start here
 
@@ -64,6 +64,9 @@ macOS/Linux:
 ./scripts/dev.sh
 ```
 
+On macOS, `./scripts/package-macos.sh --install` creates and registers
+`~/Applications/meshelf.app`, making the app available to Raycast and `open -a meshelf`.
+
 Windows PowerShell or Command Prompt:
 
 ```bat
@@ -82,24 +85,32 @@ The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may requi
 - Durable receive-ledger interface and redb implementation.
 - Length-prefixed JSON wire codec.
 - Direct one-message TCP client/listener with timeouts.
+- Bounded direct file/folder streaming with manifests, free-space admission, SHA-256 verification,
+  partial staging, atomic finalization, and no-overwrite naming.
+- Native file-list clipboard reads and writes: copy in Finder/Explorer, paste once into Meshelf,
+  then activate the received card to paste the actual file from that device's clipboard.
 - Deny-by-default trust gate.
 - Tailscale `status --json` parser and binary locator.
 - On-demand Tailscale peer probes and a listener bound only to a discovered Tailscale address.
 - Protected per-installation Ed25519 identity, signed hellos, and durable peer-key bindings.
-- Tailscale discovery plus one-sided `Trust both ways using SSH` enrollment; the remote side needs
-  no physical click, and ordinary clipboard sends use direct meshelf TCP afterward.
+- Signed Meshelf peers on the same Tailscale network pair automatically during discovery; private
+  builds also recover automatically after an app reinstall on the same Tailscale node.
 - Cross-platform explicit clipboard adapter using `arboard`.
 - Window-local explicit send controls; meshelf does not register global hotkeys.
-- `meshelfctl` equivalents for status/refresh, one-sided SSH trust, clipboard read, and explicit
-  text/stdin/clipboard sends.
-- Transparent tray icon wiring and Windows executable icon resource wiring from the supplied
-  artwork; macOS/Linux bundle/icon verification remains a release task.
+- `meshelfctl` equivalents for status/refresh, clipboard read, and mesh-wide text/stdin/clipboard
+  sends.
+- High-contrast black-and-white tray icon wiring, rounded application artwork, Windows
+  executable icon resources, and a private macOS application-bundle path.
 - Slint 1.17 desktop window and system-tray shell.
 - Loopback simulation and unit-test scaffolding.
 - CI, packaging scripts, source manifest, and agent/audit handoffs.
 
 ## Deliberately unfinished
 
-The project is not safe for everyday clipboard use until the release gate in [`docs/05_TEST_PLAN.md`](docs/05_TEST_PLAN.md) passes. The largest open items are native credential-store evidence on all three platforms, Tailscale `WhoIs`, a packaged `meshelfctl` bootstrap path, listener lifecycle, notifications, start-at-login, installers/signing, and real two-device plus three-platform testing. Discovery never creates trust; only an explicit one-sided SSH enrollment (or a future human-verification path) creates the signed reciprocal binding.
+The app is in functional private testing, not a hardened public release. The largest open items are
+interrupted-transfer resume/cleanup, notifications/start-at-login, signing/notarization, Linux
+packaging, and a final security hardening pass. Automatic pairing
+currently treats a valid signed Meshelf installation on the owner's Tailscale network as eligible;
+tightening that policy is intentionally deferred until the core workflow is settled.
 
 See the private `do/state.md` note in a synced development workspace for the exact boundary.

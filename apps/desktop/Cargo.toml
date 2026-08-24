@@ -29,5 +29,8 @@ tracing-subscriber.workspace = true
 [build-dependencies]
 slint-build.workspace = true
 
+[dev-dependencies]
+i-slint-backend-testing = "=1.17.1"
+
 [target.'cfg(windows)'.build-dependencies]
 winresource.workspace = true

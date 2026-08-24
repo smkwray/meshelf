@@ -5,7 +5,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use meshelf_core::{
-    ClipboardError, ClipboardSink, MemoryReceiveStore, ReceiptCode, ReceiverService, TextEnvelope,
+    ClipboardError, ClipboardSink, ContentKind, MemoryReceiveStore, ReceiptCode, ReceiveStore,
+    ReceiverService, TextEnvelope,
 };
 use meshelf_identity::InstallationIdentity;
 use meshelf_net::{CoreEnvelopeHandler, ExactDeviceAllowList, PeerClient, ServerIdentity, serve};
@@ -32,9 +33,10 @@ async fn main() -> Result<()> {
     let bmst = bmst_identity.device_id;
     let bzot = bzot_identity.device_id;
     let clipboard = Arc::new(SimClipboard::default());
+    let receive_store = Arc::new(MemoryReceiveStore::new());
     let service = Arc::new(ReceiverService::new(
         bzot,
-        Arc::new(MemoryReceiveStore::new()),
+        receive_store.clone(),
         clipboard.clone(),
     ));
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -54,11 +56,12 @@ async fn main() -> Result<()> {
         shutdown_rx,
     ));
 
-    let message = TextEnvelope::clipboard_push(
+    let message = TextEnvelope::shelf_item(
         bmst,
         bzot,
         now_unix_ms(),
         None,
+        ContentKind::Text,
         "meshelf loopback: α\nβ\n🙂",
     );
     let client = PeerClient::with_timeouts(Duration::from_secs(2), Duration::from_secs(2));
@@ -86,9 +89,14 @@ async fn main() -> Result<()> {
         .lock()
         .map_err(|_| anyhow::anyhow!("simulation clipboard mutex poisoned"))?
         .clone();
-    if first.code != ReceiptCode::Applied
-        || duplicate.code != ReceiptCode::DuplicateApplied
-        || writes != vec!["meshelf loopback: α\nβ\n🙂".to_owned()]
+    let stored = receive_store
+        .get(first.message_id)
+        .context("read stored shelf item")?
+        .context("shelf item missing")?;
+    if first.code != ReceiptCode::Stored
+        || duplicate.code != ReceiptCode::Stored
+        || !writes.is_empty()
+        || stored.envelope.text != "meshelf loopback: α\nβ\n🙂"
     {
         bail!(
             "simulation failed: first={:?}, duplicate={:?}, writes={writes:?}",
@@ -99,7 +107,7 @@ async fn main() -> Result<()> {
 
     shutdown_tx.send(true).context("request shutdown")?;
     server.await.context("join server")??;
-    println!("PASS: direct two-peer send applied once; duplicate acknowledged without replay");
+    println!("PASS: direct two-peer shelf send stored once without changing the clipboard");
     Ok(())
 }
 

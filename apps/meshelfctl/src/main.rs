@@ -2,7 +2,7 @@ use std::io::{self, Read};
 
 use anyhow::{Context, Result, bail};
 use meshelf_control::Controller;
-use meshelf_platform::{ClipboardSource, ClipboardWorker};
+use meshelf_platform::{ClipboardItem, ClipboardSource, ClipboardWorker};
 
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
@@ -63,37 +63,50 @@ fn main() -> Result<()> {
         "clipboard-read" | "paste-clipboard" => {
             let clipboard =
                 ClipboardWorker::new().map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            print!(
-                "{}",
-                clipboard
-                    .read_text()
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?
-            );
+            match clipboard
+                .read_item()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            {
+                ClipboardItem::Text(text) => print!("{text}"),
+                ClipboardItem::Files(paths) => {
+                    for path in paths {
+                        println!("{}", path.display());
+                    }
+                }
+            }
         }
         "send" => {
+            if selector.is_some() {
+                bail!("meshelf sends are mesh-wide; --peer is not supported for send")
+            }
             let mut send_options = options.into_iter();
             let source = parse_send_source(&mut send_options)?;
             controller
                 .refresh()
                 .map_err(|error| anyhow::anyhow!(error))?;
-            controller
-                .select_peer(selector.as_deref())
-                .map_err(|error| anyhow::anyhow!(error))?;
-            let text = match source {
-                SendSource::Text(text) => text,
-                SendSource::Stdin => read_bounded_stdin()?,
+            let report = match source {
+                SendSource::Text(text) => {
+                    controller.send_to_mesh(&text).map(|report| report.status())
+                }
+                SendSource::Stdin => controller
+                    .send_to_mesh(&read_bounded_stdin()?)
+                    .map(|report| report.status()),
                 SendSource::Clipboard => {
                     let clipboard = ClipboardWorker::new()
                         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                    clipboard
-                        .read_text()
+                    match clipboard
+                        .read_item()
                         .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                    {
+                        ClipboardItem::Text(text) => {
+                            controller.send_to_mesh(&text).map(|report| report.status())
+                        }
+                        ClipboardItem::Files(paths) => controller.send_paths_to_mesh(&paths),
+                    }
                 }
-            };
-            let receipt = controller
-                .send_text(&text)
-                .map_err(|error| anyhow::anyhow!(error))?;
-            println!("send result: {:?}", receipt.code);
+            }
+            .map_err(|error| anyhow::anyhow!(error))?;
+            println!("{report}");
         }
         _ => return usage(),
     }

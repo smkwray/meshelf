@@ -5,7 +5,7 @@
 
 mod clipboard;
 
-pub use clipboard::{ClipboardSource, ClipboardWorker, PlatformClipboardError};
+pub use clipboard::{ClipboardItem, ClipboardSource, ClipboardWorker, PlatformClipboardError};
 
 pub trait Notifier: Send + Sync + 'static {
     fn received_clipboard(&self, source_name: &str) -> Result<(), String>;

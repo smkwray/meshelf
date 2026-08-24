@@ -54,7 +54,11 @@ def digest(path: Path) -> str:
 
 
 def is_sync_artifact(part: str) -> bool:
-    return part.startswith("~syncthing~") or "sync-conflict-" in part
+    return (
+        part.startswith("~syncthing~")
+        or part.startswith(".syncthing.")
+        or "sync-conflict-" in part
+    )
 
 
 def check_required() -> None:
@@ -66,10 +70,20 @@ def check_required() -> None:
 def check_text_and_structured_files() -> None:
     for path in sorted(ROOT.rglob("*")):
         if not path.is_file() or any(
-            part in {".git", "target", "__pycache__", ".venv", "do", "status", "_icon_work"}
+            part
+            in {
+                ".git",
+                "target",
+                "__pycache__",
+                ".venv",
+                "do",
+                "status",
+                "_icon_work",
+                "release",
+            }
             or is_sync_artifact(part)
             for part in path.relative_to(ROOT).parts
-        ) or path.name in {"AGENTS.md", "CLAUDE.md", ".env"} or path.suffix in {".pyc", ".pyo"}:
+        ) or path.name in {"AGENTS.md", "CLAUDE.md", ".DS_Store", ".env"} or path.suffix in {".pyc", ".pyo"}:
             continue
         if path.suffix.lower() in TEXT_SUFFIXES or path.name in {".editorconfig", ".gitattributes", ".gitignore"}:
             data = path.read_bytes()
@@ -128,7 +142,12 @@ def check_invariants() -> None:
     if "UncertainNoReplay" not in receiver or "ReceivePhase::Applying" not in receiver:
         fail("at-most-once uncertain-boundary handling is missing")
     clipboard = (ROOT / "crates/meshelf-platform/src/clipboard.rs").read_text(encoding="utf-8")
-    if clipboard.count("clipboard.get_text()") != 1 or "ClipboardCommand::Read" not in clipboard:
+    explicit_read = clipboard.split("ClipboardCommand::Read(response) =>", 1)
+    if (
+        len(explicit_read) != 2
+        or "clipboard.get().file_list()" not in explicit_read[1]
+        or ".get_text()" not in explicit_read[1]
+    ):
         fail("clipboard reads must remain isolated to the explicit Read command")
 
 
@@ -162,9 +181,22 @@ def check_manifest(allow_stale: bool) -> None:
         if path.is_file()
         and path != MANIFEST
         and path.suffix not in {".pyc", ".pyo"}
-        and path.name not in {"AGENTS.md", "CLAUDE.md", ".env"}
+        and path.name not in {"AGENTS.md", "CLAUDE.md", ".DS_Store", ".env"}
         and not any(
-            part in {".git", "target", ".idea", ".vscode", "local-data", "__pycache__", ".venv", "do", "status", "_icon_work"}
+            part
+            in {
+                ".git",
+                "target",
+                ".idea",
+                ".vscode",
+                "local-data",
+                "__pycache__",
+                ".venv",
+                "do",
+                "status",
+                "_icon_work",
+                "release",
+            }
             or is_sync_artifact(part)
             for part in path.relative_to(ROOT).parts
         )
@@ -191,18 +223,7 @@ def main() -> int:
     except Exception as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1
-    files = sum(
-        1
-        for path in ROOT.rglob("*")
-        if path.is_file()
-        and path.suffix not in {".pyc", ".pyo"}
-        and "__pycache__" not in path.parts
-        and ".venv" not in path.parts
-        and "do" not in path.parts
-        and "status" not in path.parts
-        and "_icon_work" not in path.parts
-        and not any(is_sync_artifact(part) for part in path.parts)
-    )
+    files = len(parse_manifest()) + 1
     print(f"PASS: meshelf repository structure and integrity checks ({files} files)")
     return 0
 

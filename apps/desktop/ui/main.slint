@@ -1,174 +1,241 @@
 import {
     Button,
     HorizontalBox,
-    TextEdit,
+    Palette,
+    ScrollView,
     VerticalBox,
 } from "std-widgets.slint";
 
+export struct ShelfRow {
+    icon: string,
+    preview: string,
+    detail: string,
+    payload: string,
+    file-item: bool,
+    shortcut: string,
+}
+
+component ShelfCard inherits Rectangle {
+    in property <ShelfRow> item-data;
+    callback activated();
+
+    height: 54px;
+    border-radius: 7px;
+    background: touch.pressed ? #252c35 : touch.has-hover ? #20262e : #181d23;
+    border-width: 1px;
+    border-color: touch.has-hover ? #537f85 : #2a323b;
+
+    HorizontalBox {
+        padding: 8px;
+        spacing: 8px;
+        Text {
+            width: 24px;
+            text: root.item-data.icon;
+            color: #d5eeee;
+            font-size: 16px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        VerticalBox {
+            spacing: 2px;
+            Text {
+                text: root.item-data.preview;
+                color: #eef1f4;
+                font-size: 12px;
+                overflow: elide;
+            }
+            Text {
+                text: root.item-data.detail;
+                color: #8f9aa5;
+                font-size: 10px;
+                overflow: elide;
+            }
+        }
+        Rectangle {
+            width: 38px;
+            background: transparent;
+            Text {
+                text: root.item-data.shortcut;
+                color: #cbd2da;
+                font-size: 9px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.activated(); }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "meshelf";
-    preferred-width: 720px;
-    preferred-height: 600px;
-    min-width: 520px;
-    min-height: 460px;
+    icon: @image-url("../../../assets/meshelf-256.png");
+    preferred-width: 460px;
+    preferred-height: 400px;
+    min-width: 360px;
+    min-height: 300px;
     background: #111418;
+    forward-focus: keyboard;
 
     in property <string> device-name: "This device";
     in property <string> default-peer: "Not configured";
     in property <bool> default-peer-online: false;
-    in property <bool> default-peer-approval-available: false;
-    in-out property <string> draft-text: "";
-    in-out property <string> status-text: "Tailscale discovery is ready; signed pairing is required before sending";
+    in property <string> paste-shortcut: "Ctrl+V";
+    in property <string> shelf-shortcut-help: "click or Ctrl+1–5 to copy";
+    in property <[ShelfRow]> shelf-items: [];
+    in-out property <string> status-text: "Open meshelf, then paste once to send";
 
-    callback paste-clipboard();
-    callback send-default(string);
+    callback paste-and-send();
+    callback copy-item(string, bool);
     callback refresh-peers();
-    callback approve-default();
 
-    VerticalBox {
-        padding: 22px;
-        spacing: 14px;
+    init => { keyboard.focus(); }
+
+    keyboard := FocusScope {
+        width: 100%;
+        height: 100%;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(event) => {
+            if (!event.repeat && event.modifiers.control) {
+                if (event.text == "v") {
+                    root.paste-and-send();
+                    return accept;
+                }
+                if (event.text == "1" && root.shelf-items.length > 0) {
+                    root.copy-item(root.shelf-items[0].payload, root.shelf-items[0].file-item);
+                    return accept;
+                }
+                if (event.text == "2" && root.shelf-items.length > 1) {
+                    root.copy-item(root.shelf-items[1].payload, root.shelf-items[1].file-item);
+                    return accept;
+                }
+                if (event.text == "3" && root.shelf-items.length > 2) {
+                    root.copy-item(root.shelf-items[2].payload, root.shelf-items[2].file-item);
+                    return accept;
+                }
+                if (event.text == "4" && root.shelf-items.length > 3) {
+                    root.copy-item(root.shelf-items[3].payload, root.shelf-items[3].file-item);
+                    return accept;
+                }
+                if (event.text == "5" && root.shelf-items.length > 4) {
+                    root.copy-item(root.shelf-items[4].payload, root.shelf-items[4].file-item);
+                    return accept;
+                }
+            }
+            return reject;
+        }
+
+        VerticalBox {
+            width: 100%;
+            height: 100%;
+            padding: 12px;
+            spacing: 8px;
 
         HorizontalBox {
-            spacing: 12px;
+            spacing: 8px;
             Text {
                 text: "meshelf";
                 color: #f3f5f7;
-                font-size: 26px;
+                font-size: 20px;
                 font-weight: 700;
                 vertical-alignment: center;
             }
             Rectangle { horizontal-stretch: 1; }
-            VerticalBox {
-                alignment: end;
-                spacing: 2px;
-                Text {
-                    text: root.device-name;
-                    color: #f3f5f7;
-                    horizontal-alignment: right;
-                }
-                Text {
-                    text: root.default-peer-online ? "default peer online" : "no authenticated peer";
-                    color: root.default-peer-online ? #76d69a : #9da5af;
-                    font-size: 12px;
-                    horizontal-alignment: right;
-                }
-            }
-        }
-
-        Rectangle {
-            height: 1px;
-            background: #2a3038;
-        }
-
-        Text {
-            text: "Paste or type text";
-            color: #d8dde3;
-            font-size: 15px;
-            font-weight: 600;
-        }
-
-        TextEdit {
-            text <=> root.draft-text;
-            height: 180px;
-            wrap: word-wrap;
-        }
-
-        HorizontalBox {
-            spacing: 10px;
-            Button {
-                text: "Paste clipboard";
-                clicked => { root.paste-clipboard(); }
-            }
-            Rectangle { horizontal-stretch: 1; }
-            Button {
-                text: root.default-peer == "Not configured"
-                    ? "Send to default peer"
-                    : "Send to " + root.default-peer;
-                enabled: root.default-peer-online && root.draft-text != "";
-                clicked => { root.send-default(root.draft-text); }
-            }
-        }
-
-        Rectangle {
-            height: 58px;
-            border-radius: 7px;
-            background: #1b2027;
-            border-width: 1px;
-            border-color: #303844;
             Text {
-                x: 14px;
-                y: 9px;
-                width: parent.width - 28px;
-                height: parent.height - 18px;
+                text: root.default-peer-online ? "● mesh ready" : "○ finding mesh";
+                color: root.default-peer-online ? #76d69a : #9da5af;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "Paste  " + root.paste-shortcut;
+                enabled: root.default-peer-online;
+                clicked => { root.paste-and-send(); }
+            }
+        }
+
+        Rectangle {
+            height: 30px;
+            border-radius: 5px;
+            background: #182025;
+            Text {
+                x: 9px;
+                width: parent.width - 18px;
+                height: parent.height;
                 text: root.status-text;
-                color: #b9c1cb;
-                wrap: word-wrap;
+                color: #9da9b3;
+                font-size: 10px;
+                overflow: elide;
                 vertical-alignment: center;
             }
         }
 
         HorizontalBox {
             Text {
-                text: "RECENT";
+                text: "ON THIS DEVICE  ·  " + root.shelf-shortcut-help;
                 color: #8f98a4;
-                font-size: 12px;
+                font-size: 10px;
                 font-weight: 700;
+                vertical-alignment: center;
             }
             Rectangle { horizontal-stretch: 1; }
             Button {
-                text: "Trust both ways using SSH";
-                enabled: root.default-peer-approval-available;
-                clicked => { root.approve-default(); }
-            }
-            Button {
-                text: "Refresh peers";
+                text: "Refresh";
                 clicked => { root.refresh-peers(); }
             }
         }
 
-        Rectangle {
+        if root.shelf-items.length == 0: Rectangle {
             vertical-stretch: 1;
-            min-height: 115px;
-            border-radius: 8px;
+            min-height: 80px;
+            border-radius: 7px;
             background: #161a20;
             border-width: 1px;
             border-color: #282e36;
             VerticalBox {
-                padding: 18px;
+                padding: 12px;
                 alignment: center;
                 Text {
-                    text: "No local history yet";
+                    text: "Shelf empty";
                     color: #d0d5dc;
                     horizontal-alignment: center;
                 }
                 Text {
-                    text: "Received text will be stored locally before clipboard application.";
+                    text: "Incoming items appear here without replacing your clipboard.";
                     color: #858e99;
-                    font-size: 12px;
+                    font-size: 10px;
                     horizontal-alignment: center;
                 }
             }
         }
 
-        Text {
-        text: "Send is available only while this window is active and signed pairing is complete.";
-            color: #747d88;
-            font-size: 11px;
-            horizontal-alignment: center;
+        if root.shelf-items.length > 0: ScrollView {
+            vertical-stretch: 1;
+            VerticalBox {
+                spacing: 5px;
+                for row[index] in root.shelf-items: ShelfCard {
+                    item-data: row;
+                    activated => { root.copy-item(row.payload, row.file-item); }
+                }
+            }
+        }
         }
     }
 }
 
 export component MeshelfTray inherits SystemTrayIcon {
     in property <string> tooltip-text: "meshelf";
-    icon: @image-url("../assets/meshelf-tray.png");
+    icon: Palette.color-scheme == ColorScheme.dark
+        ? @image-url("../assets/meshelf-tray-dark.png")
+        : @image-url("../assets/meshelf-tray-light.png");
     tooltip: root.tooltip-text;
     title: "";
 
     callback open-window();
     callback send-default();
-    callback choose-target();
     callback quit();
 
     Menu {
@@ -178,12 +245,8 @@ export component MeshelfTray inherits SystemTrayIcon {
         }
         MenuSeparator { }
         MenuItem {
-            title: "Open meshelf to send clipboard";
+            title: "Open meshelf to paste and send";
             activated => { root.send-default(); }
-        }
-        MenuItem {
-            title: "Open meshelf to choose target…";
-            activated => { root.choose-target(); }
         }
         MenuSeparator { }
         MenuItem {

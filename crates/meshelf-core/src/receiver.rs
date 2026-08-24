@@ -72,6 +72,9 @@ where
                 "message target does not match this device",
             );
         }
+        if envelope.delivery_mode == DeliveryMode::ShelfItem {
+            return self.store_shelf_item(envelope, now_unix_ms);
+        }
         if envelope.delivery_mode != DeliveryMode::ClipboardPush {
             return Receipt::rejected(
                 envelope.message_id,
@@ -94,6 +97,21 @@ where
         }
 
         self.resume_from(current, now_unix_ms)
+    }
+
+    fn store_shelf_item(&self, envelope: TextEnvelope, now_unix_ms: u64) -> Receipt {
+        let current = match self.store.record_if_absent(&envelope, now_unix_ms) {
+            Ok(record) => record,
+            Err(error) => return internal_store_error(envelope.message_id, &error),
+        };
+        if current.envelope != envelope {
+            return Receipt::rejected(
+                envelope.message_id,
+                ReceiptCode::RejectedMessageIdConflict,
+                "message ID was already used for different immutable content",
+            );
+        }
+        Receipt::new(envelope.message_id, ReceiptCode::Stored, None)
     }
 
     fn resume_from(&self, record: ReceiveRecord, now_unix_ms: u64) -> Receipt {
@@ -249,6 +267,36 @@ mod tests {
 
     fn envelope(source: DeviceId, target: DeviceId) -> TextEnvelope {
         TextEnvelope::clipboard_push(source, target, 100, Some(10_000), "hello\nworld")
+    }
+
+    #[test]
+    fn shelf_item_is_stored_without_touching_clipboard() {
+        let local = DeviceId::new();
+        let store = Arc::new(MemoryReceiveStore::new());
+        let clipboard = Arc::new(CountingClipboard::default());
+        let service = ReceiverService::new(local, store.clone(), clipboard.clone());
+        let message = TextEnvelope::shelf_item(
+            DeviceId::new(),
+            local,
+            100,
+            Some(10_000),
+            crate::ContentKind::Text,
+            "shelf text",
+        );
+
+        let receipt = service.receive(message.clone(), 200);
+
+        assert_eq!(receipt.code, ReceiptCode::Stored);
+        assert!(clipboard.writes().is_empty());
+        assert_eq!(
+            store
+                .get(message.message_id)
+                .expect("read store")
+                .expect("stored record")
+                .envelope
+                .text,
+            "shelf text"
+        );
     }
 
     #[test]

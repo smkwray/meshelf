@@ -13,22 +13,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT.parent / "meshelf-agent-seed-2026-08-23.zip"
 FIXED_TIME = (2026, 8, 23, 12, 0, 0)
-EXCLUDED_PARTS = {".git", "target", ".idea", ".vscode", "local-data", "__pycache__"}
-EXCLUDED_NAMES = {".DS_Store"}
-EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
+MANIFEST = ROOT / "manifests" / "FILES.sha256"
 
 
 def source_files() -> list[Path]:
-    result = []
-    for path in ROOT.rglob("*"):
-        if not path.is_file():
+    result = [MANIFEST]
+    for line in MANIFEST.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
             continue
-        relative = path.relative_to(ROOT)
-        if any(part in EXCLUDED_PARTS for part in relative.parts):
-            continue
-        if path.name in EXCLUDED_NAMES or path.suffix in EXCLUDED_SUFFIXES:
-            continue
-        result.append(path)
+        _, relative = line.split("  ", 1)
+        result.append(ROOT / relative)
     return sorted(result, key=lambda value: value.relative_to(ROOT).as_posix())
 
 
