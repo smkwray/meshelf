@@ -5,22 +5,45 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, ErrorKind, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::Path,
-    process::Command,
     thread,
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::process::Command;
 
 use meshelf_core::MessageId;
 
 const ACTIVATION_FILE: &str = "activation";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
+pub const MAX_CONTROL_REQUEST_BYTES: usize = 64 * 1024;
+pub const MAX_CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Start the loopback activation listener and publish its address and token.
 pub fn listen(data_dir: &Path, on_activate: impl Fn() + Send + 'static) -> io::Result<()> {
+    listen_with_control(data_dir, on_activate, |_request| {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "legacy activation listener does not handle control requests",
+        ))
+    })
+}
+
+/// Start the loopback listener with a bounded request/response transport.
+///
+/// A connection first proves possession of the token in the activation file. A clean EOF after
+/// that token is the legacy raise-the-window signal. Otherwise the connection carries one
+/// length-prefixed request and one length-prefixed response. The request handler owns command
+/// semantics; this module only supplies authenticated local transport.
+pub fn listen_with_control(
+    data_dir: &Path,
+    on_activate: impl Fn() + Send + 'static,
+    on_request: impl Fn(&[u8]) -> io::Result<Vec<u8>> + Send + 'static,
+) -> io::Result<()> {
     fs::create_dir_all(data_dir)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
@@ -36,9 +59,7 @@ pub fn listen(data_dir: &Path, on_activate: impl Fn() + Send + 'static) -> io::R
                 let Ok(stream) = connection else {
                     break;
                 };
-                if authenticates(stream, &token) {
-                    on_activate();
-                }
+                let _ = handle_connection(stream, &token, &on_activate, &on_request);
             }
             let _ = fs::remove_file(thread_activation_path);
         })
@@ -52,7 +73,7 @@ pub fn listen(data_dir: &Path, on_activate: impl Fn() + Send + 'static) -> io::R
 
 /// Signal the resident desktop process, returning whether the token was sent.
 pub fn signal(data_dir: &Path) -> bool {
-    let Some((port, token)) = read_activation(&data_dir.join(ACTIVATION_FILE)) else {
+    let Ok((port, token)) = read_activation(&data_dir.join(ACTIVATION_FILE)) else {
         return false;
     };
     let address = SocketAddr::from(([127, 0, 0, 1], port));
@@ -68,6 +89,29 @@ pub fn signal(data_dir: &Path) -> bool {
     true
 }
 
+/// Send one bounded local-control request and return its bounded response.
+pub fn request(data_dir: &Path, request: &[u8]) -> io::Result<Vec<u8>> {
+    if request.len() > MAX_CONTROL_REQUEST_BYTES {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "control request is {} bytes; maximum is {MAX_CONTROL_REQUEST_BYTES}",
+                request.len()
+            ),
+        ));
+    }
+
+    let (port, token) = read_activation(&data_dir.join(ACTIVATION_FILE))?;
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
+    stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.write_all(token.as_bytes())?;
+    write_frame(&mut stream, request, MAX_CONTROL_REQUEST_BYTES)?;
+    stream.flush()?;
+    read_frame(&mut stream, MAX_CONTROL_RESPONSE_BYTES, "response")
+}
+
 fn write_activation(path: &Path, port: u16, token: &str) -> io::Result<()> {
     let temporary_path = path.with_file_name(format!(".activation-{token}.tmp"));
     let result = (|| {
@@ -77,7 +121,7 @@ fn write_activation(path: &Path, port: u16, token: &str) -> io::Result<()> {
             .open(&temporary_path)?;
         write_activation_contents(&mut file, port, token)?;
         file.sync_all()?;
-        make_owner_only(&temporary_path);
+        make_owner_only(&temporary_path)?;
 
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -96,51 +140,143 @@ fn write_activation_contents(file: &mut File, port: u16, token: &str) -> io::Res
     writeln!(file, "{port} {token}")
 }
 
-fn make_owner_only(path: &Path) {
+pub(crate) fn make_owner_only(path: &Path) -> io::Result<()> {
     // Rust's standard library has no portable owner-only ACL API. On Unix platforms
     // with chmod, apply the restrictive mode; Windows uses the ACL of its config directory.
-    let _ = Command::new("chmod")
-        .args(["600", &path_to_arg(path)])
-        .status();
+    #[cfg(unix)]
+    {
+        let mode = if path.metadata()?.is_dir() {
+            "700"
+        } else {
+            "600"
+        };
+        let status = Command::new("chmod")
+            .args([mode, &path_to_arg(path)])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "chmod {mode} for {} exited with {status}",
+                path.display()
+            )))
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
+#[cfg(unix)]
 fn path_to_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn read_activation(path: &Path) -> Option<(u16, String)> {
-    let contents = fs::read_to_string(path).ok()?;
+fn read_activation(path: &Path) -> io::Result<(u16, String)> {
+    let contents = fs::read_to_string(path)?;
     let mut fields = contents.split_whitespace();
-    let port = fields.next()?.parse().ok()?;
-    let token = fields.next()?.to_owned();
+    let port = fields
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "activation file has no port"))?
+        .parse()
+        .map_err(|error| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("activation file has an invalid port: {error}"),
+            )
+        })?;
+    let token = fields
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "activation file has no token"))?
+        .to_owned();
     if fields.next().is_some() || token.is_empty() {
-        return None;
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "activation file has malformed fields",
+        ));
     }
-    Some((port, token))
+    Ok((port, token))
 }
 
-fn authenticates(mut stream: TcpStream, expected_token: &str) -> bool {
+fn handle_connection(
+    mut stream: TcpStream,
+    expected_token: &str,
+    on_activate: &impl Fn(),
+    on_request: &impl Fn(&[u8]) -> io::Result<Vec<u8>>,
+) -> io::Result<()> {
     if stream.set_read_timeout(Some(READ_TIMEOUT)).is_err() {
-        return false;
+        return Ok(());
+    }
+    if stream.set_write_timeout(Some(READ_TIMEOUT)).is_err() {
+        return Ok(());
     }
 
-    let expected = expected_token.as_bytes();
-    let mut received = Vec::with_capacity(expected.len() + 1);
-    let mut buffer = [0_u8; 64];
-    loop {
-        let read_limit = (expected.len() + 1).saturating_sub(received.len());
-        if read_limit == 0 {
-            return false;
-        }
-        let buffer_limit = read_limit.min(buffer.len());
-        let Ok(bytes_read) = stream.read(&mut buffer[..buffer_limit]) else {
-            return false;
-        };
-        if bytes_read == 0 {
-            return received == expected;
-        }
-        received.extend_from_slice(&buffer[..bytes_read]);
+    let mut received_token = vec![0_u8; expected_token.len()];
+    if stream.read_exact(&mut received_token).is_err()
+        || received_token != expected_token.as_bytes()
+    {
+        return Ok(());
     }
+
+    let mut first_frame_byte = [0_u8; 1];
+    match stream.read(&mut first_frame_byte) {
+        Ok(0) => {
+            on_activate();
+            Ok(())
+        }
+        Ok(1) => {
+            let mut length = [0_u8; 4];
+            length[0] = first_frame_byte[0];
+            stream.read_exact(&mut length[1..])?;
+            let request_length = u32::from_be_bytes(length) as usize;
+            if request_length > MAX_CONTROL_REQUEST_BYTES {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "control request is {request_length} bytes; maximum is {MAX_CONTROL_REQUEST_BYTES}"
+                    ),
+                ));
+            }
+            let mut request = vec![0_u8; request_length];
+            stream.read_exact(&mut request)?;
+            let response = on_request(&request)?;
+            write_frame(&mut stream, &response, MAX_CONTROL_RESPONSE_BYTES)
+        }
+        Ok(_) => unreachable!("a one-byte read cannot return more than one byte"),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_frame(stream: &mut TcpStream, payload: &[u8], maximum: usize) -> io::Result<()> {
+    if payload.len() > maximum || payload.len() > u32::MAX as usize {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "control frame is {} bytes; maximum is {maximum}",
+                payload.len()
+            ),
+        ));
+    }
+    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
+    stream.write_all(payload)
+}
+
+fn read_frame(stream: &mut TcpStream, maximum: usize, label: &str) -> io::Result<Vec<u8>> {
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > maximum {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("control {label} is {length} bytes; maximum is {maximum}"),
+        ));
+    }
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload)?;
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -174,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn listener_is_signalled_and_callback_runs_once() {
+    fn local_control_still_raises_the_window_for_a_legacy_activation_signal() {
         let directory = TestDirectory::new();
         let (activated, received) = mpsc::channel();
         listen(directory.path(), move || {
@@ -229,6 +365,104 @@ mod tests {
 
         let started = Instant::now();
         assert!(!signal(directory.path()));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn local_control_round_trips_a_bounded_request_and_response() {
+        let directory = TestDirectory::new();
+        listen_with_control(
+            directory.path(),
+            || {},
+            |request| {
+                let mut response = b"response:".to_vec();
+                response.extend_from_slice(request);
+                Ok(response)
+            },
+        )
+        .expect("start local control listener");
+
+        let response = request(directory.path(), b"bounded request")
+            .expect("bounded request/response round trip");
+        assert_eq!(response, b"response:bounded request");
+    }
+
+    #[test]
+    fn local_control_rejects_a_wrong_token_before_reading_a_request() {
+        let directory = TestDirectory::new();
+        let (handled, received) = mpsc::channel();
+        listen_with_control(
+            directory.path(),
+            || {},
+            move |_request| {
+                handled.send(()).expect("handler receiver is alive");
+                Ok(Vec::new())
+            },
+        )
+        .expect("start local control listener");
+
+        let (port, token) = read_activation(&directory.path().join(ACTIVATION_FILE))
+            .expect("activation file contents");
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+            .expect("connect local control listener");
+        let wrong_token = vec![b'x'; token.len()];
+        stream
+            .write_all(&wrong_token)
+            .and_then(|()| stream.write_all(&[0, 0, 0, 1, b'x']))
+            .expect("write wrong token and request");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("finish wrong-token request");
+
+        assert!(received.recv_timeout(Duration::from_millis(500)).is_err());
+    }
+
+    #[test]
+    fn local_control_rejects_an_oversized_request_without_allocating_it() {
+        let directory = TestDirectory::new();
+        let (handled, received) = mpsc::channel();
+        listen_with_control(
+            directory.path(),
+            || {},
+            move |_request| {
+                handled.send(()).expect("handler receiver is alive");
+                Ok(Vec::new())
+            },
+        )
+        .expect("start local control listener");
+
+        let (port, token) = read_activation(&directory.path().join(ACTIVATION_FILE))
+            .expect("activation file contents");
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+            .expect("connect local control listener");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set bounded test timeout");
+        stream.write_all(token.as_bytes()).expect("write token");
+        stream
+            .write_all(&((MAX_CONTROL_REQUEST_BYTES as u32) + 1).to_be_bytes())
+            .expect("write oversized request length");
+
+        let mut byte = [0_u8; 1];
+        let result = stream.read(&mut byte);
+        assert!(matches!(result, Ok(0) | Err(_)));
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn stale_control_file_returns_an_error_rather_than_blocking() {
+        let directory = TestDirectory::new();
+        fs::write(
+            directory.path().join(ACTIVATION_FILE),
+            "0 00000000-0000-0000-0000-000000000000\n",
+        )
+        .expect("write stale control file");
+
+        let started = Instant::now();
+        let result = request(directory.path(), b"request");
+        assert!(result.is_err(), "stale control file must return an error");
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

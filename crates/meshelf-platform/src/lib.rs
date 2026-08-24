@@ -5,9 +5,17 @@
 
 mod activation;
 mod clipboard;
+mod filesystem;
 
-pub use activation::{listen, signal};
+pub use activation::{
+    MAX_CONTROL_REQUEST_BYTES, MAX_CONTROL_RESPONSE_BYTES, listen, listen_with_control, request,
+    signal,
+};
 pub use clipboard::{ClipboardItem, ClipboardSource, ClipboardWorker, PlatformClipboardError};
+pub use filesystem::{
+    FilesystemKey, apply_owner_only_permissions, available_space, filesystem_key, preallocate,
+    sync_directory, total_space,
+};
 
 pub trait Notifier: Send + Sync + 'static {
     fn received_clipboard(&self, source_name: &str) -> Result<(), String>;

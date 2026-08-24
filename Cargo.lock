@@ -3238,6 +3238,7 @@ name = "meshelf-platform"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "fs2",
  "meshelf-core",
  "thiserror 2.0.20",
 ]

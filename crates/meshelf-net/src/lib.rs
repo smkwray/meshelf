@@ -1353,6 +1353,11 @@ mod tests {
 
     use super::*;
 
+    /// Loopback tests assert data preservation, not latency. Two seconds was tight enough that
+    /// the folder-stream test timed out only when the whole workspace suite ran in parallel on a
+    /// loaded machine, which turns a real failure into something easy to dismiss as flake.
+    const TEST_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
     #[derive(Debug, Default)]
     struct TestClipboard(Mutex<Vec<String>>);
 
@@ -1393,12 +1398,12 @@ mod tests {
             },
             gate,
             handler,
-            Duration::from_secs(2),
+            TEST_IO_TIMEOUT,
             shutdown_rx,
         ));
 
         let message = TextEnvelope::clipboard_push(source, target, now_unix_ms(), None, "hello");
-        let client = PeerClient::with_timeouts(Duration::from_secs(2), Duration::from_secs(2));
+        let client = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT);
         let first = client
             .push(
                 address,
@@ -1460,7 +1465,7 @@ mod tests {
             Arc::new(ExactDeviceAllowList::new([source])),
             Arc::new(CoreEnvelopeHandler::new(receiver)),
             incoming.clone(),
-            Duration::from_secs(2),
+            TEST_IO_TIMEOUT,
             shutdown_rx,
         ));
         let transfer_id = meshelf_core::MessageId::new();
@@ -1479,7 +1484,7 @@ mod tests {
                 sha256: Sha256::digest(bytes).to_vec(),
             }],
         };
-        let client = PeerClient::with_timeouts(Duration::from_secs(2), Duration::from_secs(2));
+        let client = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT);
         let receipt = client
             .push_file_transfer(
                 address,
@@ -1826,7 +1831,7 @@ mod tests {
             Arc::new(ExactDeviceAllowList::new([source])),
             Arc::new(CoreEnvelopeHandler::new(receiver)),
             incoming.clone(),
-            Duration::from_secs(2),
+            TEST_IO_TIMEOUT,
             shutdown_rx,
         ));
         let transfer_id = meshelf_core::MessageId::new();
@@ -1859,7 +1864,7 @@ mod tests {
                 },
             ],
         };
-        let receipt = PeerClient::with_timeouts(Duration::from_secs(2), Duration::from_secs(2))
+        let receipt = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
             .push_file_transfer(
                 address,
                 ClientHello::signed(source, "BMST", "folder-nonce", &source_identity),
@@ -1912,7 +1917,7 @@ mod tests {
             },
             Arc::new(DenyAll),
             Arc::new(CoreEnvelopeHandler::new(receiver)),
-            Duration::from_secs(2),
+            TEST_IO_TIMEOUT,
             shutdown_rx,
         ));
 
@@ -1999,7 +2004,7 @@ mod tests {
                 .expect("attach listener to runtime");
             ready_tx.send(()).expect("signal listener ready");
             runtime
-                .block_on(async { timeout(Duration::from_secs(2), listener.accept()).await })
+                .block_on(async { timeout(TEST_IO_TIMEOUT, listener.accept()).await })
                 .expect("listener accepted before timeout")
                 .expect("accept connection");
         });
