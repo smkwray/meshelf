@@ -1138,7 +1138,7 @@ async fn finalize_payload_without_overwrite(
     content_kind: ContentKind,
 ) -> Result<PathBuf, NetError> {
     for index in 1..=9999 {
-        let final_path = collision_candidate(directory, root_name, content_kind, index);
+        let final_path = collision_candidate(directory, root_name, content_kind, index)?;
         match finalize_payload(payload, &final_path, content_kind).await {
             Ok(()) => return Ok(final_path),
             Err(NetError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1149,7 +1149,7 @@ async fn finalize_payload_without_overwrite(
     }
 
     let suffix = format!(".{}", meshelf_core::MessageId::new());
-    let final_path = directory.join(component_with_suffix(root_name, &suffix));
+    let final_path = directory.join(component_with_suffix(root_name, &suffix)?);
     finalize_payload(payload, &final_path, content_kind).await?;
     Ok(final_path)
 }
@@ -1165,9 +1165,58 @@ async fn finalize_payload(
         // a failed transfer. The caller removes the whole transfer staging directory as well.
         let _ = tokio::fs::remove_file(payload).await;
     } else {
-        renamore::rename_exclusive(payload, final_path)?;
+        rename_exclusive_portable(payload, final_path)?;
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn rename_exclusive_portable(payload: &Path, final_path: &Path) -> std::io::Result<()> {
+    renamore::rename_exclusive(payload, final_path)
+}
+
+#[cfg(windows)]
+fn rename_exclusive_portable(payload: &Path, final_path: &Path) -> std::io::Result<()> {
+    let payload = windows_verbatim_path(payload)?;
+    let final_path = windows_verbatim_path(final_path)?;
+    renamore::rename_exclusive(&payload, &final_path)
+}
+
+#[cfg(windows)]
+fn windows_verbatim_path(path: &Path) -> std::io::Result<PathBuf> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
+
+    const SEP: u16 = b'\\' as u16;
+    const DOT: u16 = b'.' as u16;
+    const QUERY: u16 = b'?' as u16;
+    const U: u16 = b'U' as u16;
+    const N: u16 = b'N' as u16;
+    const C: u16 = b'C' as u16;
+    const VERBATIM_PREFIX: &[u16] = &[SEP, SEP, QUERY, SEP];
+    const NT_PREFIX: &[u16] = &[SEP, QUERY, QUERY, SEP];
+    const DEVICE_PREFIX: &[u16] = &[SEP, SEP, DOT, SEP];
+    const UNC_PREFIX: &[u16] = &[SEP, SEP, QUERY, SEP, U, N, C, SEP];
+
+    let absolute = std::path::absolute(path)?;
+    let wide = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.starts_with(VERBATIM_PREFIX) || wide.starts_with(NT_PREFIX) {
+        return Ok(absolute);
+    }
+
+    let (prefix, body) = if wide.starts_with(DEVICE_PREFIX) {
+        (VERBATIM_PREFIX, &wide[DEVICE_PREFIX.len()..])
+    } else if wide.starts_with(&[SEP, SEP]) {
+        (UNC_PREFIX, &wide[2..])
+    } else {
+        (VERBATIM_PREFIX, wide.as_slice())
+    };
+    let mut verbatim = Vec::with_capacity(prefix.len() + body.len());
+    verbatim.extend_from_slice(prefix);
+    verbatim.extend_from_slice(body);
+    Ok(PathBuf::from(OsString::from_wide(&verbatim)))
 }
 
 fn collision_candidate(
@@ -1175,9 +1224,10 @@ fn collision_candidate(
     root_name: &str,
     content_kind: ContentKind,
     index: usize,
-) -> PathBuf {
+) -> Result<PathBuf, NetError> {
     if index == 1 {
-        return directory.join(root_name);
+        validate_component(root_name).map_err(generated_component_error)?;
+        return Ok(directory.join(root_name));
     }
 
     let suffix = format!(" ({index})");
@@ -1190,23 +1240,50 @@ fn collision_candidate(
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or(root_name);
-        let fixed_bytes = suffix.len() + 1 + extension.len();
+        let fixed_bytes = suffix
+            .len()
+            .checked_add(1)
+            .and_then(|value| value.checked_add(extension.len()))
+            .ok_or_else(|| {
+                NetError::FileTransfer("generated destination name length overflow".to_owned())
+            })?;
         if let Some(max_stem_bytes) = MAX_PORTABLE_COMPONENT_BYTES.checked_sub(fixed_bytes) {
             let stem = truncate_utf8(stem, max_stem_bytes);
             if !stem.is_empty() {
-                return directory.join(format!("{stem}{suffix}.{extension}"));
+                let name = format!("{stem}{suffix}.{extension}");
+                validate_component(&name).map_err(generated_component_error)?;
+                return Ok(directory.join(name));
             }
         }
     }
 
-    directory.join(component_with_suffix(root_name, &suffix))
+    Ok(directory.join(component_with_suffix(root_name, &suffix)?))
 }
 
-fn component_with_suffix(component: &str, suffix: &str) -> String {
-    debug_assert!(suffix.len() < MAX_PORTABLE_COMPONENT_BYTES);
-    let max_component_bytes = MAX_PORTABLE_COMPONENT_BYTES.saturating_sub(suffix.len());
+fn component_with_suffix(component: &str, suffix: &str) -> Result<String, NetError> {
+    let max_component_bytes = MAX_PORTABLE_COMPONENT_BYTES
+        .checked_sub(suffix.len())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            NetError::FileTransfer(format!(
+                "generated destination suffix is {} bytes; maximum component is {MAX_PORTABLE_COMPONENT_BYTES}",
+                suffix.len()
+            ))
+        })?;
     let component = truncate_utf8(component, max_component_bytes);
-    format!("{component}{suffix}")
+    if component.is_empty() {
+        return Err(NetError::FileTransfer(
+            "generated destination suffix leaves no complete UTF-8 character for the name"
+                .to_owned(),
+        ));
+    }
+    let name = format!("{component}{suffix}");
+    validate_component(&name).map_err(generated_component_error)?;
+    Ok(name)
+}
+
+fn generated_component_error(error: String) -> NetError {
+    NetError::FileTransfer(format!("generated destination name is invalid: {error}"))
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -1504,7 +1581,8 @@ mod tests {
     fn collision_candidates_stay_within_portable_component_limit() {
         let directory = Path::new("incoming");
         let folder_root = "a".repeat(MAX_PORTABLE_COMPONENT_BYTES);
-        let folder_candidate = collision_candidate(directory, &folder_root, ContentKind::Folder, 2);
+        let folder_candidate = collision_candidate(directory, &folder_root, ContentKind::Folder, 2)
+            .expect("folder collision candidate");
         let folder_name = folder_candidate
             .file_name()
             .and_then(|value| value.to_str())
@@ -1514,7 +1592,8 @@ mod tests {
         validate_component(folder_name).expect("portable folder collision name");
 
         let file_root = format!("{}.txt", "b".repeat(MAX_PORTABLE_COMPONENT_BYTES - 4));
-        let file_candidate = collision_candidate(directory, &file_root, ContentKind::File, 9999);
+        let file_candidate = collision_candidate(directory, &file_root, ContentKind::File, 9999)
+            .expect("file collision candidate");
         let file_name = file_candidate
             .file_name()
             .and_then(|value| value.to_str())
@@ -1525,7 +1604,8 @@ mod tests {
 
         let unicode_root = format!("{}a", "é".repeat(127));
         let unicode_candidate =
-            collision_candidate(directory, &unicode_root, ContentKind::Folder, 2);
+            collision_candidate(directory, &unicode_root, ContentKind::Folder, 2)
+                .expect("UTF-8 collision candidate");
         let unicode_name = unicode_candidate
             .file_name()
             .and_then(|value| value.to_str())
@@ -1535,9 +1615,82 @@ mod tests {
         validate_component(unicode_name).expect("portable UTF-8 collision name");
 
         let fallback_suffix = format!(".{}", meshelf_core::MessageId::new());
-        let fallback_name = component_with_suffix(&folder_root, &fallback_suffix);
+        let fallback_name = component_with_suffix(&folder_root, &fallback_suffix)
+            .expect("portable UUID fallback name");
         assert!(fallback_name.len() <= MAX_PORTABLE_COMPONENT_BYTES);
         validate_component(&fallback_name).expect("portable UUID fallback name");
+    }
+
+    #[test]
+    fn generated_collision_names_reject_degenerate_suffix_budgets() {
+        let at_ceiling = "x".repeat(MAX_PORTABLE_COMPONENT_BYTES);
+        let over_ceiling = "x".repeat(MAX_PORTABLE_COMPONENT_BYTES + 1);
+        assert!(component_with_suffix("stem", &at_ceiling).is_err());
+        assert!(component_with_suffix("stem", &over_ceiling).is_err());
+
+        let almost_ceiling = "x".repeat(MAX_PORTABLE_COMPONENT_BYTES - 1);
+        assert!(component_with_suffix("é", &almost_ceiling).is_err());
+        assert_eq!(truncate_utf8("é", 1), "");
+
+        let directory = Path::new("incoming");
+        let dotfile = collision_candidate(directory, ".bashrc", ContentKind::File, 2)
+            .expect("dotfile collision candidate");
+        assert_eq!(dotfile, directory.join(".bashrc (2)"));
+
+        let long_extension = format!("a.{}", "x".repeat(250));
+        let long_extension_candidate =
+            collision_candidate(directory, &long_extension, ContentKind::File, 2)
+                .expect("long-extension collision candidate");
+        let long_extension_name = long_extension_candidate
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("long-extension collision name");
+        assert!(long_extension_name.len() <= MAX_PORTABLE_COMPONENT_BYTES);
+        assert!(long_extension_name.ends_with(" (2)"));
+        validate_component(long_extension_name).expect("portable long-extension collision name");
+    }
+
+    #[tokio::test]
+    async fn max_length_folder_collision_finalizes_on_the_real_filesystem() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let incoming = directory.path().join("incoming");
+        std::fs::create_dir(&incoming).expect("incoming directory");
+        let root_name = "a".repeat(MAX_PORTABLE_COMPONENT_BYTES);
+        let existing = incoming.join(&root_name);
+        std::fs::create_dir(&existing).expect("existing maximum-length destination");
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+
+            assert!(existing.as_os_str().encode_wide().count() >= 260);
+        }
+
+        let payload = directory.path().join("payload");
+        std::fs::create_dir(&payload).expect("payload directory");
+        std::fs::write(payload.join("item.txt"), b"payload").expect("payload file");
+
+        let final_path = finalize_payload_without_overwrite(
+            &payload,
+            &incoming,
+            &root_name,
+            ContentKind::Folder,
+        )
+        .await
+        .expect("maximum-length exclusive folder finalization");
+        let final_name = final_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("maximum-length final name");
+
+        assert_eq!(final_name.len(), MAX_PORTABLE_COMPONENT_BYTES);
+        assert!(final_name.ends_with(" (2)"));
+        validate_component(final_name).expect("portable maximum-length final name");
+        assert!(existing.is_dir());
+        assert_eq!(
+            std::fs::read(final_path.join("item.txt")).expect("published payload"),
+            b"payload"
+        );
     }
 
     #[tokio::test]
