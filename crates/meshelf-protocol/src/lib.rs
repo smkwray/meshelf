@@ -187,7 +187,26 @@ pub enum ProtocolError {
     FrameTooLarge { bytes: usize, maximum: usize },
     #[error("frame length cannot be represented as u32")]
     LengthOverflow,
+    #[error("v2 message validation failed: {detail}")]
+    V2Validation { detail: String },
 }
+
+pub mod v2;
+
+pub use v2::{
+    CAP_OFFER_PULL_V2, FetchAbort, FetchAbortCode, FetchAdmission, FetchAdmissionCode,
+    FetchComplete, FetchHeader, FetchReceipt, FetchReceiptCode, FetchRefusal, FetchRefusalCode,
+    FetchRequest, FileEnd, FileStart, ManifestChunk, ManifestEnd, ManifestEntry, OfferAck,
+    OfferAckCode, OfferAnnouncement, TextEnd, V2_ADMISSION_TIMEOUT_SECS,
+    V2_MAX_ACTIVE_CLIPBOARD_PULLS, V2_MAX_ACTIVE_PAYLOAD_STREAMS, V2_MAX_CONTROL_FRAME_BYTES,
+    V2_MAX_FILE_BYTES, V2_MAX_INBOUND_HANDLERS, V2_MAX_LIVE_ENTRIES, V2_MAX_MANIFEST_BYTES,
+    V2_MAX_MANIFEST_ENTRIES, V2_MAX_PORTABLE_COMPONENT_BYTES, V2_MAX_PREVIEW_BYTES,
+    V2_MAX_RELATIVE_PATH_BYTES, V2_MAX_STATUS_DETAIL_BYTES, V2_MAX_TEXT_PAYLOAD_BYTES,
+    V2_MAX_TRANSFER_BYTES, V2_PAYLOAD_INACTIVITY_SECS, V2_PROTOCOL_VERSION, V2_STREAM_BUFFER_BYTES,
+    V2Message, chunk_manifest, decode_v2_payload, encode_manifest_chunks, encode_v2_frame,
+    encoded_manifest_bytes, read_v2_frame, read_v2_frame_async, validate_v2_message,
+    write_v2_frame, write_v2_frame_async,
+};
 
 pub fn encode_frame(message: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
     let payload = serde_json::to_vec(message)?;
