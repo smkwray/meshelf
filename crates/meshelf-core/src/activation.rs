@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf, str::FromStr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::StoreError;
+use crate::{DeviceId, OfferId, StoreError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -62,11 +62,22 @@ pub enum ActivationState {
     UncertainNoReplay,
 }
 
+/// The receiver-local side effect selected by an explicit activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationMode {
+    Clipboard,
+    Save,
+}
+
 /// Cleanup ownership only. The journal deliberately has no payload or
 /// transfer-resume fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivationJournalEntry {
     pub activation_id: ActivationId,
+    pub source_device: DeviceId,
+    pub offer_id: OfferId,
+    pub mode: ActivationMode,
     pub staging_root: PathBuf,
     pub state: ActivationState,
     pub reserved_entries: u32,

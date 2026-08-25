@@ -5,6 +5,7 @@
 //! application across duplicate delivery and an uncertain crash boundary.
 
 mod activation;
+mod destination;
 mod memory_store;
 mod model;
 mod offer;
@@ -13,8 +14,11 @@ mod settings;
 mod store;
 
 pub use activation::{
-    ActivationId, ActivationJournalEntry, ActivationState, ClipboardCacheRecord,
+    ActivationId, ActivationJournalEntry, ActivationMode, ActivationState, ClipboardCacheRecord,
     ClipboardCacheState,
+};
+pub use destination::{
+    DestinationPolicy, relative_path, validate_component, validate_relative_path,
 };
 pub use memory_store::MemoryReceiveStore;
 pub use model::{

@@ -252,6 +252,10 @@ pub enum OfferAttemptCode {
     SourceUnavailable,
     SourceChanged,
     Busy,
+    Cancelled,
+    ClipboardFailed,
+    VerificationFailed,
+    UncertainNoReplay,
     Failed,
 }
 

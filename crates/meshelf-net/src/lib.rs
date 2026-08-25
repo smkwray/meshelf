@@ -3,8 +3,17 @@
 //! This crate does not contain a permissive production trust policy. `DenyAll` is the safe
 //! default; `ExactDeviceAllowList` exists only for loopback simulation and bounded development.
 
+mod destination;
+mod fetch_receiver;
 mod fetch_sender;
+pub use fetch_receiver::{
+    FetchActivation, FetchClipboard, FetchReceiver, OfferFetchReceiver, ReservationError,
+    ReservationLedger, ReservationPermit, V2FetchReceiver,
+};
 pub use fetch_sender::{OfferFetchHandler, V2FetchSender};
+
+#[cfg(test)]
+use meshelf_core::MAX_OFFER_PORTABLE_COMPONENT_BYTES as MAX_PORTABLE_COMPONENT_BYTES;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -18,14 +27,14 @@ use async_trait::async_trait;
 use meshelf_core::{
     CardAvailability, ClipboardSink, ContentKind, DeviceId, OfferCardInput, OfferCardInsert,
     OfferCardRecord, OfferId, Receipt, ReceiptCode, ReceiveStore, ReceiverService, StoreError,
-    TextEnvelope, V2_MAX_LIVE_ENTRIES,
+    TextEnvelope, V2_MAX_LIVE_ENTRIES, validate_component, validate_relative_path,
 };
 use meshelf_protocol::{
     CAP_FILE_STREAM_V1, CAP_TEXT_SHELF_V1, ClientHello, FileAdmission, FileEntryKind,
-    FileTransferOffer, MAX_FILE_BYTES, MAX_FILE_ENTRIES, MAX_FRAME_BYTES, MAX_RELATIVE_PATH_BYTES,
-    MAX_TRANSFER_BYTES, OfferAck, OfferAckCode, OfferAnnouncement, ProtocolError, ServerHello,
-    V2_MAX_INBOUND_HANDLERS, V2Message, WireMessage, decode_payload, read_frame_async,
-    read_v2_frame_async, validate_v2_message, write_frame_async, write_v2_frame_async,
+    FileTransferOffer, MAX_FILE_BYTES, MAX_FILE_ENTRIES, MAX_FRAME_BYTES, MAX_TRANSFER_BYTES,
+    OfferAck, OfferAckCode, OfferAnnouncement, ProtocolError, ServerHello, V2_MAX_INBOUND_HANDLERS,
+    V2Message, WireMessage, decode_payload, read_frame_async, read_v2_frame_async,
+    validate_v2_message, write_frame_async, write_v2_frame_async,
 };
 use meshelf_store::RedbV2Store;
 use serde::{Deserialize, Serialize};
@@ -37,8 +46,6 @@ use tokio::{
     sync::{Semaphore, TryAcquireError, watch},
     time::timeout,
 };
-
-const MAX_PORTABLE_COMPONENT_BYTES: usize = 255;
 
 #[derive(Debug, Clone)]
 pub struct ServerIdentity {
@@ -769,6 +776,80 @@ impl PeerClient {
         }
         Ok(receipt)
     }
+
+    /// Open one authenticated receiver-initiated pull. The receiver-side activation is supplied
+    /// by the caller before this method is called; announcements never invoke it.
+    pub async fn fetch<C>(
+        &self,
+        address: SocketAddr,
+        hello: ClientHello,
+        request: meshelf_protocol::FetchRequest,
+        activation: FetchActivation,
+        expected_server_public_key: &[u8],
+        receiver: &FetchReceiver<C>,
+    ) -> Result<(), NetError>
+    where
+        C: FetchClipboard,
+    {
+        let requester_device = hello.device_id;
+        if hello.device_id != request.requester_device
+            || activation.request_id != request.request_id
+            || activation.source_device != request.source_device
+            || activation.offer_id != request.offer_id
+        {
+            return Err(NetError::IdentityMismatch(
+                "fetch request, activation, and client identity differ".to_owned(),
+            ));
+        }
+        let mut stream = timeout(self.connect_timeout, TcpStream::connect(address))
+            .await
+            .map_err(|_| NetError::Timeout("fetch connect"))??;
+        stream.set_nodelay(true)?;
+        io_timeout(
+            self.io_timeout,
+            write_frame_async(&mut stream, &WireMessage::ClientHello(hello)),
+            "write fetch client hello",
+        )
+        .await?;
+        let response = io_timeout(
+            self.io_timeout,
+            read_frame_async(&mut stream),
+            "read fetch server hello",
+        )
+        .await?;
+        let WireMessage::ServerHello(server_hello) = response else {
+            return Err(NetError::UnexpectedMessage("expected server_hello"));
+        };
+        if !server_hello.has_valid_signature()
+            || (!expected_server_public_key.is_empty()
+                && server_hello.public_key != expected_server_public_key)
+        {
+            return Err(NetError::IdentityMismatch(
+                "fetch server hello signature or public key is invalid".to_owned(),
+            ));
+        }
+        if server_hello.device_id != request.source_device {
+            return Err(NetError::IdentityMismatch(
+                "fetch server hello does not match source device".to_owned(),
+            ));
+        }
+        if !server_hello.accepted {
+            return Err(NetError::Rejected(
+                server_hello
+                    .reason
+                    .unwrap_or_else(|| "fetch server rejected connection".to_owned()),
+            ));
+        }
+        io_timeout(
+            self.io_timeout,
+            write_v2_frame_async(&mut stream, &V2Message::FetchRequest(request)),
+            "write fetch request",
+        )
+        .await?;
+        receiver
+            .receive(requester_device, activation, &mut stream, self.io_timeout)
+            .await
+    }
 }
 
 async fn send_file_bytes(
@@ -872,58 +953,6 @@ pub fn validate_file_offer(offer: &FileTransferOffer) -> Result<(), String> {
         return Err(format!(
             "transfer is {total} bytes; maximum is {MAX_TRANSFER_BYTES}"
         ));
-    }
-    Ok(())
-}
-
-fn validate_relative_path(path: &str) -> Result<(), String> {
-    if path.is_empty() || path.len() > MAX_RELATIVE_PATH_BYTES {
-        return Err("file path is empty or too long".to_owned());
-    }
-    if path.starts_with('/') || path.starts_with('\\') || path.contains('\\') || path.contains(':')
-    {
-        return Err(format!("unsafe file path: {path}"));
-    }
-    for component in path.split('/') {
-        validate_component(component)?;
-    }
-    Ok(())
-}
-
-fn validate_component(component: &str) -> Result<(), String> {
-    let contains_platform_forbidden_character = component.chars().any(|character| {
-        character.is_control()
-            || matches!(
-                character,
-                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
-            )
-    });
-    if component.is_empty()
-        || component == "."
-        || component == ".."
-        || component.len() > MAX_PORTABLE_COMPONENT_BYTES
-        || contains_platform_forbidden_character
-    {
-        return Err(format!("unsafe file name component: {component:?}"));
-    }
-    let device_stem = component
-        .split('.')
-        .next()
-        .unwrap_or(component)
-        .trim_end_matches([' ', '.'])
-        .to_ascii_uppercase();
-    let numbered_device_suffix = device_stem
-        .strip_prefix("COM")
-        .or_else(|| device_stem.strip_prefix("LPT"));
-    let reserved = matches!(device_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || numbered_device_suffix.is_some_and(|suffix| {
-            matches!(
-                suffix,
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            )
-        });
-    if reserved || component.ends_with(' ') || component.ends_with('.') {
-        return Err(format!("platform-reserved file name: {component}"));
     }
     Ok(())
 }
@@ -1628,168 +1657,32 @@ async fn finalize_payload_without_overwrite(
     root_name: &str,
     content_kind: ContentKind,
 ) -> Result<PathBuf, NetError> {
-    for index in 1..=9999 {
-        let final_path = collision_candidate(directory, root_name, content_kind, index)?;
-        match finalize_payload(payload, &final_path, content_kind).await {
-            Ok(()) => return Ok(final_path),
-            Err(NetError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                continue;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    let suffix = format!(".{}", meshelf_core::MessageId::new());
-    let final_path = directory.join(component_with_suffix(root_name, &suffix)?);
-    finalize_payload(payload, &final_path, content_kind).await?;
-    Ok(final_path)
+    destination::finalize_payload_without_overwrite(payload, directory, root_name, content_kind)
+        .await
 }
 
-async fn finalize_payload(
-    payload: &Path,
-    final_path: &Path,
-    content_kind: ContentKind,
-) -> Result<(), NetError> {
-    if content_kind == ContentKind::File {
-        std::fs::hard_link(payload, final_path)?;
-        // Once the no-replace link exists, staging cleanup must not turn a valid publication into
-        // a failed transfer. The caller removes the whole transfer staging directory as well.
-        let _ = tokio::fs::remove_file(payload).await;
-    } else {
-        rename_exclusive_portable(payload, final_path)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn rename_exclusive_portable(payload: &Path, final_path: &Path) -> std::io::Result<()> {
-    renamore::rename_exclusive(payload, final_path)
-}
-
-#[cfg(windows)]
-fn rename_exclusive_portable(payload: &Path, final_path: &Path) -> std::io::Result<()> {
-    let payload = windows_verbatim_path(payload)?;
-    let final_path = windows_verbatim_path(final_path)?;
-    renamore::rename_exclusive(&payload, &final_path)
-}
-
-#[cfg(windows)]
-fn windows_verbatim_path(path: &Path) -> std::io::Result<PathBuf> {
-    use std::{
-        ffi::OsString,
-        os::windows::ffi::{OsStrExt, OsStringExt},
-    };
-
-    const SEP: u16 = b'\\' as u16;
-    const DOT: u16 = b'.' as u16;
-    const QUERY: u16 = b'?' as u16;
-    const U: u16 = b'U' as u16;
-    const N: u16 = b'N' as u16;
-    const C: u16 = b'C' as u16;
-    const VERBATIM_PREFIX: &[u16] = &[SEP, SEP, QUERY, SEP];
-    const NT_PREFIX: &[u16] = &[SEP, QUERY, QUERY, SEP];
-    const DEVICE_PREFIX: &[u16] = &[SEP, SEP, DOT, SEP];
-    const UNC_PREFIX: &[u16] = &[SEP, SEP, QUERY, SEP, U, N, C, SEP];
-
-    let absolute = std::path::absolute(path)?;
-    let wide = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
-    if wide.starts_with(VERBATIM_PREFIX) || wide.starts_with(NT_PREFIX) {
-        return Ok(absolute);
-    }
-
-    let (prefix, body) = if wide.starts_with(DEVICE_PREFIX) {
-        (VERBATIM_PREFIX, &wide[DEVICE_PREFIX.len()..])
-    } else if wide.starts_with(&[SEP, SEP]) {
-        (UNC_PREFIX, &wide[2..])
-    } else {
-        (VERBATIM_PREFIX, wide.as_slice())
-    };
-    let mut verbatim = Vec::with_capacity(prefix.len() + body.len());
-    verbatim.extend_from_slice(prefix);
-    verbatim.extend_from_slice(body);
-    Ok(PathBuf::from(OsString::from_wide(&verbatim)))
-}
-
+#[cfg(test)]
 fn collision_candidate(
     directory: &Path,
     root_name: &str,
     content_kind: ContentKind,
     index: usize,
 ) -> Result<PathBuf, NetError> {
-    if index == 1 {
-        validate_component(root_name).map_err(generated_component_error)?;
-        return Ok(directory.join(root_name));
-    }
-
-    let suffix = format!(" ({index})");
-    let source = Path::new(root_name);
-    let extension = (content_kind == ContentKind::File)
-        .then(|| source.extension().and_then(|value| value.to_str()))
-        .flatten();
-    if let Some(extension) = extension {
-        let stem = source
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or(root_name);
-        let fixed_bytes = suffix
-            .len()
-            .checked_add(1)
-            .and_then(|value| value.checked_add(extension.len()))
-            .ok_or_else(|| {
-                NetError::FileTransfer("generated destination name length overflow".to_owned())
-            })?;
-        if let Some(max_stem_bytes) = MAX_PORTABLE_COMPONENT_BYTES.checked_sub(fixed_bytes) {
-            let stem = truncate_utf8(stem, max_stem_bytes);
-            if !stem.is_empty() {
-                let name = format!("{stem}{suffix}.{extension}");
-                validate_component(&name).map_err(generated_component_error)?;
-                return Ok(directory.join(name));
-            }
-        }
-    }
-
-    Ok(directory.join(component_with_suffix(root_name, &suffix)?))
+    destination::collision_candidate(directory, root_name, content_kind, index)
 }
 
+#[cfg(test)]
 fn component_with_suffix(component: &str, suffix: &str) -> Result<String, NetError> {
-    let max_component_bytes = MAX_PORTABLE_COMPONENT_BYTES
-        .checked_sub(suffix.len())
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            NetError::FileTransfer(format!(
-                "generated destination suffix is {} bytes; maximum component is {MAX_PORTABLE_COMPONENT_BYTES}",
-                suffix.len()
-            ))
-        })?;
-    let component = truncate_utf8(component, max_component_bytes);
-    if component.is_empty() {
-        return Err(NetError::FileTransfer(
-            "generated destination suffix leaves no complete UTF-8 character for the name"
-                .to_owned(),
-        ));
-    }
-    let name = format!("{component}{suffix}");
-    validate_component(&name).map_err(generated_component_error)?;
-    Ok(name)
+    destination::component_with_suffix(component, suffix)
 }
 
-fn generated_component_error(error: String) -> NetError {
-    NetError::FileTransfer(format!("generated destination name is invalid: {error}"))
-}
-
+#[cfg(test)]
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
+    destination::truncate_utf8(value, max_bytes)
 }
 
 fn relative_path(value: &str) -> PathBuf {
-    value.split('/').collect()
+    destination::relative_path(value)
 }
 
 async fn io_timeout<T>(
@@ -1859,6 +1752,8 @@ pub enum NetError {
     OfferStorage(String),
     #[error("fetch service failed: {0}")]
     FetchService(&'static str),
+    #[error("fetch service failed: {0}")]
+    FetchServiceOwned(String),
     #[error("inbound handler limit was closed")]
     HandlerLimitClosed,
 }
@@ -1873,12 +1768,12 @@ mod tests {
     };
 
     use meshelf_core::{
-        ClipboardError, ClipboardSink, MemoryReceiveStore, OfferDescriptor, OfferSource,
-        OfferSourceInput, ReceiptCode, ReceiveStore, ReceiverService,
+        ActivationId, ClipboardError, ClipboardSink, MemoryReceiveStore, OfferDescriptor,
+        OfferSource, OfferSourceInput, ReceiptCode, ReceiveStore, ReceiverService,
     };
     use meshelf_protocol::{
-        ClientHello, FetchAbortCode, FetchRefusal, FetchRefusalCode, FetchRequest, ManifestEntry,
-        V2_MAX_MANIFEST_BYTES,
+        ClientHello, FetchAbortCode, FetchReceipt, FetchRefusal, FetchRefusalCode, FetchRequest,
+        ManifestEntry, V2_MAX_MANIFEST_BYTES,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
@@ -2237,6 +2132,30 @@ mod tests {
         io_timeout(TEST_IO_TIMEOUT, read_v2_frame_async(stream), operation)
             .await
             .expect("read v2 frame")
+    }
+
+    async fn write_fetch_receipt(
+        stream: &mut TcpStream,
+        request_id: meshelf_core::ActivationId,
+        offer_id: OfferId,
+    ) {
+        io_timeout(
+            TEST_IO_TIMEOUT,
+            write_v2_frame_async(
+                stream,
+                &V2Message::FetchReceipt(meshelf_protocol::FetchReceipt {
+                    request_id,
+                    offer_id,
+                    code: meshelf_protocol::FetchReceiptCode::Completed,
+                    files_received: 0,
+                    bytes_received: 0,
+                    detail: None,
+                }),
+            ),
+            "write fetch receipt",
+        )
+        .await
+        .expect("write fetch receipt");
     }
 
     async fn read_exact_test(stream: &mut TcpStream, bytes: &mut [u8], operation: &'static str) {
@@ -3092,7 +3011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn third_peer_that_never_activates_receives_zero_payload_bytes() {
+    async fn announcement_without_activation_writes_zero_payload_bytes() {
         let source_identity = meshelf_identity::InstallationIdentity::generate();
         let source_directory = tempfile::tempdir().expect("source directory");
         let source_file = source_directory.path().join("secret.txt");
@@ -3619,7 +3538,72 @@ mod tests {
             read_v2_test(&mut stream, "read fetch complete").await,
             V2Message::FetchComplete(_)
         ));
+        write_fetch_receipt(&mut stream, request_id, offer_id).await;
         stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn origin_waits_for_and_validates_fetch_receipt() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let directory = tempfile::tempdir().expect("temporary fetch directory");
+        let store = Arc::new(
+            RedbV2Store::open(directory.path().join("offers.redb")).expect("open offer store"),
+        );
+        let origin = meshelf_identity::InstallationIdentity::generate();
+        let body = "receipt-gated text";
+        let offer_id = OfferId::new();
+        insert_text_source(&store, requester.device_id, offer_id, body);
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let request_id = request.request_id;
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let sender = Arc::new(OfferFetchHandler::new(origin.device_id, store));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept fetch");
+            sender
+                .handle_fetch(requester.device_id, request, &mut stream, TEST_IO_TIMEOUT)
+                .await
+        });
+        let mut stream = TcpStream::connect(address).await.expect("connect fetch");
+        let _ = read_fetch_header_and_manifest(&mut stream).await;
+        admit_fetch(&mut stream, request_id).await;
+        let mut received = vec![0_u8; body.len()];
+        read_exact_test(&mut stream, &mut received, "read text body").await;
+        assert_eq!(received, body.as_bytes());
+        let _ = read_v2_test(&mut stream, "read text end").await;
+        let _ = read_v2_test(&mut stream, "read fetch complete").await;
+
+        let mut probe = [0_u8; 1];
+        assert!(
+            timeout(TEST_IO_TIMEOUT / 10, stream.read(&mut probe))
+                .await
+                .is_err(),
+            "origin returned before the receiver supplied a receipt"
+        );
+        write_v2_frame_async(
+            &mut stream,
+            &V2Message::FetchReceipt(FetchReceipt {
+                request_id: ActivationId::new(),
+                offer_id,
+                code: meshelf_protocol::FetchReceiptCode::Completed,
+                files_received: 0,
+                bytes_received: body.len() as u64,
+                detail: None,
+            }),
+        )
+        .await
+        .expect("write mismatched receipt");
+        assert_eq!(
+            timeout(TEST_IO_TIMEOUT, stream.read(&mut probe))
+                .await
+                .expect("read close timeout")
+                .expect("read close"),
+            0
+        );
+        let result = server.await.expect("sender task");
+        assert!(matches!(result, Err(NetError::IdentityMismatch(_))));
     }
 
     #[tokio::test]
@@ -3861,6 +3845,7 @@ mod tests {
         assert_eq!(abort.code, FetchAbortCode::SourceChanged);
         assert_eq!(abort.files_sent, 0);
         assert_eq!(abort.bytes_sent, 0);
+        write_fetch_receipt(&mut stream, request_id, offer_id).await;
         stop_offer_server(shutdown_tx, server).await;
     }
 

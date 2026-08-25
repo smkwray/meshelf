@@ -7,7 +7,8 @@
 use std::{
     fs::{self, File},
     io::{self, ErrorKind},
-    path::Path,
+    path::Component,
+    path::{Path, PathBuf},
 };
 
 use fs2::FileExt;
@@ -17,14 +18,162 @@ use crate::activation;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FilesystemKey(String);
 
+#[cfg(windows)]
+const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Inspect one path without following a final link and reject every link-like object that could
+/// redirect a destination operation. On Windows the attribute check also catches junctions,
+/// which `FileType::is_symlink` does not report.
+pub fn reject_reparse_point(path: &Path) -> io::Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| path_error("inspect destination component", path, error))?;
+    reject_reparse_metadata(path, &metadata)?;
+    Ok(metadata)
+}
+
+fn reject_reparse_metadata(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "destination component is a symbolic link: {}",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        if metadata.file_attributes() & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "destination component is a Windows reparse point: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Walk and create a directory path one component at a time. Existing components are checked
+/// with `symlink_metadata`; no unchecked `create_dir_all` traversal is used.
+pub fn ensure_directory_tree(path: &Path) -> io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        // A drive prefix and a root are not creatable objects and cannot themselves be reparse
+        // points. On Windows `components()` yields `C:` and `\\` separately, so stat-ing the
+        // partial path would ask about "the current directory on drive C:" rather than the drive
+        // root, which is both meaningless and not what the caller named.
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                reject_reparse_metadata(&current, &metadata)?;
+                if !metadata.is_dir() {
+                    return Err(io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        format!(
+                            "destination component is not a directory: {}",
+                            current.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .map_err(|error| path_error("create destination directory", &current, error))?;
+                let metadata = reject_reparse_point(&current)?;
+                if !metadata.is_dir() {
+                    return Err(io::Error::other(format!(
+                        "created destination is not a directory: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(path_error("inspect destination component", &current, error)),
+        }
+    }
+    Ok(())
+}
+
+/// Require an existing, non-reparse directory.
+pub fn require_directory(path: &Path) -> io::Result<()> {
+    let metadata = reject_reparse_point(path)?;
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("expected directory: {}", path.display()),
+        ))
+    }
+}
+
+/// Create one new regular file and reject a redirected result before it is used.
+pub fn create_new_file(path: &Path) -> io::Result<File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| path_error("create staging file", path, error))?;
+    if let Err(error) = reject_reparse_point(path) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Remove an owned staging root without following a final symlink or reparse point.
+pub fn remove_owned_tree(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(path_error("inspect owned cleanup root", path, error)),
+    };
+    reject_reparse_metadata(path, &metadata)?;
+    if metadata.is_dir() {
+        remove_owned_directory(path)
+    } else {
+        Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("owned cleanup root is not a directory: {}", path.display()),
+        ))
+    }
+}
+
+fn remove_owned_directory(path: &Path) -> io::Result<()> {
+    for entry in
+        fs::read_dir(path).map_err(|error| path_error("read owned staging root", path, error))?
+    {
+        let entry = entry.map_err(|error| path_error("read owned staging entry", path, error))?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child)
+            .map_err(|error| path_error("inspect owned staging entry", &child, error))?;
+        reject_reparse_metadata(&child, &metadata)?;
+        if metadata.is_dir() {
+            remove_owned_directory(&child)?;
+        } else {
+            fs::remove_file(&child)
+                .map_err(|error| path_error("remove owned staging file", &child, error))?;
+        }
+    }
+    fs::remove_dir(path).map_err(|error| path_error("remove owned staging root", path, error))
+}
+
 /// Return an identity suitable for grouping paths that share one filesystem.
 pub fn filesystem_key(path: &Path) -> io::Result<FilesystemKey> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
-        let metadata =
-            fs::metadata(path).map_err(|error| path_error("identify filesystem", path, error))?;
+        let metadata = reject_reparse_point(path)?;
         Ok(FilesystemKey(format!("unix-device:{}", metadata.dev())))
     }
 
@@ -105,6 +254,7 @@ pub fn preallocate(file: &File, length: u64) -> io::Result<()> {
             "preallocation requires a regular file",
         ));
     }
+    reject_reparse_metadata(Path::new("<open file>"), &metadata)?;
 
     #[cfg(any(
         target_os = "android",
@@ -149,15 +299,13 @@ pub fn preallocate(file: &File, length: u64) -> io::Result<()> {
 
 /// Apply owner-only permissions where the platform supports the existing activation approach.
 pub fn apply_owner_only_permissions(path: &Path) -> io::Result<()> {
-    fs::metadata(path)
-        .map_err(|error| path_error("inspect path for owner-only permissions", path, error))?;
+    reject_reparse_point(path)?;
     activation::make_owner_only(path)
 }
 
 /// Flush directory metadata so a preceding rename is durable where the platform supports it.
 pub fn sync_directory(path: &Path) -> io::Result<()> {
-    let metadata =
-        fs::metadata(path).map_err(|error| path_error("inspect directory", path, error))?;
+    let metadata = reject_reparse_point(path)?;
     if !metadata.is_dir() {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -196,6 +344,63 @@ fn path_error(action: &str, path: &Path, error: io::Error) -> io::Error {
 
 fn io_error(action: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{action}: {error}"))
+}
+
+/// Atomically rename a staged directory without replacing an existing destination.
+pub fn rename_exclusive_portable(payload: &Path, final_path: &Path) -> io::Result<()> {
+    reject_reparse_point(payload)?;
+    if let Some(parent) = final_path.parent() {
+        require_directory(parent)?;
+    }
+    #[cfg(not(windows))]
+    {
+        renamore::rename_exclusive(payload, final_path)
+    }
+    #[cfg(windows)]
+    {
+        let payload = windows_verbatim_path(payload)?;
+        let final_path = windows_verbatim_path(final_path)?;
+        renamore::rename_exclusive(&payload, &final_path)
+    }
+}
+
+/// Convert an absolute path to the Windows verbatim spelling used for long and exact filesystem
+/// operations. This function is only compiled on Windows.
+#[cfg(windows)]
+pub fn windows_verbatim_path(path: &Path) -> io::Result<PathBuf> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
+
+    const SEP: u16 = b'\\' as u16;
+    const DOT: u16 = b'.' as u16;
+    const QUERY: u16 = b'?' as u16;
+    const U: u16 = b'U' as u16;
+    const N: u16 = b'N' as u16;
+    const C: u16 = b'C' as u16;
+    const VERBATIM_PREFIX: &[u16] = &[SEP, SEP, QUERY, SEP];
+    const NT_PREFIX: &[u16] = &[SEP, QUERY, QUERY, SEP];
+    const DEVICE_PREFIX: &[u16] = &[SEP, SEP, DOT, SEP];
+    const UNC_PREFIX: &[u16] = &[SEP, SEP, QUERY, SEP, U, N, C, SEP];
+
+    let absolute = std::path::absolute(path)?;
+    let wide = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.starts_with(VERBATIM_PREFIX) || wide.starts_with(NT_PREFIX) {
+        return Ok(absolute);
+    }
+
+    let (prefix, body) = if wide.starts_with(DEVICE_PREFIX) {
+        (VERBATIM_PREFIX, &wide[DEVICE_PREFIX.len()..])
+    } else if wide.starts_with(&[SEP, SEP]) {
+        (UNC_PREFIX, &wide[2..])
+    } else {
+        (VERBATIM_PREFIX, wide.as_slice())
+    };
+    let mut verbatim = Vec::with_capacity(prefix.len() + body.len());
+    verbatim.extend_from_slice(prefix);
+    verbatim.extend_from_slice(body);
+    Ok(PathBuf::from(OsString::from_wide(&verbatim)))
 }
 
 #[cfg(windows)]
@@ -459,5 +664,41 @@ mod tests {
         let child = directory.path().join("child");
         fs::create_dir(&child).expect("create child directory");
         sync_directory(directory.path()).expect("sync real directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_symlink_ancestor_is_rejected_without_payload() {
+        let directory = TestDirectory::new();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        fs::create_dir(&target).expect("create target");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink ancestor");
+
+        let destination = link.join("destination");
+        assert!(ensure_directory_tree(&destination).is_err());
+        assert!(!destination.join("payload").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_junction_destination_is_rejected_without_payload() {
+        let directory = TestDirectory::new();
+        let target = directory.path().join("target");
+        let junction = directory.path().join("junction");
+        fs::create_dir(&target).expect("create target");
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&target)
+            .status()
+            .expect("run mklink junction");
+        assert!(status.success(), "mklink /J failed: {status}");
+
+        let destination = junction.join("destination");
+        assert!(ensure_directory_tree(&destination).is_err());
+        assert!(!destination.join("payload").exists());
     }
 }

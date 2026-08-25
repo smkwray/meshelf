@@ -10,4 +10,5 @@ license-file.workspace = true
 arboard.workspace = true
 fs2.workspace = true
 meshelf-core = { path = "../meshelf-core" }
+renamore.workspace = true
 thiserror.workspace = true

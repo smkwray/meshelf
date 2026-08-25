@@ -12,9 +12,13 @@ pub use activation::{
     listen, listen_with_control, request, signal,
 };
 pub use clipboard::{ClipboardItem, ClipboardSource, ClipboardWorker, PlatformClipboardError};
+#[cfg(windows)]
+pub use filesystem::windows_verbatim_path;
 pub use filesystem::{
-    FilesystemKey, apply_owner_only_permissions, available_space, filesystem_key, preallocate,
-    source_identity_bytes, sync_directory, total_space,
+    FilesystemKey, apply_owner_only_permissions, available_space, create_new_file,
+    ensure_directory_tree, filesystem_key, preallocate, reject_reparse_point, remove_owned_tree,
+    rename_exclusive_portable, require_directory, source_identity_bytes, sync_directory,
+    total_space,
 };
 
 pub trait Notifier: Send + Sync + 'static {

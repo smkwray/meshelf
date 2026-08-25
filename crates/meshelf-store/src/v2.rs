@@ -12,6 +12,7 @@ use meshelf_core::{
     OfferSourceInput, OfferSourceInsert, OfferSourceRecord, OfferSourceStore, StoreError,
     V2_MAX_LIVE_ENTRIES,
 };
+use meshelf_platform::{ensure_directory_tree, remove_owned_tree};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{RECEIVE_LEDGER, map_redb_error};
@@ -358,12 +359,47 @@ impl RedbV2Store {
     }
 
     /// The journal transaction is committed before the staging directory is
-    /// created. If directory creation fails, the journal remains for startup
-    /// cleanup and the error is returned to the caller.
+    /// created. The caller must have checked the directory ancestry; this
+    /// method creates only the final activation directory.
     pub fn prepare_staging(&self, entry: &ActivationJournalEntry) -> Result<(), StoreError> {
+        let parent = entry
+            .staging_root
+            .parent()
+            .ok_or_else(|| StoreError::new("staging root has no parent"))?;
+        ensure_directory_tree(parent)
+            .map_err(|error| StoreError::new(format!("staging ancestry failed: {error}")))?;
         self.journal_activation(entry)?;
-        fs::create_dir_all(&entry.staging_root)
+        fs::create_dir(&entry.staging_root)
             .map_err(|error| StoreError::new(format!("staging creation failed: {error}")))
+    }
+
+    /// Durably advance the cleanup journal without adding payload or replay state to it.
+    pub fn update_activation_state(
+        &self,
+        activation_id: ActivationId,
+        state: meshelf_core::ActivationState,
+    ) -> Result<(), StoreError> {
+        let key = activation_id.to_string();
+        let write = self.database.begin_write().map_err(map_redb_error)?;
+        {
+            let mut table = write
+                .open_table(ACTIVATION_JOURNAL_V2)
+                .map_err(map_redb_error)?;
+            let Some(bytes) = table
+                .get(key.as_str())
+                .map_err(map_redb_error)?
+                .map(|guard| guard.value().to_vec())
+            else {
+                return Err(StoreError::new("activation journal entry does not exist"));
+            };
+            let mut entry: ActivationJournalEntry = decode_json!(&bytes)?;
+            entry.state = state;
+            let encoded = encode_json!(&entry)?;
+            table
+                .insert(key.as_str(), encoded.as_slice())
+                .map_err(map_redb_error)?;
+        }
+        write.commit().map_err(map_redb_error)
     }
 
     pub fn remove_activation_journal(&self, activation_id: ActivationId) -> Result<(), StoreError> {
@@ -388,7 +424,7 @@ impl RedbV2Store {
         let mut failures = Vec::new();
 
         for entry in &entries {
-            match fs::remove_dir_all(&entry.staging_root) {
+            match remove_owned_tree(&entry.staging_root) {
                 Ok(()) => removed.push(entry.activation_id),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     removed.push(entry.activation_id)
@@ -471,6 +507,41 @@ impl RedbV2Store {
             table.remove(cache_key(state)).map_err(map_redb_error)?;
         }
         write.commit().map_err(map_redb_error)
+    }
+
+    /// Atomically promote the in-flight cache index to the completed slot. The returned record,
+    /// when present, is the previous completed object and may be deleted only after this commit.
+    pub fn promote_clipboard_cache(
+        &self,
+        candidate: &ClipboardCacheRecord,
+    ) -> Result<Option<ClipboardCacheRecord>, StoreError> {
+        if candidate.state != ClipboardCacheState::InFlight {
+            return Err(StoreError::new("clipboard candidate must be in flight"));
+        }
+        candidate.validate()?;
+        let encoded_candidate = encode_json!(&ClipboardCacheRecord {
+            activation_id: candidate.activation_id,
+            state: ClipboardCacheState::Completed,
+            payload_path: candidate.payload_path.clone(),
+        })?;
+        let write = self.database.begin_write().map_err(map_redb_error)?;
+        let previous = {
+            let mut table = write
+                .open_table(CLIPBOARD_CACHE_V2)
+                .map_err(map_redb_error)?;
+            let previous = table
+                .get(CACHE_COMPLETED)
+                .map_err(map_redb_error)?
+                .map(|guard| decode_json!(guard.value()))
+                .transpose()?;
+            table
+                .insert(CACHE_COMPLETED, encoded_candidate.as_slice())
+                .map_err(map_redb_error)?;
+            table.remove(CACHE_IN_FLIGHT).map_err(map_redb_error)?;
+            previous
+        };
+        write.commit().map_err(map_redb_error)?;
+        Ok(previous)
     }
 
     /// Explicit migration for the later cutover step. Opening a v2 store does
@@ -620,7 +691,7 @@ mod tests {
     use std::{collections::HashSet, fs, path::PathBuf};
 
     use meshelf_core::{
-        ActivationId, ActivationJournalEntry, ActivationState, CardAvailability,
+        ActivationId, ActivationJournalEntry, ActivationMode, ActivationState, CardAvailability,
         ClipboardCacheRecord, ClipboardCacheState, DeviceId, OfferAttemptCode, OfferAttemptStatus,
         OfferCardInput, OfferDescriptor, OfferId, OfferSource, OfferSourceInput, ReceiveStore,
         TextEnvelope, V2_MAX_LIVE_ENTRIES,
@@ -983,6 +1054,9 @@ mod tests {
     fn journal_entry(root: PathBuf) -> ActivationJournalEntry {
         ActivationJournalEntry {
             activation_id: ActivationId::new(),
+            source_device: DeviceId::new(),
+            offer_id: OfferId::new(),
+            mode: ActivationMode::Save,
             staging_root: root,
             state: ActivationState::Staging,
             reserved_entries: 2,
@@ -993,7 +1067,11 @@ mod tests {
     #[test]
     fn cleanup_journal_commit_precedes_staging_creation() {
         let (directory, store) = store();
-        let entry = journal_entry(directory.path().join("staging"));
+        let entry = journal_entry(
+            fs::canonicalize(directory.path())
+                .expect("canonical temporary directory")
+                .join("staging"),
+        );
         store.prepare_staging(&entry).expect("prepare");
         assert!(entry.staging_root.is_dir());
         assert_eq!(
@@ -1006,10 +1084,38 @@ mod tests {
     }
 
     #[test]
+    fn journal_commit_precedes_staging() {
+        let (directory, store) = store();
+        let root = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+        let staging_root = root.join("staging-file");
+        fs::write(&staging_root, b"pre-existing non-staging object").expect("blocking object");
+        let entry = journal_entry(staging_root.clone());
+
+        let error = store
+            .prepare_staging(&entry)
+            .expect_err("staging creation must fail on a pre-existing file");
+        assert!(error.message().contains("staging creation failed"));
+        assert_eq!(
+            store
+                .get_activation_journal(entry.activation_id)
+                .expect("journal lookup")
+                .expect("journal committed before staging")
+                .staging_root,
+            staging_root
+        );
+
+        store
+            .remove_activation_journal(entry.activation_id)
+            .expect("remove test journal");
+        fs::remove_file(entry.staging_root).expect("remove blocking object");
+    }
+
+    #[test]
     fn startup_cleanup_deletes_every_journaled_partial() {
         let (directory, store) = store();
-        let first = journal_entry(directory.path().join("first"));
-        let second = journal_entry(directory.path().join("second"));
+        let root = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+        let first = journal_entry(root.join("first"));
+        let second = journal_entry(root.join("second"));
         store.prepare_staging(&first).expect("first");
         store.prepare_staging(&second).expect("second");
         let report = store.startup_cleanup().expect("cleanup");
@@ -1021,6 +1127,32 @@ mod tests {
             store
                 .get_activation_journal(first.activation_id)
                 .expect("first journal")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn restart_cleans_partial_without_resume() {
+        let directory = tempdir().expect("temporary directory");
+        let database_path = directory.path().join("offers.redb");
+        let root = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+        let entry = journal_entry(root.join("partial-staging"));
+        {
+            let store = RedbV2Store::open(&database_path).expect("open store");
+            store.journal_activation(&entry).expect("journal partial");
+            fs::create_dir_all(entry.staging_root.join("nested")).expect("partial directory");
+            fs::write(entry.staging_root.join("nested/payload"), b"partial").expect("payload");
+        }
+
+        let reopened = RedbV2Store::open(&database_path).expect("reopen store");
+        let report = reopened.startup_cleanup().expect("startup cleanup");
+        assert_eq!(report.journaled_entries, 1);
+        assert_eq!(report.removed_entries, 1);
+        assert!(!entry.staging_root.exists());
+        assert!(
+            reopened
+                .get_activation_journal(entry.activation_id)
+                .expect("journal lookup")
                 .is_none()
         );
     }

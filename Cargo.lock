@@ -3228,7 +3228,6 @@ dependencies = [
  "meshelf-platform",
  "meshelf-protocol",
  "meshelf-store",
- "renamore",
  "serde",
  "serde_json",
  "sha2",
@@ -3245,6 +3244,7 @@ dependencies = [
  "arboard",
  "fs2",
  "meshelf-core",
+ "renamore",
  "thiserror 2.0.20",
 ]
 
@@ -3277,6 +3277,7 @@ name = "meshelf-store"
 version = "0.1.0"
 dependencies = [
  "meshelf-core",
+ "meshelf-platform",
  "redb",
  "serde_json",
  "tempfile",

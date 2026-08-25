@@ -16,9 +16,9 @@ use meshelf_core::{
     OfferDescriptor, OfferSource, OfferSourceRecord, OfferSourceStore,
 };
 use meshelf_protocol::{
-    FetchAbort, FetchAbortCode, FetchAdmissionCode, FetchComplete, FetchHeader, FetchRefusal,
-    FetchRefusalCode, FetchRequest, FileEnd, FileEntryKind, FileStart, ManifestChunk, ManifestEnd,
-    ManifestEntry, TextEnd, V2_MAX_ACTIVE_PAYLOAD_STREAMS, V2_MAX_MANIFEST_BYTES,
+    FetchAbort, FetchAbortCode, FetchAdmissionCode, FetchComplete, FetchHeader, FetchReceipt,
+    FetchRefusal, FetchRefusalCode, FetchRequest, FileEnd, FileEntryKind, FileStart, ManifestChunk,
+    ManifestEnd, ManifestEntry, TextEnd, V2_MAX_ACTIVE_PAYLOAD_STREAMS, V2_MAX_MANIFEST_BYTES,
     V2_MAX_MANIFEST_ENTRIES, V2_MAX_RELATIVE_PATH_BYTES, V2_STREAM_BUFFER_BYTES, V2Message,
     chunk_manifest, encoded_manifest_bytes, validate_v2_message, write_v2_frame_async,
 };
@@ -337,6 +337,7 @@ impl OfferFetchHandler {
                     self.send_abort(
                         stream,
                         request.request_id,
+                        request.offer_id,
                         FetchAbortCode::SourceChanged,
                         0,
                         0,
@@ -349,6 +350,7 @@ impl OfferFetchHandler {
                     self.send_abort(
                         stream,
                         request.request_id,
+                        request.offer_id,
                         FetchAbortCode::SourceUnavailable,
                         0,
                         0,
@@ -361,6 +363,7 @@ impl OfferFetchHandler {
                     self.send_abort(
                         stream,
                         request.request_id,
+                        request.offer_id,
                         FetchAbortCode::InternalError,
                         0,
                         0,
@@ -373,8 +376,15 @@ impl OfferFetchHandler {
         }
 
         if let Some(text) = plan.text {
+            self.stream_text(stream, request.request_id, text, io_timeout_duration)
+                .await?;
             return self
-                .stream_text(stream, request.request_id, text, io_timeout_duration)
+                .await_receipt(
+                    stream,
+                    request.request_id,
+                    Some(request.offer_id),
+                    io_timeout_duration,
+                )
                 .await;
         }
 
@@ -401,6 +411,7 @@ impl OfferFetchHandler {
                     self.send_abort(
                         stream,
                         request.request_id,
+                        request.offer_id,
                         FetchAbortCode::SourceUnavailable,
                         files_sent,
                         bytes_sent,
@@ -413,6 +424,7 @@ impl OfferFetchHandler {
                     self.send_abort(
                         stream,
                         request.request_id,
+                        request.offer_id,
                         FetchAbortCode::SourceChanged,
                         files_sent,
                         bytes_sent,
@@ -428,6 +440,7 @@ impl OfferFetchHandler {
                     self.send_abort(
                         stream,
                         request.request_id,
+                        request.offer_id,
                         FetchAbortCode::SourceUnavailable,
                         files_sent,
                         bytes_sent,
@@ -443,6 +456,7 @@ impl OfferFetchHandler {
                     self.send_abort(
                         stream,
                         request.request_id,
+                        request.offer_id,
                         FetchAbortCode::SourceChanged,
                         files_sent,
                         bytes_sent,
@@ -461,6 +475,7 @@ impl OfferFetchHandler {
                 self.send_abort(
                     stream,
                     request.request_id,
+                    request.offer_id,
                     FetchAbortCode::SourceChanged,
                     files_sent,
                     bytes_sent,
@@ -473,6 +488,7 @@ impl OfferFetchHandler {
                 self.send_abort(
                     stream,
                     request.request_id,
+                    request.offer_id,
                     FetchAbortCode::SourceUnavailable,
                     files_sent,
                     bytes_sent,
@@ -485,6 +501,7 @@ impl OfferFetchHandler {
                 self.send_abort(
                     stream,
                     request.request_id,
+                    request.offer_id,
                     FetchAbortCode::InternalError,
                     files_sent,
                     bytes_sent,
@@ -504,6 +521,13 @@ impl OfferFetchHandler {
         self.write_control(
             stream,
             V2Message::FetchComplete(complete),
+            io_timeout_duration,
+        )
+        .await?;
+        self.await_receipt(
+            stream,
+            request.request_id,
+            Some(request.offer_id),
             io_timeout_duration,
         )
         .await
@@ -624,10 +648,12 @@ impl OfferFetchHandler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_abort(
         &self,
         stream: &mut TcpStream,
         request_id: meshelf_core::ActivationId,
+        offer_id: meshelf_core::OfferId,
         code: FetchAbortCode,
         files_sent: u32,
         bytes_sent: u64,
@@ -644,7 +670,29 @@ impl OfferFetchHandler {
             }),
             io_timeout_duration,
         )
-        .await
+        .await?;
+        self.await_receipt(stream, request_id, Some(offer_id), io_timeout_duration)
+            .await
+    }
+
+    async fn await_receipt(
+        &self,
+        stream: &mut TcpStream,
+        request_id: meshelf_core::ActivationId,
+        expected_offer_id: Option<meshelf_core::OfferId>,
+        io_timeout_duration: std::time::Duration,
+    ) -> Result<(), NetError> {
+        let response = io_timeout(
+            io_timeout_duration,
+            meshelf_protocol::read_v2_frame_async(stream),
+            "read fetch receipt",
+        )
+        .await?;
+        validate_v2_message(&response)?;
+        let V2Message::FetchReceipt(receipt) = response else {
+            return Err(NetError::UnexpectedMessage("expected fetch receipt"));
+        };
+        validate_receipt(&receipt, request_id, expected_offer_id)
     }
 
     async fn write_control(
@@ -709,6 +757,26 @@ enum FileStreamFailure {
     AfterFileUnavailable(Vec<u8>),
     AfterFileChanged(Vec<u8>),
     Io(NetError),
+}
+
+fn validate_receipt(
+    receipt: &FetchReceipt,
+    request_id: meshelf_core::ActivationId,
+    expected_offer_id: Option<meshelf_core::OfferId>,
+) -> Result<(), NetError> {
+    if receipt.request_id != request_id {
+        return Err(NetError::IdentityMismatch(
+            "fetch receipt request ID does not match".to_owned(),
+        ));
+    }
+    if let Some(expected_offer_id) = expected_offer_id
+        && receipt.offer_id != expected_offer_id
+    {
+        return Err(NetError::IdentityMismatch(
+            "fetch receipt offer ID does not match".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn build_source_plan(

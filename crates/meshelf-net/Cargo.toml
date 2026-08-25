@@ -14,7 +14,6 @@ meshelf-core = { path = "../meshelf-core" }
 meshelf-platform = { path = "../meshelf-platform" }
 meshelf-protocol = { path = "../meshelf-protocol" }
 meshelf-store = { path = "../meshelf-store" }
-renamore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
