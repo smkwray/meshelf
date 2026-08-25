@@ -3157,10 +3157,13 @@ dependencies = [
  "meshelf-identity",
  "meshelf-net",
  "meshelf-protocol",
+ "meshelf-store",
  "meshelf-tailscale",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
 ]
 

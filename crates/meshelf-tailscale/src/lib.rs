@@ -15,7 +15,7 @@ use std::{
 };
 
 use atomic_write_file::AtomicWriteFile;
-use meshelf_core::DeviceId;
+use meshelf_core::{DeviceId, UserSettings};
 use meshelf_identity::InstallationIdentity;
 use serde::Deserialize;
 use thiserror::Error;
@@ -269,6 +269,8 @@ pub struct PeerRegistry {
 pub struct InstallationState {
     pub device_id: DeviceId,
     pub peers: PeerRegistry,
+    #[serde(default)]
+    pub settings: UserSettings,
 }
 
 /// Cross-process transaction boundary for the shared per-user installation state.
@@ -287,6 +289,7 @@ impl Default for InstallationState {
         Self {
             device_id: DeviceId::new(),
             peers: PeerRegistry::default(),
+            settings: UserSettings::default(),
         }
     }
 }
@@ -362,6 +365,7 @@ impl InstallationStore {
             Ok(InstallationState {
                 device_id: identity,
                 peers: PeerRegistry::default(),
+                settings: loaded.settings,
             })
         }
     }
@@ -796,6 +800,100 @@ fn bounded_lossy(bytes: &[u8], maximum: usize) -> String {
 mod tests {
     use super::*;
 
+    use meshelf_core::{SaveDestination, UserSettings};
+
+    #[test]
+    fn old_state_without_settings_loads_downloads_default() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let identity = DeviceId::new();
+        let path = directory.path().join("state.json");
+        let old_state = serde_json::json!({
+            "device_id": identity,
+            "peers": {"peers": []}
+        });
+        fs::write(&path, serde_json::to_vec(&old_state).expect("encode")).expect("write state");
+        let loaded = InstallationState::load(path).expect("load old state");
+        assert_eq!(loaded.settings, UserSettings::default());
+        assert_eq!(loaded.settings.save_destination, SaveDestination::Downloads);
+    }
+
+    fn test_peer() -> (TailNode, InstallationIdentity) {
+        let peer = InstallationIdentity::generate();
+        (
+            TailNode {
+                node_id: Some("settings-peer-node".to_owned()),
+                hostname: "settings-peer".to_owned(),
+                dns_name: None,
+                addresses: vec!["100.64.0.2".parse().expect("peer address")],
+                online: true,
+                active: true,
+            },
+            peer,
+        )
+    }
+
+    #[test]
+    fn settings_update_preserves_peers() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = InstallationStore::new(directory.path().join("state.json"));
+        let identity = DeviceId::new();
+        let (node, peer) = test_peer();
+        store
+            .update(identity, |state| {
+                state
+                    .peers
+                    .accept_signed(&node, peer.device_id, peer.public_key().to_vec())
+            })
+            .expect("peer");
+        let custom = std::env::temp_dir().join("meshelf-settings-test");
+        store
+            .update(identity, |state| {
+                state.settings.save_destination = SaveDestination::Custom {
+                    path: custom.clone(),
+                };
+                Ok(())
+            })
+            .expect("settings");
+        let loaded = store.load_for_identity(identity).expect("load");
+        assert!(loaded.peers.by_device_id(peer.device_id).is_some());
+        assert_eq!(
+            loaded.settings.save_destination,
+            SaveDestination::Custom { path: custom }
+        );
+    }
+
+    #[test]
+    fn peer_update_preserves_settings() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = InstallationStore::new(directory.path().join("state.json"));
+        let identity = DeviceId::new();
+        let custom = std::env::temp_dir().join("meshelf-peer-settings-test");
+        store
+            .update(identity, |state| {
+                state.settings.save_destination = SaveDestination::Custom {
+                    path: custom.clone(),
+                };
+                Ok(())
+            })
+            .expect("settings");
+        let (node, peer) = test_peer();
+        store
+            .update(identity, |state| {
+                state
+                    .peers
+                    .accept_signed(&node, peer.device_id, peer.public_key().to_vec())
+            })
+            .expect("peer");
+        assert_eq!(
+            store
+                .load_for_identity(identity)
+                .expect("load")
+                .settings
+                .save_destination,
+            SaveDestination::Custom { path: custom }
+        );
+    }
+
     #[test]
     fn native_gui_launch_locations_include_apple_silicon_homebrew() {
         assert!(known_binary_locations().contains(&PathBuf::from("/opt/homebrew/bin/tailscale")));
@@ -934,6 +1032,9 @@ mod tests {
         let peer_device = DeviceId::new();
         store
             .update(old_device, |latest| {
+                latest.settings.save_destination = SaveDestination::Custom {
+                    path: std::env::temp_dir().join("identity-reconciliation-settings"),
+                };
                 latest.peers.accept_signed(
                     &TailNode {
                         node_id: Some("node-peer".to_owned()),
@@ -954,6 +1055,96 @@ mod tests {
             .expect("reconcile new identity");
         assert_eq!(reconciled.device_id, new_device);
         assert!(reconciled.peers.peers().is_empty());
+        assert_eq!(
+            reconciled.settings.save_destination,
+            SaveDestination::Custom {
+                path: std::env::temp_dir().join("identity-reconciliation-settings")
+            }
+        );
+    }
+
+    #[test]
+    fn identity_reconciliation_preserves_settings_but_clears_peers() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = InstallationStore::new(directory.path().join("state.json"));
+        let old_device = DeviceId::new();
+        let new_device = DeviceId::new();
+        let custom = std::env::temp_dir().join("identity-settings");
+        let (node, peer) = test_peer();
+        store
+            .update(old_device, |state| {
+                state.settings.save_destination = SaveDestination::Custom {
+                    path: custom.clone(),
+                };
+                state
+                    .peers
+                    .accept_signed(&node, peer.device_id, peer.public_key().to_vec())
+            })
+            .expect("old state");
+        let reconciled = store
+            .load_for_identity(new_device)
+            .expect("reconcile identity");
+        assert!(reconciled.peers.peers().is_empty());
+        assert_eq!(
+            reconciled.settings.save_destination,
+            SaveDestination::Custom { path: custom }
+        );
+    }
+
+    #[test]
+    fn concurrent_peer_and_settings_updates_do_not_lose_either() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("state.json");
+        let store = InstallationStore::new(path.clone());
+        let identity = DeviceId::new();
+        store
+            .update(identity, |_| Ok(()))
+            .expect("initialize state");
+        let (node, peer) = test_peer();
+        let peer_device_id = peer.device_id;
+        let peer_public_key = peer.public_key();
+        let custom = std::env::temp_dir().join("concurrent-settings");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let peer_store = InstallationStore::new(path.clone());
+        let peer_barrier = barrier.clone();
+        let peer_thread = std::thread::spawn(move || {
+            peer_barrier.wait();
+            peer_store
+                .update(identity, |state| {
+                    state
+                        .peers
+                        .accept_signed(&node, peer_device_id, peer_public_key.to_vec())
+                })
+                .expect("peer update");
+        });
+        let settings_store = InstallationStore::new(path);
+        let settings_barrier = barrier.clone();
+        let settings_thread = std::thread::spawn(move || {
+            settings_barrier.wait();
+            settings_store
+                .update(identity, |state| {
+                    state.settings.save_destination = SaveDestination::Custom { path: custom };
+                    Ok(())
+                })
+                .expect("settings update");
+        });
+        barrier.wait();
+        peer_thread.join().expect("peer thread");
+        settings_thread.join().expect("settings thread");
+
+        let committed = store_for_test(&directory)
+            .load_for_identity(identity)
+            .expect("load");
+        assert!(committed.peers.by_device_id(peer_device_id).is_some());
+        assert!(matches!(
+            committed.settings.save_destination,
+            SaveDestination::Custom { .. }
+        ));
+    }
+
+    fn store_for_test(directory: &tempfile::TempDir) -> InstallationStore {
+        InstallationStore::new(directory.path().join("state.json"))
     }
 
     #[test]

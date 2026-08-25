@@ -15,13 +15,56 @@ use std::{
 #[cfg(unix)]
 use std::process::Command;
 
-use meshelf_core::MessageId;
+use fs2::FileExt;
+use meshelf_core::{MAX_CONTROL_REQUEST_BYTES as CORE_MAX_CONTROL_REQUEST_BYTES, MessageId};
 
 const ACTIVATION_FILE: &str = "activation";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
-const READ_TIMEOUT: Duration = Duration::from_millis(250);
-pub const MAX_CONTROL_REQUEST_BYTES: usize = 64 * 1024;
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_CONTROL_REQUEST_BYTES: usize = CORE_MAX_CONTROL_REQUEST_BYTES;
 pub const MAX_CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// The one process-wide resident lock shared by the desktop and headless
+/// `serve` entry points. Ordinary CLI requests do not acquire it.
+#[derive(Debug)]
+pub struct ResidentLock {
+    file: File,
+}
+
+pub fn acquire_resident_lock(data_dir: &Path) -> io::Result<Option<ResidentLock>> {
+    fs::create_dir_all(data_dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(data_dir.join("resident.lock"))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(ResidentLock { file })),
+        Err(error) if is_lock_contention(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Another live instance holds the lock, as opposed to the lock being unusable.
+///
+/// Unix reports contention as `WouldBlock`. Windows reports `ERROR_SHARING_VIOLATION` (32) or
+/// `ERROR_LOCK_VIOLATION` (33), which Rust maps to `ErrorKind::Uncategorized`, so matching on
+/// `WouldBlock` alone silently turns "already running" into a hard error there. That would have
+/// made a second launch fail outright on Windows instead of signalling the resident instance and
+/// exiting quietly, regressing the behaviour that made relaunching show the window again.
+fn is_lock_contention(error: &io::Error) -> bool {
+    if error.kind() == ErrorKind::WouldBlock {
+        return true;
+    }
+    cfg!(windows) && matches!(error.raw_os_error(), Some(32) | Some(33))
+}
+
+impl Drop for ResidentLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
 
 /// Start the loopback activation listener and publish its address and token.
 pub fn listen(data_dir: &Path, on_activate: impl Fn() + Send + 'static) -> io::Result<()> {
@@ -385,6 +428,52 @@ mod tests {
         let response = request(directory.path(), b"bounded request")
             .expect("bounded request/response round trip");
         assert_eq!(response, b"response:bounded request");
+    }
+
+    #[test]
+    fn one_mib_worst_case_text_crosses_control_channel() {
+        let directory = TestDirectory::new();
+        listen_with_control(
+            directory.path(),
+            || {},
+            |request| {
+                assert_eq!(request.len(), meshelf_core::MAX_TEXT_BYTES * 6);
+                Ok(Vec::new())
+            },
+        )
+        .expect("start local control listener");
+        let worst_case_encoded = vec![b'\\'; meshelf_core::MAX_TEXT_BYTES * 6];
+        assert!(request(directory.path(), &worst_case_encoded).is_ok());
+    }
+
+    #[test]
+    fn local_listener_is_ipv4_loopback_only() {
+        let directory = TestDirectory::new();
+        listen_with_control(directory.path(), || {}, |_| Ok(Vec::new()))
+            .expect("start local control listener");
+        let (port, _) = read_activation(&directory.path().join(ACTIVATION_FILE))
+            .expect("activation file contents");
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        assert!(TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).is_ok());
+    }
+
+    #[test]
+    fn desktop_and_serve_cannot_both_own_resident_lock() {
+        let directory = TestDirectory::new();
+        let first = acquire_resident_lock(directory.path())
+            .expect("first lock")
+            .expect("first owner");
+        assert!(
+            acquire_resident_lock(directory.path())
+                .expect("second lock")
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            acquire_resident_lock(directory.path())
+                .expect("lock after release")
+                .is_some()
+        );
     }
 
     #[test]

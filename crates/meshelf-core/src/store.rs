@@ -175,6 +175,28 @@ pub struct OfferSourceInsert {
     pub purged: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfferEligibilityUpdate {
+    pub recipient_was_eligible: bool,
+    pub offer_deleted: bool,
+    pub remaining_recipients: u32,
+}
+
+/// The sender-side durable source authority. Implementations must make each
+/// mutation durable and atomic; callers never maintain a parallel registry.
+pub trait OfferSourceStore: Send + Sync + 'static {
+    fn insert_offer_source(&self, input: OfferSourceInput)
+    -> Result<OfferSourceInsert, StoreError>;
+
+    fn remove_explicit_refusal(
+        &self,
+        offer_id: OfferId,
+        recipient: DeviceId,
+    ) -> Result<OfferEligibilityUpdate, StoreError>;
+
+    fn get_offer_source(&self, offer_id: OfferId) -> Result<Option<OfferSourceRecord>, StoreError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferCardRecord {
     pub source_device: DeviceId,

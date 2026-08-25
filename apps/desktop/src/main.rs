@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
+    fs,
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -17,13 +17,18 @@ use std::{
 use std::process::Command;
 
 use anyhow::Result;
-use meshelf_control::{Controller, MESHELF_PORT, PeerView};
+use meshelf_control::{
+    Controller, MESHELF_PORT, PeerView, coordinator::Coordinator, local_control,
+};
 use meshelf_core::{ClipboardError, ClipboardSink, ContentKind, DeviceId, ReceiveRecord};
 use meshelf_net::{
     CoreEnvelopeHandler, ServerIdentity, TrustDecision, TrustGate,
     bind_discovered_tailscale_std_listener, serve_with_files,
 };
-use meshelf_platform::{ClipboardItem, ClipboardSource, ClipboardWorker, listen, signal};
+use meshelf_platform::{
+    ClipboardItem, ClipboardSource, ClipboardWorker, acquire_resident_lock, listen_with_control,
+    signal,
+};
 use meshelf_store::RedbReceiveStore;
 use meshelf_tailscale::InstallationStore;
 use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
@@ -430,28 +435,11 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("meshelf");
     fs::create_dir_all(&data_dir)?;
-    let instance_lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(data_dir.join("desktop.lock"))?;
-    if instance_lock.try_lock().is_err() {
+    let Some(_resident_lock) = acquire_resident_lock(&data_dir)? else {
         let signalled = signal(&data_dir);
         tracing::info!(signalled, "meshelf desktop is already running");
         return Ok(());
-    }
-    let _instance_lock = instance_lock;
-    let window_weak = window.as_weak();
-    listen(&data_dir, move || {
-        let window_weak = window_weak.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window_weak.upgrade() {
-                raise_window(&window);
-            }
-        });
-    })
-    .map_err(|error| anyhow::anyhow!("could not start activation listener: {error}"))?;
+    };
     let _activation_cleanup = ActivationCleanup(data_dir.join("activation"));
     let state_path = data_dir.join("state.json");
     let receive_store = Arc::new(
@@ -459,8 +447,35 @@ fn main() -> Result<()> {
             .map_err(|error| anyhow::anyhow!("could not open receive ledger: {error}"))?,
     );
     let app_state = Arc::new(Mutex::new(
-        Controller::load(state_path, device_name).map_err(|error| anyhow::anyhow!(error))?,
+        Controller::load(state_path.clone(), device_name)
+            .map_err(|error| anyhow::anyhow!(error))?,
     ));
+    let coordinator = {
+        let state = app_state.lock().expect("app state mutex");
+        Arc::new(Coordinator::new(
+            state.identity.device_id,
+            InstallationStore::new(state_path),
+            Arc::new(
+                meshelf_store::RedbV2Store::open(data_dir.join("meshelf-v2.redb"))
+                    .map_err(|error| anyhow::anyhow!("could not open v2 offer store: {error}"))?,
+            ),
+        ))
+    };
+    let window_weak = window.as_weak();
+    let control_coordinator = coordinator.clone();
+    listen_with_control(
+        &data_dir,
+        move || {
+            let window_weak = window_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = window_weak.upgrade() {
+                    raise_window(&window);
+                }
+            });
+        },
+        move |request| local_control::dispatch_bytes(&control_coordinator, request),
+    )
+    .map_err(|error| anyhow::anyhow!("could not start activation listener: {error}"))?;
     let (device_name, initial_peer_names) = {
         let state = app_state.lock().expect("app state mutex");
         (state.device_name.clone(), capture_peer_names(&state))

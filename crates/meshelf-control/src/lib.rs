@@ -3,6 +3,13 @@
 //! Clipboard operations remain explicit. Signed meshelf installations on the owner's Tailscale
 //! network pair automatically; sends use the direct signed protocol.
 
+pub mod coordinator;
+pub mod local_control;
+pub mod offer_source;
+
+pub use coordinator::{Coordinator, OfferPlan, PeerAnnouncement};
+pub use offer_source::{OfferInput, PreparedOfferSource, SourcePreparationError};
+
 use std::{
     fs,
     io::Read,
@@ -781,6 +788,7 @@ mod tests {
         let installation = InstallationState {
             device_id: local_device_id,
             peers: Default::default(),
+            settings: Default::default(),
         };
         installation.save(&state_path).expect("save initial state");
         let mut controller = Controller {
@@ -836,6 +844,7 @@ mod tests {
         let initial = InstallationState {
             device_id: local_device_id,
             peers: Default::default(),
+            settings: Default::default(),
         };
         initial.save(&state_path).expect("save initial state");
         let mut controller = Controller {

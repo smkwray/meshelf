@@ -8,8 +8,9 @@ use std::{fs, path::Path};
 
 use meshelf_core::{
     ActivationId, ActivationJournalEntry, CleanupReport, ClipboardCacheRecord, ClipboardCacheState,
-    MigrationReport, OfferCardInput, OfferCardInsert, OfferCardRecord, OfferSourceInput,
-    OfferSourceInsert, OfferSourceRecord, StoreError, V2_MAX_LIVE_ENTRIES,
+    MigrationReport, OfferCardInput, OfferCardInsert, OfferCardRecord, OfferEligibilityUpdate,
+    OfferSourceInput, OfferSourceInsert, OfferSourceRecord, OfferSourceStore, StoreError,
+    V2_MAX_LIVE_ENTRIES,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -123,6 +124,70 @@ impl RedbV2Store {
             .map_err(map_redb_error)?
             .map(|guard| decode_json!(guard.value()))
             .transpose()
+    }
+
+    /// Remove one recipient only after the user explicitly refused the offer.
+    /// The source row is removed in the same redb transaction when no eligible
+    /// recipients remain. Transport failures and lost acknowledgements never
+    /// call this method and therefore preserve eligibility.
+    pub fn remove_explicit_refusal(
+        &self,
+        offer_id: meshelf_core::OfferId,
+        recipient: meshelf_core::DeviceId,
+    ) -> Result<OfferEligibilityUpdate, StoreError> {
+        let key = offer_id.to_string();
+        let write = self.database.begin_write().map_err(map_redb_error)?;
+        let result: Result<OfferEligibilityUpdate, StoreError> = {
+            let mut table = write.open_table(OFFER_SOURCES_V2).map_err(map_redb_error)?;
+            let Some(bytes) = table
+                .get(key.as_str())
+                .map_err(map_redb_error)?
+                .map(|guard| guard.value().to_vec())
+            else {
+                return Err(StoreError::new("offer source does not exist"));
+            };
+            let mut record: OfferSourceRecord = decode_json!(&bytes)?;
+            let recipient_was_eligible = record.announced_to.remove(&recipient);
+            if !recipient_was_eligible {
+                Ok(OfferEligibilityUpdate {
+                    recipient_was_eligible: false,
+                    offer_deleted: false,
+                    remaining_recipients: u32::try_from(record.announced_to.len())
+                        .map_err(|_| StoreError::new("too many eligible recipients"))?,
+                })
+            } else if record.announced_to.is_empty() {
+                table.remove(key.as_str()).map_err(map_redb_error)?;
+                Ok(OfferEligibilityUpdate {
+                    recipient_was_eligible: true,
+                    offer_deleted: true,
+                    remaining_recipients: 0,
+                })
+            } else {
+                let remaining_recipients = u32::try_from(record.announced_to.len())
+                    .map_err(|_| StoreError::new("too many eligible recipients"))?;
+                let encoded = encode_json!(&record)?;
+                table
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(map_redb_error)?;
+                Ok(OfferEligibilityUpdate {
+                    recipient_was_eligible: true,
+                    offer_deleted: false,
+                    remaining_recipients,
+                })
+            }
+        };
+        let result = result?;
+        write.commit().map_err(map_redb_error)?;
+        Ok(result)
+    }
+
+    /// Descriptive alias for callers whose domain language is eligibility.
+    pub fn remove_eligible_recipient(
+        &self,
+        offer_id: meshelf_core::OfferId,
+        recipient: meshelf_core::DeviceId,
+    ) -> Result<OfferEligibilityUpdate, StoreError> {
+        self.remove_explicit_refusal(offer_id, recipient)
     }
 
     pub fn read_offer_sources(&self) -> Result<Vec<OfferSourceRecord>, StoreError> {
@@ -446,6 +511,30 @@ impl RedbV2Store {
     }
 }
 
+impl OfferSourceStore for RedbV2Store {
+    fn insert_offer_source(
+        &self,
+        input: OfferSourceInput,
+    ) -> Result<OfferSourceInsert, StoreError> {
+        Self::insert_offer_source(self, input)
+    }
+
+    fn remove_explicit_refusal(
+        &self,
+        offer_id: meshelf_core::OfferId,
+        recipient: meshelf_core::DeviceId,
+    ) -> Result<OfferEligibilityUpdate, StoreError> {
+        Self::remove_explicit_refusal(self, offer_id, recipient)
+    }
+
+    fn get_offer_source(
+        &self,
+        offer_id: meshelf_core::OfferId,
+    ) -> Result<Option<OfferSourceRecord>, StoreError> {
+        Self::get_offer_source(self, offer_id)
+    }
+}
+
 fn purge_oldest_sources(
     table: &mut redb::Table<'_, &'static str, &'static [u8]>,
 ) -> Result<u32, StoreError> {
@@ -558,6 +647,128 @@ mod tests {
                 text: text.to_owned(),
             },
         )
+    }
+
+    #[test]
+    fn source_and_eligibility_survive_restart() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("offers.redb");
+        let first = DeviceId::new();
+        let second = DeviceId::new();
+        let mut input = text_input("restart eligibility");
+        input.announced_to = HashSet::from([first, second]);
+        let offer_id = input.offer_id;
+        {
+            let store = RedbV2Store::open(&path).expect("open");
+            store.insert_offer_source(input).expect("insert");
+        }
+        let reopened = RedbV2Store::open(path).expect("reopen");
+        assert_eq!(
+            reopened
+                .get_offer_source(offer_id)
+                .expect("read")
+                .expect("source")
+                .announced_to,
+            HashSet::from([first, second])
+        );
+    }
+
+    #[test]
+    fn explicit_refusal_removes_only_that_recipient() {
+        let (_directory, store) = store();
+        let first = DeviceId::new();
+        let second = DeviceId::new();
+        let mut input = text_input("refusal");
+        input.announced_to = HashSet::from([first, second]);
+        let offer_id = input.offer_id;
+        store.insert_offer_source(input).expect("insert");
+        let result = store
+            .remove_explicit_refusal(offer_id, first)
+            .expect("refusal");
+        assert_eq!(
+            result,
+            meshelf_core::OfferEligibilityUpdate {
+                recipient_was_eligible: true,
+                offer_deleted: false,
+                remaining_recipients: 1,
+            }
+        );
+        assert_eq!(
+            store
+                .get_offer_source(offer_id)
+                .expect("read")
+                .expect("source")
+                .announced_to,
+            HashSet::from([second])
+        );
+    }
+
+    #[test]
+    fn last_explicit_refusal_deletes_source() {
+        let (_directory, store) = store();
+        let recipient = DeviceId::new();
+        let mut input = text_input("last refusal");
+        input.announced_to = HashSet::from([recipient]);
+        let offer_id = input.offer_id;
+        store.insert_offer_source(input).expect("insert");
+        let result = store
+            .remove_explicit_refusal(offer_id, recipient)
+            .expect("refusal");
+        assert!(result.offer_deleted);
+        assert!(store.get_offer_source(offer_id).expect("read").is_none());
+    }
+
+    #[test]
+    fn lost_ack_keeps_attempted_recipient() {
+        let (_directory, store) = store();
+        let recipient = DeviceId::new();
+        let mut input = text_input("lost acknowledgement");
+        input.announced_to = HashSet::from([recipient]);
+        let offer_id = input.offer_id;
+        store.insert_offer_source(input).expect("insert");
+        assert!(
+            store
+                .get_offer_source(offer_id)
+                .expect("read")
+                .expect("source")
+                .announced_to
+                .contains(&recipient)
+        );
+    }
+
+    #[test]
+    fn eleventh_source_purges_oldest_text_and_eligibility() {
+        let (_directory, store) = store();
+        let recipient = DeviceId::new();
+        let mut oldest = text_input("oldest");
+        oldest.announced_to = HashSet::from([recipient]);
+        let oldest_id = oldest.offer_id;
+        store.insert_offer_source(oldest).expect("oldest");
+        for index in 0..V2_MAX_LIVE_ENTRIES {
+            store
+                .insert_offer_source(text_input(&format!("new {index}")))
+                .expect("new source");
+        }
+        assert!(store.get_offer_source(oldest_id).expect("read").is_none());
+        assert_eq!(store.read_offer_sources().expect("read sources").len(), 10);
+    }
+
+    #[test]
+    fn no_offer_record_contains_time_expiry() {
+        let (_directory, store) = store();
+        let input = text_input("persistent");
+        let offer_id = input.offer_id;
+        store.insert_offer_source(input).expect("insert");
+        let encoded = serde_json::to_string(
+            &store
+                .get_offer_source(offer_id)
+                .expect("read")
+                .expect("source"),
+        )
+        .expect("encode");
+        assert!(!encoded.contains("expiry"));
+        assert!(!encoded.contains("expires"));
+        assert!(!encoded.contains("deadline"));
     }
 
     fn card_input(source_device: DeviceId, text: &str) -> OfferCardInput {

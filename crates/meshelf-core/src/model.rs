@@ -6,6 +6,9 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
+/// Six bytes per JSON-escaped control character is the worst-case encoding
+/// expansion for a valid UTF-8 text body, plus a bounded request envelope.
+pub const MAX_CONTROL_REQUEST_BYTES: usize = MAX_TEXT_BYTES * 6 + 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

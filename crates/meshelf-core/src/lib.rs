@@ -9,6 +9,7 @@ mod memory_store;
 mod model;
 mod offer;
 mod receiver;
+mod settings;
 mod store;
 
 pub use activation::{
@@ -17,8 +18,8 @@ pub use activation::{
 };
 pub use memory_store::MemoryReceiveStore;
 pub use model::{
-    ContentKind, DeliveryMode, DeviceId, EnvelopeValidationError, MAX_TEXT_BYTES, MessageId,
-    PROTOCOL_VERSION, Receipt, ReceiptCode, TextEnvelope,
+    ContentKind, DeliveryMode, DeviceId, EnvelopeValidationError, MAX_CONTROL_REQUEST_BYTES,
+    MAX_TEXT_BYTES, MessageId, PROTOCOL_VERSION, Receipt, ReceiptCode, TextEnvelope,
 };
 pub use offer::{
     CardAvailability, MAX_OFFER_ATTEMPT_DETAIL_BYTES, MAX_OFFER_FILE_BYTES,
@@ -27,8 +28,10 @@ pub use offer::{
     OfferSourceError, V2_MAX_LIVE_ENTRIES,
 };
 pub use receiver::{ClipboardError, ClipboardSink, ReceiverService};
+pub use settings::{SaveDestination, UserSettings};
 pub use store::{
     CleanupReport, MigrationReport, OfferAttemptCode, OfferAttemptStatus, OfferCardInput,
-    OfferCardInsert, OfferCardRecord, OfferSourceInput, OfferSourceInsert, OfferSourceRecord,
-    ReceivePhase, ReceiveRecord, ReceiveState, ReceiveStore, StoreError, TransitionOutcome,
+    OfferCardInsert, OfferCardRecord, OfferEligibilityUpdate, OfferSourceInput, OfferSourceInsert,
+    OfferSourceRecord, OfferSourceStore, ReceivePhase, ReceiveRecord, ReceiveState, ReceiveStore,
+    StoreError, TransitionOutcome,
 };

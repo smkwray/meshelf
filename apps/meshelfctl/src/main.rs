@@ -1,8 +1,19 @@
-use std::io::{self, Read};
+use std::{
+    io::{self, Read},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
-use meshelf_control::Controller;
-use meshelf_platform::{ClipboardItem, ClipboardSource, ClipboardWorker};
+use meshelf_control::{
+    Controller,
+    coordinator::Coordinator,
+    local_control::{self, LocalRequest, LocalResponse},
+};
+use meshelf_platform::{
+    ClipboardItem, ClipboardSource, ClipboardWorker, acquire_resident_lock, listen_with_control,
+    request as control_request,
+};
 
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
@@ -15,14 +26,20 @@ fn main() -> Result<()> {
         return meshelf_bootstrap::run_stdio();
     }
 
-    let (selector, options) = take_peer_selector(args.collect())?;
+    let remaining = args.collect::<Vec<_>>();
+    if command == "serve" {
+        return run_serve(remaining);
+    }
+    if command == "announce" {
+        return run_announce(remaining);
+    }
+
+    let (selector, options) = take_peer_selector(remaining)?;
     let device_name = std::env::var("MESHELF_DEVICE_NAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "This device".to_owned());
-    let config_dir = dirs::config_dir()
-        .context("could not determine the per-user configuration directory")?
-        .join("meshelf");
+    let config_dir = config_dir()?;
     std::fs::create_dir_all(&config_dir)?;
     let mut controller = Controller::load(config_dir.join("state.json"), device_name)
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -168,8 +185,86 @@ fn read_bounded_stdin() -> Result<String> {
     String::from_utf8(bytes).context("stdin is not valid UTF-8")
 }
 
+fn config_dir() -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .context("could not determine the per-user configuration directory")?
+        .join("meshelf"))
+}
+
+fn run_serve(args: Vec<String>) -> Result<()> {
+    if !args.is_empty() {
+        bail!("serve does not accept options")
+    }
+    let data_dir = config_dir()?;
+    std::fs::create_dir_all(&data_dir)?;
+    let Some(_resident_lock) = acquire_resident_lock(&data_dir)? else {
+        bail!("another meshelf resident already owns the local control channel")
+    };
+    let (coordinator, _identity) = Coordinator::open(
+        data_dir.join("state.json"),
+        data_dir.join("meshelf-v2.redb"),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let coordinator = Arc::new(coordinator);
+    let control_coordinator = coordinator.clone();
+    let (_stop_sender, stop_receiver) = std::sync::mpsc::channel::<()>();
+    listen_with_control(
+        &data_dir,
+        || {},
+        move |request| local_control::dispatch_bytes(&control_coordinator, request),
+    )?;
+    stop_receiver
+        .recv()
+        .map_err(|_| anyhow::anyhow!("local control listener stopped"))?;
+    Ok(())
+}
+
+fn run_announce(args: Vec<String>) -> Result<()> {
+    let mut source = None;
+    let mut arguments = args.into_iter();
+    while let Some(argument) = arguments.next() {
+        let candidate = match argument.as_str() {
+            "--text" => LocalRequest::AnnounceText {
+                text: arguments.next().context("--text requires a value")?,
+            },
+            "--stdin" => LocalRequest::AnnounceText {
+                text: read_bounded_stdin()?,
+            },
+            "--path" => LocalRequest::AnnouncePath {
+                path: PathBuf::from(arguments.next().context("--path requires a value")?),
+            },
+            _ => bail!("unknown announce option: {argument}"),
+        };
+        if source.is_some() {
+            bail!("choose exactly one of --text, --stdin, or --path");
+        }
+        source = Some(candidate);
+    }
+    let request = source.context("announce requires --text, --stdin, or --path")?;
+    let encoded = local_control::encode_request(&request)?;
+    let response = control_request(&config_dir()?, &encoded)
+        .context("could not contact the meshelf resident")?;
+    let response: LocalResponse = serde_json::from_slice(&response)?;
+    match response {
+        LocalResponse::OfferCreated {
+            offer_id,
+            announcements,
+            ..
+        } => println!(
+            "Announced offer {offer_id} to {} paired device(s)",
+            announcements.len()
+        ),
+        LocalResponse::NoPeers => bail!("no other meshelf device is paired"),
+        LocalResponse::Error { message } => bail!("{message}"),
+        LocalResponse::RefusalRecorded | LocalResponse::Settings { .. } => {
+            bail!("resident returned an unexpected response")
+        }
+    }
+    Ok(())
+}
+
 fn usage() -> Result<()> {
     bail!(
-        "usage: meshelfctl [status|refresh|trust-ssh|clipboard-read|send] [--peer NAME_OR_ID]\n  send requires exactly one of --clipboard, --stdin, or --text TEXT\n  pair-stdio is the fixed SSH bootstrap command"
+        "usage: meshelfctl [status|refresh|trust-ssh|clipboard-read|send|serve|announce] [--peer NAME_OR_ID]\n  send requires exactly one of --clipboard, --stdin, or --text TEXT\n  announce requires exactly one of --text TEXT, --stdin, or --path PATH\n  pair-stdio is the fixed SSH bootstrap command"
     )
 }

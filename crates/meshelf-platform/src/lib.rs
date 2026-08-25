@@ -8,8 +8,8 @@ mod clipboard;
 mod filesystem;
 
 pub use activation::{
-    MAX_CONTROL_REQUEST_BYTES, MAX_CONTROL_RESPONSE_BYTES, listen, listen_with_control, request,
-    signal,
+    MAX_CONTROL_REQUEST_BYTES, MAX_CONTROL_RESPONSE_BYTES, ResidentLock, acquire_resident_lock,
+    listen, listen_with_control, request, signal,
 };
 pub use clipboard::{ClipboardItem, ClipboardSource, ClipboardWorker, PlatformClipboardError};
 pub use filesystem::{
