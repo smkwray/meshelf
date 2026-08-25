@@ -13,22 +13,25 @@ use std::{
 
 use async_trait::async_trait;
 use meshelf_core::{
-    ClipboardSink, ContentKind, DeviceId, Receipt, ReceiptCode, ReceiveStore, ReceiverService,
-    TextEnvelope,
+    CardAvailability, ClipboardSink, ContentKind, DeviceId, OfferCardInput, OfferCardInsert,
+    OfferCardRecord, OfferId, Receipt, ReceiptCode, ReceiveStore, ReceiverService, StoreError,
+    TextEnvelope, V2_MAX_LIVE_ENTRIES,
 };
 use meshelf_protocol::{
     CAP_FILE_STREAM_V1, CAP_TEXT_SHELF_V1, ClientHello, FileAdmission, FileEntryKind,
-    FileTransferOffer, MAX_FILE_BYTES, MAX_FILE_ENTRIES, MAX_RELATIVE_PATH_BYTES,
-    MAX_TRANSFER_BYTES, ProtocolError, ServerHello, WireMessage, read_frame_async,
-    write_frame_async,
+    FileTransferOffer, MAX_FILE_BYTES, MAX_FILE_ENTRIES, MAX_FRAME_BYTES, MAX_RELATIVE_PATH_BYTES,
+    MAX_TRANSFER_BYTES, OfferAck, OfferAckCode, OfferAnnouncement, ProtocolError, ServerHello,
+    V2_MAX_INBOUND_HANDLERS, V2Message, WireMessage, decode_payload, read_frame_async,
+    read_v2_frame_async, validate_v2_message, write_frame_async, write_v2_frame_async,
 };
+use meshelf_store::RedbV2Store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::watch,
+    sync::{Semaphore, TryAcquireError, watch},
     time::timeout,
 };
 
@@ -187,6 +190,202 @@ where
     }
 }
 
+/// The receiver-side v2 card operations used by the announcement boundary.
+///
+/// This small transport-facing trait keeps the network layer on the Step 2 API while leaving
+/// redb as the sole persisted card authority. It intentionally exposes no payload or staging
+/// operation.
+pub trait OfferCardStore: Send + Sync + 'static {
+    fn get_offer_card(
+        &self,
+        source_device: DeviceId,
+        offer_id: OfferId,
+    ) -> Result<Option<OfferCardRecord>, StoreError>;
+
+    fn read_offer_shelf(&self) -> Result<Vec<OfferCardRecord>, StoreError>;
+
+    fn insert_offer_card(&self, input: OfferCardInput) -> Result<OfferCardInsert, StoreError>;
+}
+
+impl OfferCardStore for RedbV2Store {
+    fn get_offer_card(
+        &self,
+        source_device: DeviceId,
+        offer_id: OfferId,
+    ) -> Result<Option<OfferCardRecord>, StoreError> {
+        RedbV2Store::get_offer_card(self, source_device, offer_id)
+    }
+
+    fn read_offer_shelf(&self) -> Result<Vec<OfferCardRecord>, StoreError> {
+        RedbV2Store::read_offer_shelf(self)
+    }
+
+    fn insert_offer_card(&self, input: OfferCardInput) -> Result<OfferCardInsert, StoreError> {
+        RedbV2Store::insert_offer_card(self, input)
+    }
+}
+
+/// A v2 announcement receiver. It stores bounded card metadata only; it never opens a source,
+/// creates staging, writes a cache, or creates a payload file.
+pub struct OfferAnnouncementHandler {
+    store: Arc<dyn OfferCardStore>,
+    mutation_lock: std::sync::Mutex<()>,
+}
+
+impl OfferAnnouncementHandler {
+    #[must_use]
+    pub fn new(store: Arc<dyn OfferCardStore>) -> Self {
+        Self {
+            store,
+            mutation_lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn live_counts(&self) -> Result<(u32, u32), NetError> {
+        let live = self
+            .store
+            .read_offer_shelf()
+            .map_err(|error| NetError::OfferStorage(error.to_string()))?
+            .len();
+        let live = u32::try_from(live)
+            .map_err(|_| NetError::OfferStorage("offer card count exceeds u32".to_owned()))?;
+        Ok((live, V2_MAX_LIVE_ENTRIES))
+    }
+
+    fn ack(
+        offer_id: OfferId,
+        code: OfferAckCode,
+        live_entries: u32,
+        pruned_entries: u32,
+        detail: Option<String>,
+    ) -> OfferAck {
+        OfferAck {
+            offer_id,
+            code,
+            live_entries,
+            max_live_entries: V2_MAX_LIVE_ENTRIES,
+            pruned_entries,
+            detail,
+        }
+    }
+
+    pub fn handle_sync(
+        &self,
+        authenticated_source: DeviceId,
+        listener_device: DeviceId,
+        announcement: OfferAnnouncement,
+    ) -> Result<OfferAck, NetError> {
+        let offer_id = announcement.offer_id;
+        let (live_entries, _max_live_entries) = self.live_counts()?;
+
+        if announcement.source_device != authenticated_source {
+            return Ok(Self::ack(
+                offer_id,
+                OfferAckCode::RefusedInvalid,
+                live_entries,
+                0,
+                Some("source device does not match authenticated client".to_owned()),
+            ));
+        }
+        if announcement.target_device != listener_device {
+            return Ok(Self::ack(
+                offer_id,
+                OfferAckCode::RefusedInvalid,
+                live_entries,
+                0,
+                Some("target device does not match listener".to_owned()),
+            ));
+        }
+        if let Err(error) = announcement.validate() {
+            return Ok(Self::ack(
+                offer_id,
+                OfferAckCode::RefusedInvalid,
+                live_entries,
+                0,
+                Some(format!("invalid offer announcement: {error}")),
+            ));
+        }
+
+        // The count and insert must be one local critical section. The Step 2 store API still
+        // supports sender-side oldest-first pruning for its independent source table; receiver
+        // announcements must refuse at ten instead of invoking that pruning path.
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| NetError::OfferStorage("offer card lock is poisoned".to_owned()))?;
+        let (live_entries, _) = self.live_counts()?;
+        if let Some(existing) = self
+            .store
+            .get_offer_card(authenticated_source, offer_id)
+            .map_err(|error| NetError::OfferStorage(error.to_string()))?
+        {
+            let (code, detail) = if existing.descriptor == announcement.descriptor {
+                (OfferAckCode::Duplicate, None)
+            } else {
+                (
+                    OfferAckCode::RefusedConflict,
+                    Some("offer ID is already stored with a different descriptor".to_owned()),
+                )
+            };
+            return Ok(Self::ack(offer_id, code, live_entries, 0, detail));
+        }
+        if live_entries >= V2_MAX_LIVE_ENTRIES {
+            return Ok(Self::ack(
+                offer_id,
+                OfferAckCode::RefusedCapacity,
+                live_entries,
+                0,
+                Some("receiver offer-card capacity is full".to_owned()),
+            ));
+        }
+
+        let inserted = self
+            .store
+            .insert_offer_card(OfferCardInput::new(
+                authenticated_source,
+                offer_id,
+                announcement.descriptor,
+                CardAvailability::Available,
+            ))
+            .map_err(|error| NetError::OfferStorage(error.to_string()))?;
+        let live_entries = self.live_counts()?.0;
+        let code = if inserted.inserted {
+            OfferAckCode::Stored
+        } else {
+            OfferAckCode::Duplicate
+        };
+        Ok(Self::ack(
+            offer_id,
+            code,
+            live_entries,
+            inserted.purged,
+            None,
+        ))
+    }
+}
+
+#[async_trait]
+pub trait V2AnnouncementReceiver: Send + Sync + 'static {
+    async fn handle_announcement(
+        &self,
+        authenticated_source: DeviceId,
+        listener_device: DeviceId,
+        announcement: OfferAnnouncement,
+    ) -> Result<OfferAck, NetError>;
+}
+
+#[async_trait]
+impl V2AnnouncementReceiver for OfferAnnouncementHandler {
+    async fn handle_announcement(
+        &self,
+        authenticated_source: DeviceId,
+        listener_device: DeviceId,
+        announcement: OfferAnnouncement,
+    ) -> Result<OfferAck, NetError> {
+        self.handle_sync(authenticated_source, listener_device, announcement)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerClient {
     connect_timeout: Duration,
@@ -328,6 +527,111 @@ impl PeerClient {
             ));
         }
         Ok(receipt)
+    }
+
+    /// Announce one metadata-only offer over one authenticated connection.
+    ///
+    /// This deliberately has no retry or queue path. A connect or I/O failure is returned to the
+    /// caller immediately, and the connection is never reused for another operation.
+    pub async fn announce_offer(
+        &self,
+        address: SocketAddr,
+        hello: ClientHello,
+        announcement: OfferAnnouncement,
+        expected_server_public_key: &[u8],
+    ) -> Result<OfferAck, NetError> {
+        announcement.validate()?;
+        if hello.device_id != announcement.source_device {
+            return Err(NetError::IdentityMismatch(
+                "client hello and offer announcement source differ".to_owned(),
+            ));
+        }
+
+        let mut stream = match timeout(self.connect_timeout, TcpStream::connect(address)).await {
+            Err(_) => {
+                return Err(NetError::Unavailable(
+                    "announce connect timed out".to_owned(),
+                ));
+            }
+            Ok(Err(error)) => return Err(NetError::Unavailable(error.to_string())),
+            Ok(Ok(stream)) => stream,
+        };
+        stream.set_nodelay(true)?;
+
+        io_timeout(
+            self.io_timeout,
+            write_frame_async(&mut stream, &WireMessage::ClientHello(hello)),
+            "write announce client hello",
+        )
+        .await
+        .map_err(|error| match error {
+            NetError::Io(error) => NetError::Unavailable(error.to_string()),
+            NetError::Timeout(operation) => NetError::Unavailable(operation.to_owned()),
+            other => other,
+        })?;
+        let response = io_timeout(
+            self.io_timeout,
+            read_frame_async(&mut stream),
+            "read announce server hello",
+        )
+        .await
+        .map_err(|error| match error {
+            NetError::Io(error) => NetError::Unavailable(error.to_string()),
+            NetError::Timeout(operation) => NetError::Unavailable(operation.to_owned()),
+            other => other,
+        })?;
+        let WireMessage::ServerHello(server_hello) = response else {
+            return Err(NetError::UnexpectedMessage("expected server_hello"));
+        };
+        if !server_hello.has_valid_signature()
+            || (!expected_server_public_key.is_empty()
+                && server_hello.public_key != expected_server_public_key)
+        {
+            return Err(NetError::IdentityMismatch(
+                "announcement receiver signature or public key is invalid".to_owned(),
+            ));
+        }
+        if server_hello.device_id != announcement.target_device {
+            return Err(NetError::IdentityMismatch(
+                "announcement receiver does not match target".to_owned(),
+            ));
+        }
+        if server_hello.protocol_version != meshelf_core::PROTOCOL_VERSION {
+            return Err(NetError::Rejected(
+                "announcement receiver uses an unsupported protocol version".to_owned(),
+            ));
+        }
+        if !server_hello.accepted {
+            return Err(NetError::Rejected(server_hello.reason.unwrap_or_else(
+                || "announcement receiver rejected connection".to_owned(),
+            )));
+        }
+
+        io_timeout(
+            self.io_timeout,
+            write_v2_frame_async(
+                &mut stream,
+                &V2Message::OfferAnnouncement(announcement.clone()),
+            ),
+            "write offer announcement",
+        )
+        .await?;
+        let response = io_timeout(
+            self.io_timeout,
+            read_v2_frame_async(&mut stream),
+            "read offer acknowledgement",
+        )
+        .await?;
+        validate_v2_message(&response)?;
+        let V2Message::OfferAck(ack) = response else {
+            return Err(NetError::UnexpectedMessage("expected offer_ack"));
+        };
+        if ack.offer_id != announcement.offer_id {
+            return Err(NetError::IdentityMismatch(
+                "offer acknowledgement ID does not match announcement".to_owned(),
+            ));
+        }
+        Ok(ack)
     }
 
     pub async fn push_file_transfer(
@@ -635,11 +939,14 @@ where
 {
     serve_inner(
         listener,
-        identity,
-        gate,
-        handler,
-        None,
-        io_timeout_duration,
+        ServerContext {
+            identity,
+            gate,
+            handler,
+            incoming_directory: None,
+            offer_receiver: None,
+            io_timeout_duration,
+        },
         shutdown,
     )
     .await
@@ -660,29 +967,85 @@ where
 {
     serve_inner(
         listener,
-        identity,
-        gate,
-        handler,
-        Some(incoming_directory),
-        io_timeout_duration,
+        ServerContext {
+            identity,
+            gate,
+            handler,
+            incoming_directory: Some(incoming_directory),
+            offer_receiver: None,
+            io_timeout_duration,
+        },
         shutdown,
     )
     .await
 }
 
-async fn serve_inner<G, H>(
+/// Serve the existing v1 operations and the additive, unadvertised v2 announcement operation.
+///
+/// The v2 receiver is deliberately opt-in at the composition boundary. It does not alter the
+/// v1 capability list or select v2 for existing clients.
+pub async fn serve_with_offers<G, H>(
     listener: TcpListener,
     identity: ServerIdentity,
     gate: Arc<G>,
     handler: Arc<H>,
-    incoming_directory: Option<PathBuf>,
+    offer_receiver: Arc<dyn V2AnnouncementReceiver>,
     io_timeout_duration: Duration,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), NetError>
+where
+    G: TrustGate,
+    H: EnvelopeHandler,
+{
+    serve_inner(
+        listener,
+        ServerContext {
+            identity,
+            gate,
+            handler,
+            incoming_directory: None,
+            offer_receiver: Some(offer_receiver),
+            io_timeout_duration,
+        },
+        shutdown,
+    )
+    .await
+}
+
+struct ServerContext<G, H> {
+    identity: ServerIdentity,
+    gate: Arc<G>,
+    handler: Arc<H>,
+    incoming_directory: Option<PathBuf>,
+    offer_receiver: Option<Arc<dyn V2AnnouncementReceiver>>,
+    io_timeout_duration: Duration,
+}
+
+impl<G, H> Clone for ServerContext<G, H> {
+    fn clone(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            gate: self.gate.clone(),
+            handler: self.handler.clone(),
+            incoming_directory: self.incoming_directory.clone(),
+            offer_receiver: self.offer_receiver.clone(),
+            io_timeout_duration: self.io_timeout_duration,
+        }
+    }
+}
+
+async fn serve_inner<G, H>(
+    listener: TcpListener,
+    context: ServerContext<G, H>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), NetError>
 where
     G: TrustGate,
     H: EnvelopeHandler,
 {
+    let handler_limit = Arc::new(Semaphore::new(
+        usize::try_from(V2_MAX_INBOUND_HANDLERS).expect("handler limit fits usize"),
+    ));
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -694,20 +1057,29 @@ where
             }
             accepted = listener.accept() => {
                 let (stream, remote) = accepted?;
-                let identity = identity.clone();
-                let gate = gate.clone();
-                let handler = handler.clone();
-                let incoming_directory = incoming_directory.clone();
+                let permit = match handler_limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(TryAcquireError::NoPermits) => {
+                        let active = V2_MAX_INBOUND_HANDLERS.saturating_sub(
+                            u32::try_from(handler_limit.available_permits()).unwrap_or(0),
+                        );
+                        refuse_excess_connection(
+                            stream,
+                            context.identity.clone(),
+                            context.incoming_directory.is_some(),
+                            active,
+                            context.io_timeout_duration,
+                        ).await?;
+                        continue;
+                    }
+                    Err(TryAcquireError::Closed) => {
+                        return Err(NetError::HandlerLimitClosed);
+                    }
+                };
+                let context = context.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(
-                        stream,
-                        remote,
-                        identity,
-                        gate,
-                        handler,
-                        incoming_directory,
-                        io_timeout_duration,
-                    ).await {
+                    let _permit = permit;
+                    if let Err(error) = handle_connection(stream, remote, context).await {
                         tracing::warn!(remote = %remote, error = %error, "meshelf peer connection failed");
                     }
                 });
@@ -749,14 +1121,42 @@ pub fn bind_discovered_tailscale_std_listener(
     Ok(listener)
 }
 
+async fn refuse_excess_connection(
+    mut stream: TcpStream,
+    identity: ServerIdentity,
+    has_file_receiver: bool,
+    active: u32,
+    io_timeout_duration: Duration,
+) -> Result<(), NetError> {
+    stream.set_nodelay(true)?;
+    let mut capabilities = vec![CAP_TEXT_SHELF_V1.to_owned()];
+    if has_file_receiver {
+        capabilities.push(CAP_FILE_STREAM_V1.to_owned());
+    }
+    let reason = format!(
+        "inbound handler capacity exhausted: active={active}, maximum={V2_MAX_INBOUND_HANDLERS}"
+    );
+    let server_hello = WireMessage::ServerHello(ServerHello::signed(
+        meshelf_core::PROTOCOL_VERSION,
+        identity.device_id(),
+        identity.device_name,
+        false,
+        Some(reason),
+        capabilities,
+        &identity.signing_identity,
+    ));
+    io_timeout(
+        io_timeout_duration,
+        write_frame_async(&mut stream, &server_hello),
+        "write handler-capacity refusal",
+    )
+    .await
+}
+
 async fn handle_connection<G, H>(
     mut stream: TcpStream,
     remote: SocketAddr,
-    identity: ServerIdentity,
-    gate: Arc<G>,
-    handler: Arc<H>,
-    incoming_directory: Option<PathBuf>,
-    io_timeout_duration: Duration,
+    context: ServerContext<G, H>,
 ) -> Result<(), NetError>
 where
     G: TrustGate,
@@ -764,7 +1164,7 @@ where
 {
     stream.set_nodelay(true)?;
     let first = io_timeout(
-        io_timeout_duration,
+        context.io_timeout_duration,
         read_frame_async(&mut stream),
         "read client hello",
     )
@@ -775,7 +1175,7 @@ where
 
     let protocol_ok = hello.protocol_version == meshelf_core::PROTOCOL_VERSION;
     let trust = if protocol_ok && hello.has_valid_signature() {
-        gate.authorize(remote, &hello)
+        context.gate.authorize(remote, &hello)
     } else if protocol_ok {
         TrustDecision::Deny("client hello signature is invalid".to_owned())
     } else {
@@ -789,20 +1189,20 @@ where
         TrustDecision::Deny(reason) => (false, Some(reason)),
     };
     let mut capabilities = vec![CAP_TEXT_SHELF_V1.to_owned()];
-    if incoming_directory.is_some() {
+    if context.incoming_directory.is_some() {
         capabilities.push(CAP_FILE_STREAM_V1.to_owned());
     }
     let server_hello = WireMessage::ServerHello(ServerHello::signed(
         meshelf_core::PROTOCOL_VERSION,
-        identity.device_id(),
-        identity.device_name.clone(),
+        context.identity.device_id(),
+        context.identity.device_name.clone(),
         accepted,
         reason,
         capabilities,
-        &identity.signing_identity,
+        &context.identity.signing_identity,
     ));
     io_timeout(
-        io_timeout_duration,
+        context.io_timeout_duration,
         write_frame_async(&mut stream, &server_hello),
         "write server hello",
     )
@@ -811,15 +1211,38 @@ where
         return Ok(());
     }
 
-    let message = io_timeout(
-        io_timeout_duration,
-        read_frame_async(&mut stream),
+    let payload = io_timeout(
+        context.io_timeout_duration,
+        read_raw_frame_async(&mut stream),
         "read envelope",
     )
     .await?;
+    if let Ok(v2_message) = serde_json::from_slice::<V2Message>(&payload) {
+        let V2Message::OfferAnnouncement(announcement) = v2_message else {
+            return Err(NetError::UnexpectedMessage(
+                "unsupported v2 operation; only offer announcements are enabled",
+            ));
+        };
+        let Some(offer_receiver) = context.offer_receiver.as_ref() else {
+            return Err(NetError::UnexpectedMessage(
+                "v2 offer announcements are not configured",
+            ));
+        };
+        let ack = offer_receiver
+            .handle_announcement(hello.device_id, context.identity.device_id(), announcement)
+            .await?;
+        io_timeout(
+            context.io_timeout_duration,
+            write_v2_frame_async(&mut stream, &V2Message::OfferAck(ack)),
+            "write offer acknowledgement",
+        )
+        .await?;
+        return Ok(());
+    }
+    let message = decode_payload(&payload)?;
     let WireMessage::PushEnvelope(envelope) = message else {
         if let WireMessage::FileOffer(offer) = message {
-            let Some(incoming_directory) = incoming_directory else {
+            let Some(incoming_directory) = context.incoming_directory else {
                 return Err(NetError::FileTransfer(
                     "file receiving is not configured".to_owned(),
                 ));
@@ -827,11 +1250,11 @@ where
             return handle_file_offer(
                 &mut stream,
                 &hello,
-                identity.device_id(),
+                context.identity.device_id(),
                 offer,
                 &incoming_directory,
-                handler,
-                io_timeout_duration,
+                context.handler,
+                context.io_timeout_duration,
             )
             .await;
         }
@@ -846,21 +1269,21 @@ where
             "authenticated hello identity and envelope source differ",
         );
         io_timeout(
-            io_timeout_duration,
+            context.io_timeout_duration,
             write_frame_async(&mut stream, &WireMessage::Receipt(receipt)),
             "write rejection receipt",
         )
         .await?;
         return Ok(());
     }
-    if envelope.target_device != identity.device_id() {
+    if envelope.target_device != context.identity.device_id() {
         let receipt = Receipt::rejected(
             envelope.message_id,
             ReceiptCode::RejectedWrongTarget,
             "message target does not match listener device",
         );
         io_timeout(
-            io_timeout_duration,
+            context.io_timeout_duration,
             write_frame_async(&mut stream, &WireMessage::Receipt(receipt)),
             "write wrong-target receipt",
         )
@@ -868,9 +1291,9 @@ where
         return Ok(());
     }
 
-    let receipt = handler.handle(envelope, now_unix_ms()).await;
+    let receipt = context.handler.handle(envelope, now_unix_ms()).await;
     io_timeout(
-        io_timeout_duration,
+        context.io_timeout_duration,
         write_frame_async(&mut stream, &WireMessage::Receipt(receipt)),
         "write receipt",
     )
@@ -1312,6 +1735,30 @@ async fn io_timeout<T>(
         .map_err(NetError::Protocol)
 }
 
+/// Read one existing-protocol frame without choosing a wire enum first. The post-handshake
+/// server path uses this to distinguish an additive v2 announcement from an existing v1 message;
+/// it keeps the v1 frame ceiling and never allocates based on an unchecked length.
+async fn read_raw_frame_async<R>(reader: &mut R) -> Result<Vec<u8>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut length_bytes = [0_u8; 4];
+    reader.read_exact(&mut length_bytes).await?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    if length == 0 {
+        return Err(ProtocolError::EmptyFrame);
+    }
+    if length > MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge {
+            bytes: length,
+            maximum: MAX_FRAME_BYTES,
+        });
+    }
+    let mut payload = vec![0_u8; length];
+    reader.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
 fn now_unix_ms() -> u64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1330,6 +1777,8 @@ pub enum NetError {
     Timeout(&'static str),
     #[error("peer rejected connection: {0}")]
     Rejected(String),
+    #[error("peer unavailable: {0}")]
+    Unavailable(String),
     #[error("unexpected wire message: {0}")]
     UnexpectedMessage(&'static str),
     #[error("identity mismatch: {0}")]
@@ -1338,17 +1787,26 @@ pub enum NetError {
     UnsafeBind(String),
     #[error("file transfer failed: {0}")]
     FileTransfer(String),
+    #[error("offer card storage failed: {0}")]
+    OfferStorage(String),
+    #[error("inbound handler limit was closed")]
+    HandlerLimitClosed,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Barrier, Mutex},
+    };
 
     use meshelf_core::{
         ClipboardError, ClipboardSink, MemoryReceiveStore, ReceiptCode, ReceiveStore,
         ReceiverService,
     };
     use meshelf_protocol::ClientHello;
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::watch;
 
     use super::*;
@@ -1371,8 +1829,213 @@ mod tests {
         }
     }
 
+    async fn start_offer_server(
+        allowed_devices: impl IntoIterator<Item = DeviceId>,
+    ) -> (
+        tempfile::TempDir,
+        SocketAddr,
+        meshelf_identity::InstallationIdentity,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<(), NetError>>,
+        Arc<RedbV2Store>,
+    ) {
+        let directory = tempfile::tempdir().expect("temporary offer directory");
+        let store = Arc::new(
+            RedbV2Store::open(directory.path().join("offers.redb")).expect("open offer store"),
+        );
+        let target_identity = meshelf_identity::InstallationIdentity::generate();
+        let target = target_identity.device_id;
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let receiver = Arc::new(ReceiverService::new(
+            target,
+            Arc::new(MemoryReceiveStore::new()),
+            Arc::new(TestClipboard::default()),
+        ));
+        let handler = Arc::new(CoreEnvelopeHandler::new(receiver));
+        let offer_receiver: Arc<dyn V2AnnouncementReceiver> =
+            Arc::new(OfferAnnouncementHandler::new(store.clone()));
+        let server = tokio::spawn(serve_with_offers(
+            listener,
+            ServerIdentity {
+                signing_identity: target_identity.clone(),
+                device_name: "BZOT".to_owned(),
+            },
+            Arc::new(ExactDeviceAllowList::new(allowed_devices)),
+            handler,
+            offer_receiver,
+            TEST_IO_TIMEOUT,
+            shutdown_rx,
+        ));
+        (
+            directory,
+            address,
+            target_identity,
+            shutdown_tx,
+            server,
+            store,
+        )
+    }
+
+    async fn stop_offer_server(
+        shutdown_tx: watch::Sender<bool>,
+        server: tokio::task::JoinHandle<Result<(), NetError>>,
+    ) {
+        shutdown_tx.send(true).expect("request shutdown");
+        server.await.expect("server task").expect("clean server");
+    }
+
+    fn text_announcement(
+        source: DeviceId,
+        target: DeviceId,
+        offer_id: OfferId,
+        text: &str,
+    ) -> OfferAnnouncement {
+        OfferAnnouncement::new(
+            offer_id,
+            source,
+            target,
+            now_unix_ms(),
+            meshelf_core::OfferDescriptor::text(text).expect("text descriptor"),
+        )
+    }
+
+    async fn send_announcement(
+        address: SocketAddr,
+        source_identity: &meshelf_identity::InstallationIdentity,
+        target_identity: &meshelf_identity::InstallationIdentity,
+        announcement: OfferAnnouncement,
+    ) -> Result<OfferAck, NetError> {
+        PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+            .announce_offer(
+                address,
+                ClientHello::signed(
+                    source_identity.device_id,
+                    "BMST",
+                    DeviceId::new().to_string(),
+                    source_identity,
+                ),
+                announcement,
+                &target_identity.public_key(),
+            )
+            .await
+    }
+
+    async fn send_raw_announcement(
+        address: SocketAddr,
+        source_identity: &meshelf_identity::InstallationIdentity,
+        target_identity: &meshelf_identity::InstallationIdentity,
+        announcement: OfferAnnouncement,
+    ) -> OfferAck {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("connect announcement");
+        stream.set_nodelay(true).expect("nodelay");
+        let hello = ClientHello::signed(
+            source_identity.device_id,
+            "BMST",
+            DeviceId::new().to_string(),
+            source_identity,
+        );
+        io_timeout(
+            TEST_IO_TIMEOUT,
+            write_frame_async(&mut stream, &WireMessage::ClientHello(hello)),
+            "write raw client hello",
+        )
+        .await
+        .expect("write hello");
+        let response = io_timeout(
+            TEST_IO_TIMEOUT,
+            read_frame_async(&mut stream),
+            "read raw server hello",
+        )
+        .await
+        .expect("read hello");
+        let WireMessage::ServerHello(server_hello) = response else {
+            panic!("expected server hello");
+        };
+        assert!(server_hello.accepted);
+        assert_eq!(server_hello.device_id, target_identity.device_id);
+
+        let payload = serde_json::to_vec(&V2Message::OfferAnnouncement(announcement))
+            .expect("serialize raw announcement");
+        let payload_len = u32::try_from(payload.len()).expect("raw announcement length");
+        stream
+            .write_all(&payload_len.to_be_bytes())
+            .await
+            .expect("write raw announcement length");
+        stream
+            .write_all(&payload)
+            .await
+            .expect("write raw announcement");
+        let response = io_timeout(
+            TEST_IO_TIMEOUT,
+            read_v2_frame_async(&mut stream),
+            "read raw acknowledgement",
+        )
+        .await
+        .expect("read raw acknowledgement");
+        let V2Message::OfferAck(ack) = response else {
+            panic!("expected offer ack");
+        };
+        ack
+    }
+
+    fn filesystem_entries(root: &Path) -> Vec<(PathBuf, u64)> {
+        let mut entries = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).expect("read test directory") {
+                let entry = entry.expect("read directory entry");
+                let path = entry.path();
+                let metadata = entry.metadata().expect("read entry metadata");
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else {
+                    entries.push((path, metadata.len()));
+                }
+            }
+        }
+        entries
+    }
+
+    fn assert_no_payload_artifacts(root: &Path) {
+        let entries = filesystem_entries(root);
+        let forbidden = entries
+            .iter()
+            .filter(|(path, _)| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.contains("staging")
+                            || name.contains("cache")
+                            || name.contains("payload")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            forbidden.is_empty(),
+            "unexpected payload artifacts: {forbidden:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(path, _)| path.ends_with("offers.redb")),
+            "metadata store was not created"
+        );
+        let non_store_bytes: u64 = entries
+            .iter()
+            .filter(|(path, _)| !path.ends_with("offers.redb"))
+            .map(|(_, bytes)| *bytes)
+            .sum();
+        assert_eq!(non_store_bytes, 0, "non-store payload bytes were written");
+    }
+
     #[tokio::test]
-    async fn loopback_delivery_is_duplicate_safe() {
+    async fn v1_push_still_works_unchanged() {
         let source_identity = meshelf_identity::InstallationIdentity::generate();
         let target_identity = meshelf_identity::InstallationIdentity::generate();
         let source = source_identity.device_id;
@@ -2012,5 +2675,426 @@ mod tests {
         ready_rx.recv().expect("listener attached");
         std::net::TcpStream::connect(bound_address).expect("connect to moved listener");
         worker.join().expect("server worker");
+    }
+
+    #[tokio::test]
+    async fn announcement_persists_only_metadata() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let (directory, address, target_identity, shutdown_tx, server, store) =
+            start_offer_server([source_identity.device_id]).await;
+        let announcement = text_announcement(
+            source_identity.device_id,
+            target_identity.device_id,
+            OfferId::new(),
+            "metadata must be bounded",
+        );
+        let ack = send_announcement(
+            address,
+            &source_identity,
+            &target_identity,
+            announcement.clone(),
+        )
+        .await
+        .expect("metadata announcement");
+        assert_eq!(ack.code, OfferAckCode::Stored);
+        let card = store
+            .get_offer_card(source_identity.device_id, announcement.offer_id)
+            .expect("read card")
+            .expect("stored card");
+        assert_eq!(card.descriptor, announcement.descriptor);
+        assert_eq!(card.availability, CardAvailability::Available);
+        assert!(card.last_attempt.is_none());
+        assert!(
+            store
+                .read_offer_sources()
+                .expect("read source table")
+                .is_empty()
+        );
+        stop_offer_server(shutdown_tx, server).await;
+        assert_no_payload_artifacts(directory.path());
+    }
+
+    #[tokio::test]
+    async fn announcement_creates_no_staging_cache_or_payload_file_on_disk() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let (directory, address, target_identity, shutdown_tx, server, _store) =
+            start_offer_server([source_identity.device_id]).await;
+        let announcement = text_announcement(
+            source_identity.device_id,
+            target_identity.device_id,
+            OfferId::new(),
+            "metadata only",
+        );
+        let ack = send_announcement(address, &source_identity, &target_identity, announcement)
+            .await
+            .expect("announce");
+        assert_eq!(ack.code, OfferAckCode::Stored);
+        stop_offer_server(shutdown_tx, server).await;
+        assert_no_payload_artifacts(directory.path());
+    }
+
+    #[tokio::test]
+    async fn third_peer_that_never_activates_receives_zero_payload_bytes() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let source_file = source_directory.path().join("secret.txt");
+        fs::write(&source_file, b"payload remains on the source").expect("write source file");
+        let (receiver_directory, address, target_identity, shutdown_tx, server, store) =
+            start_offer_server([source_identity.device_id]).await;
+        let announcement = OfferAnnouncement::new(
+            OfferId::new(),
+            source_identity.device_id,
+            target_identity.device_id,
+            now_unix_ms(),
+            meshelf_core::OfferDescriptor::File {
+                root_name: "secret.txt".to_owned(),
+                total_bytes: 31,
+            },
+        );
+        let ack = send_announcement(address, &source_identity, &target_identity, announcement)
+            .await
+            .expect("announce file metadata");
+        assert_eq!(ack.code, OfferAckCode::Stored);
+        assert_eq!(store.read_offer_shelf().expect("read shelf").len(), 1);
+        stop_offer_server(shutdown_tx, server).await;
+        assert_no_payload_artifacts(receiver_directory.path());
+        assert_eq!(
+            fs::read(&source_file).expect("source remains"),
+            b"payload remains on the source"
+        );
+    }
+
+    #[tokio::test]
+    async fn announcement_from_unpaired_peer_is_refused_before_storage() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let unpaired_identity = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, target_identity, shutdown_tx, server, store) =
+            start_offer_server([unpaired_identity.device_id]).await;
+        let announcement = text_announcement(
+            source_identity.device_id,
+            target_identity.device_id,
+            OfferId::new(),
+            "must not store",
+        );
+        let error = send_announcement(address, &source_identity, &target_identity, announcement)
+            .await
+            .expect_err("unpaired announcement");
+        assert!(matches!(error, NetError::Rejected(_)));
+        assert!(store.read_offer_shelf().expect("read shelf").is_empty());
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn announcement_with_wrong_target_device_is_refused() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, target_identity, shutdown_tx, server, store) =
+            start_offer_server([source_identity.device_id]).await;
+        let announcement = text_announcement(
+            source_identity.device_id,
+            DeviceId::new(),
+            OfferId::new(),
+            "wrong target",
+        );
+        let ack =
+            send_raw_announcement(address, &source_identity, &target_identity, announcement).await;
+        assert_eq!(ack.code, OfferAckCode::RefusedInvalid);
+        assert_eq!(ack.live_entries, 0);
+        assert_eq!(ack.max_live_entries, V2_MAX_LIVE_ENTRIES);
+        assert!(store.read_offer_shelf().expect("read shelf").is_empty());
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn announcement_with_oversized_preview_is_refused_invalid() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, target_identity, shutdown_tx, server, store) =
+            start_offer_server([source_identity.device_id]).await;
+        let announcement = OfferAnnouncement::new(
+            OfferId::new(),
+            source_identity.device_id,
+            target_identity.device_id,
+            now_unix_ms(),
+            meshelf_core::OfferDescriptor::Text {
+                utf8_bytes: 1,
+                line_count: 1,
+                preview: "x".repeat(meshelf_core::MAX_OFFER_PREVIEW_BYTES + 1),
+            },
+        );
+        let ack =
+            send_raw_announcement(address, &source_identity, &target_identity, announcement).await;
+        assert_eq!(ack.code, OfferAckCode::RefusedInvalid);
+        assert_eq!(ack.live_entries, 0);
+        assert_eq!(ack.max_live_entries, V2_MAX_LIVE_ENTRIES);
+        assert!(store.read_offer_shelf().expect("read shelf").is_empty());
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn identical_reannouncement_returns_duplicate_and_does_not_duplicate_the_card() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, target_identity, shutdown_tx, server, store) =
+            start_offer_server([source_identity.device_id]).await;
+        let announcement = text_announcement(
+            source_identity.device_id,
+            target_identity.device_id,
+            OfferId::new(),
+            "same descriptor",
+        );
+        let first = send_announcement(
+            address,
+            &source_identity,
+            &target_identity,
+            announcement.clone(),
+        )
+        .await
+        .expect("first announcement");
+        let duplicate =
+            send_announcement(address, &source_identity, &target_identity, announcement)
+                .await
+                .expect("duplicate announcement");
+        assert_eq!(first.code, OfferAckCode::Stored);
+        assert_eq!(duplicate.code, OfferAckCode::Duplicate);
+        assert_eq!(duplicate.live_entries, 1);
+        assert_eq!(store.read_offer_shelf().expect("read shelf").len(), 1);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn same_offer_id_with_different_descriptor_returns_conflict() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, target_identity, shutdown_tx, server, store) =
+            start_offer_server([source_identity.device_id]).await;
+        let offer_id = OfferId::new();
+        let first = text_announcement(
+            source_identity.device_id,
+            target_identity.device_id,
+            offer_id,
+            "first",
+        );
+        let second = text_announcement(
+            source_identity.device_id,
+            target_identity.device_id,
+            offer_id,
+            "different",
+        );
+        assert_eq!(
+            send_announcement(address, &source_identity, &target_identity, first)
+                .await
+                .expect("first announcement")
+                .code,
+            OfferAckCode::Stored
+        );
+        let conflict = send_announcement(address, &source_identity, &target_identity, second)
+            .await
+            .expect("conflicting announcement");
+        assert_eq!(conflict.code, OfferAckCode::RefusedConflict);
+        assert_eq!(conflict.live_entries, 1);
+        assert_eq!(store.read_offer_shelf().expect("read shelf").len(), 1);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn eleventh_card_returns_capacity_with_ten_of_ten_counts() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, target_identity, shutdown_tx, server, store) =
+            start_offer_server([source_identity.device_id]).await;
+        for index in 0..V2_MAX_LIVE_ENTRIES {
+            let ack = send_announcement(
+                address,
+                &source_identity,
+                &target_identity,
+                text_announcement(
+                    source_identity.device_id,
+                    target_identity.device_id,
+                    OfferId::new(),
+                    &format!("card {index}"),
+                ),
+            )
+            .await
+            .expect("announcement within capacity");
+            assert_eq!(ack.code, OfferAckCode::Stored);
+        }
+        let eleventh = send_announcement(
+            address,
+            &source_identity,
+            &target_identity,
+            text_announcement(
+                source_identity.device_id,
+                target_identity.device_id,
+                OfferId::new(),
+                "eleventh",
+            ),
+        )
+        .await
+        .expect("capacity acknowledgement");
+        assert_eq!(eleventh.code, OfferAckCode::RefusedCapacity);
+        assert_eq!(eleventh.live_entries, V2_MAX_LIVE_ENTRIES);
+        assert_eq!(eleventh.max_live_entries, V2_MAX_LIVE_ENTRIES);
+        assert_eq!(store.read_offer_shelf().expect("read shelf").len(), 10);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn offline_announcement_is_reported_and_not_retried() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let target_identity = meshelf_identity::InstallationIdentity::generate();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        drop(listener);
+        let started = std::time::Instant::now();
+        let error = send_announcement(
+            address,
+            &source_identity,
+            &target_identity,
+            text_announcement(
+                source_identity.device_id,
+                target_identity.device_id,
+                OfferId::new(),
+                "offline",
+            ),
+        )
+        .await
+        .expect_err("offline peer");
+        assert!(matches!(error, NetError::Unavailable(_) | NetError::Io(_)));
+        assert!(started.elapsed() < TEST_IO_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn one_connection_cannot_announce_twice() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, target_identity, shutdown_tx, server, store) =
+            start_offer_server([source_identity.device_id]).await;
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("connect announcement");
+        stream.set_nodelay(true).expect("nodelay");
+        let hello = ClientHello::signed(
+            source_identity.device_id,
+            "BMST",
+            "single-operation",
+            &source_identity,
+        );
+        io_timeout(
+            TEST_IO_TIMEOUT,
+            write_frame_async(&mut stream, &WireMessage::ClientHello(hello)),
+            "write client hello",
+        )
+        .await
+        .expect("write hello");
+        let _ = io_timeout(
+            TEST_IO_TIMEOUT,
+            read_frame_async(&mut stream),
+            "read server hello",
+        )
+        .await
+        .expect("read hello");
+        let announcement = text_announcement(
+            source_identity.device_id,
+            target_identity.device_id,
+            OfferId::new(),
+            "one operation",
+        );
+        io_timeout(
+            TEST_IO_TIMEOUT,
+            write_v2_frame_async(
+                &mut stream,
+                &V2Message::OfferAnnouncement(announcement.clone()),
+            ),
+            "write first announcement",
+        )
+        .await
+        .expect("write first announcement");
+        let first = io_timeout(
+            TEST_IO_TIMEOUT,
+            read_v2_frame_async(&mut stream),
+            "read first acknowledgement",
+        )
+        .await
+        .expect("read first acknowledgement");
+        assert!(matches!(first, V2Message::OfferAck(_)));
+
+        let second_write = io_timeout(
+            TEST_IO_TIMEOUT,
+            write_v2_frame_async(&mut stream, &V2Message::OfferAnnouncement(announcement)),
+            "write second announcement",
+        )
+        .await;
+        if second_write.is_ok() {
+            let second_read = io_timeout(
+                TEST_IO_TIMEOUT,
+                read_v2_frame_async(&mut stream),
+                "read second acknowledgement",
+            )
+            .await;
+            assert!(
+                second_read.is_err(),
+                "one connection returned two acknowledgements"
+            );
+        }
+        assert_eq!(store.read_offer_shelf().expect("read shelf").len(), 1);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn handler_limit_refuses_excess_connections_without_unbounded_task_growth() {
+        let source_identity = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, _target_identity, shutdown_tx, server, _store) =
+            start_offer_server([source_identity.device_id]).await;
+        let mut held = Vec::new();
+        for index in 0..V2_MAX_INBOUND_HANDLERS {
+            let mut stream = TcpStream::connect(address)
+                .await
+                .expect("connect held handler");
+            stream.set_nodelay(true).expect("nodelay");
+            let hello = ClientHello::signed(
+                source_identity.device_id,
+                "BMST",
+                format!("held-{index}"),
+                &source_identity,
+            );
+            io_timeout(
+                TEST_IO_TIMEOUT,
+                write_frame_async(&mut stream, &WireMessage::ClientHello(hello)),
+                "write held hello",
+            )
+            .await
+            .expect("write held hello");
+            let response = io_timeout(
+                TEST_IO_TIMEOUT,
+                read_frame_async(&mut stream),
+                "read held server hello",
+            )
+            .await
+            .expect("read held server hello");
+            let WireMessage::ServerHello(server_hello) = response else {
+                panic!("expected held server hello");
+            };
+            assert!(server_hello.accepted);
+            held.push(stream);
+        }
+
+        let mut excess = TcpStream::connect(address)
+            .await
+            .expect("connect excess handler");
+        excess.set_nodelay(true).expect("nodelay");
+        let response = io_timeout(
+            TEST_IO_TIMEOUT,
+            read_frame_async(&mut excess),
+            "read capacity refusal",
+        )
+        .await
+        .expect("read capacity refusal");
+        let WireMessage::ServerHello(server_hello) = response else {
+            panic!("expected capacity refusal server hello");
+        };
+        let reason = server_hello.reason.expect("capacity refusal detail");
+        assert!(!server_hello.accepted);
+        assert!(reason.contains("active=16"));
+        assert!(reason.contains("maximum=16"));
+        drop(excess);
+        drop(held);
+        stop_offer_server(shutdown_tx, server).await;
     }
 }

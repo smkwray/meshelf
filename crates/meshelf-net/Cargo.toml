@@ -12,6 +12,7 @@ fs2.workspace = true
 meshelf-identity = { path = "../meshelf-identity" }
 meshelf-core = { path = "../meshelf-core" }
 meshelf-protocol = { path = "../meshelf-protocol" }
+meshelf-store = { path = "../meshelf-store" }
 renamore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,5 +22,4 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-meshelf-store = { path = "../meshelf-store" }
 tempfile.workspace = true
