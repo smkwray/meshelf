@@ -3,6 +3,9 @@
 //! This crate does not contain a permissive production trust policy. `DenyAll` is the safe
 //! default; `ExactDeviceAllowList` exists only for loopback simulation and bounded development.
 
+mod fetch_sender;
+pub use fetch_sender::{OfferFetchHandler, V2FetchSender};
+
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr, TcpListener as StdTcpListener},
@@ -945,6 +948,7 @@ where
             handler,
             incoming_directory: None,
             offer_receiver: None,
+            fetch_sender: None,
             io_timeout_duration,
         },
         shutdown,
@@ -973,6 +977,7 @@ where
             handler,
             incoming_directory: Some(incoming_directory),
             offer_receiver: None,
+            fetch_sender: None,
             io_timeout_duration,
         },
         shutdown,
@@ -1005,6 +1010,43 @@ where
             handler,
             incoming_directory: None,
             offer_receiver: Some(offer_receiver),
+            fetch_sender: None,
+            io_timeout_duration,
+        },
+        shutdown,
+    )
+    .await
+}
+
+/// Serve the existing v1 operations, the additive announcement operation, and the origin half of
+/// the v2 fetch operation. The v2 capability remains intentionally absent from the hello.
+pub struct V2OfferServices {
+    pub announcement_receiver: Arc<dyn V2AnnouncementReceiver>,
+    pub fetch_sender: Arc<dyn V2FetchSender>,
+}
+
+pub async fn serve_with_offers_and_fetch<G, H>(
+    listener: TcpListener,
+    identity: ServerIdentity,
+    gate: Arc<G>,
+    handler: Arc<H>,
+    services: V2OfferServices,
+    io_timeout_duration: Duration,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), NetError>
+where
+    G: TrustGate,
+    H: EnvelopeHandler,
+{
+    serve_inner(
+        listener,
+        ServerContext {
+            identity,
+            gate,
+            handler,
+            incoming_directory: None,
+            offer_receiver: Some(services.announcement_receiver),
+            fetch_sender: Some(services.fetch_sender),
             io_timeout_duration,
         },
         shutdown,
@@ -1018,6 +1060,7 @@ struct ServerContext<G, H> {
     handler: Arc<H>,
     incoming_directory: Option<PathBuf>,
     offer_receiver: Option<Arc<dyn V2AnnouncementReceiver>>,
+    fetch_sender: Option<Arc<dyn V2FetchSender>>,
     io_timeout_duration: Duration,
 }
 
@@ -1029,6 +1072,7 @@ impl<G, H> Clone for ServerContext<G, H> {
             handler: self.handler.clone(),
             incoming_directory: self.incoming_directory.clone(),
             offer_receiver: self.offer_receiver.clone(),
+            fetch_sender: self.fetch_sender.clone(),
             io_timeout_duration: self.io_timeout_duration,
         }
     }
@@ -1218,26 +1262,50 @@ where
     )
     .await?;
     if let Ok(v2_message) = serde_json::from_slice::<V2Message>(&payload) {
-        let V2Message::OfferAnnouncement(announcement) = v2_message else {
-            return Err(NetError::UnexpectedMessage(
-                "unsupported v2 operation; only offer announcements are enabled",
-            ));
-        };
-        let Some(offer_receiver) = context.offer_receiver.as_ref() else {
-            return Err(NetError::UnexpectedMessage(
-                "v2 offer announcements are not configured",
-            ));
-        };
-        let ack = offer_receiver
-            .handle_announcement(hello.device_id, context.identity.device_id(), announcement)
-            .await?;
-        io_timeout(
-            context.io_timeout_duration,
-            write_v2_frame_async(&mut stream, &V2Message::OfferAck(ack)),
-            "write offer acknowledgement",
-        )
-        .await?;
-        return Ok(());
+        match v2_message {
+            V2Message::OfferAnnouncement(announcement) => {
+                let Some(offer_receiver) = context.offer_receiver.as_ref() else {
+                    return Err(NetError::UnexpectedMessage(
+                        "v2 offer announcements are not configured",
+                    ));
+                };
+                let ack = offer_receiver
+                    .handle_announcement(
+                        hello.device_id,
+                        context.identity.device_id(),
+                        announcement,
+                    )
+                    .await?;
+                io_timeout(
+                    context.io_timeout_duration,
+                    write_v2_frame_async(&mut stream, &V2Message::OfferAck(ack)),
+                    "write offer acknowledgement",
+                )
+                .await?;
+                return Ok(());
+            }
+            V2Message::FetchRequest(request) => {
+                let Some(fetch_sender) = context.fetch_sender.as_ref() else {
+                    return Err(NetError::UnexpectedMessage(
+                        "v2 fetch serving is not configured",
+                    ));
+                };
+                fetch_sender
+                    .handle_fetch(
+                        hello.device_id,
+                        request,
+                        &mut stream,
+                        context.io_timeout_duration,
+                    )
+                    .await?;
+                return Ok(());
+            }
+            _ => {
+                return Err(NetError::UnexpectedMessage(
+                    "unsupported v2 operation; announcement and fetch request are enabled",
+                ));
+            }
+        }
     }
     let message = decode_payload(&payload)?;
     let WireMessage::PushEnvelope(envelope) = message else {
@@ -1789,6 +1857,8 @@ pub enum NetError {
     FileTransfer(String),
     #[error("offer card storage failed: {0}")]
     OfferStorage(String),
+    #[error("fetch service failed: {0}")]
+    FetchService(&'static str),
     #[error("inbound handler limit was closed")]
     HandlerLimitClosed,
 }
@@ -1796,17 +1866,21 @@ pub enum NetError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         fs,
         path::{Path, PathBuf},
         sync::{Arc, Barrier, Mutex},
     };
 
     use meshelf_core::{
-        ClipboardError, ClipboardSink, MemoryReceiveStore, ReceiptCode, ReceiveStore,
-        ReceiverService,
+        ClipboardError, ClipboardSink, MemoryReceiveStore, OfferDescriptor, OfferSource,
+        OfferSourceInput, ReceiptCode, ReceiveStore, ReceiverService,
     };
-    use meshelf_protocol::ClientHello;
-    use tokio::io::AsyncWriteExt;
+    use meshelf_protocol::{
+        ClientHello, FetchAbortCode, FetchRefusal, FetchRefusalCode, FetchRequest, ManifestEntry,
+        V2_MAX_MANIFEST_BYTES,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
 
     use super::*;
@@ -1886,6 +1960,290 @@ mod tests {
     ) {
         shutdown_tx.send(true).expect("request shutdown");
         server.await.expect("server task").expect("clean server");
+    }
+
+    async fn start_fetch_server(
+        allowed_devices: impl IntoIterator<Item = DeviceId>,
+    ) -> (
+        tempfile::TempDir,
+        SocketAddr,
+        meshelf_identity::InstallationIdentity,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<(), NetError>>,
+        Arc<RedbV2Store>,
+    ) {
+        let directory = tempfile::tempdir().expect("temporary fetch directory");
+        let store = Arc::new(
+            RedbV2Store::open(directory.path().join("offers.redb")).expect("open offer store"),
+        );
+        let origin_identity = meshelf_identity::InstallationIdentity::generate();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let receiver = Arc::new(ReceiverService::new(
+            origin_identity.device_id,
+            Arc::new(MemoryReceiveStore::new()),
+            Arc::new(TestClipboard::default()),
+        ));
+        let handler = Arc::new(CoreEnvelopeHandler::new(receiver));
+        let offer_receiver: Arc<dyn V2AnnouncementReceiver> =
+            Arc::new(OfferAnnouncementHandler::new(store.clone()));
+        let fetch_sender: Arc<dyn V2FetchSender> = Arc::new(OfferFetchHandler::new(
+            origin_identity.device_id,
+            store.clone(),
+        ));
+        let server = tokio::spawn(serve_with_offers_and_fetch(
+            listener,
+            ServerIdentity {
+                signing_identity: origin_identity.clone(),
+                device_name: "BMST".to_owned(),
+            },
+            Arc::new(ExactDeviceAllowList::new(allowed_devices)),
+            handler,
+            V2OfferServices {
+                announcement_receiver: offer_receiver,
+                fetch_sender,
+            },
+            TEST_IO_TIMEOUT,
+            shutdown_rx,
+        ));
+        (
+            directory,
+            address,
+            origin_identity,
+            shutdown_tx,
+            server,
+            store,
+        )
+    }
+
+    fn insert_text_source(
+        store: &RedbV2Store,
+        requester: DeviceId,
+        offer_id: OfferId,
+        text: &str,
+    ) -> OfferDescriptor {
+        let descriptor = OfferDescriptor::text(text).expect("text descriptor");
+        store
+            .insert_offer_source(OfferSourceInput::new(
+                offer_id,
+                descriptor.clone(),
+                HashSet::from([requester]),
+                OfferSource::Text {
+                    text: text.to_owned(),
+                },
+            ))
+            .expect("insert text source");
+        descriptor
+    }
+
+    fn insert_file_source(
+        store: &RedbV2Store,
+        requester: DeviceId,
+        offer_id: OfferId,
+        path: &Path,
+    ) -> OfferDescriptor {
+        let root_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("file root name")
+            .to_owned();
+        let total_bytes = fs::metadata(path).expect("file metadata").len();
+        let descriptor = OfferDescriptor::File {
+            root_name: root_name.clone(),
+            total_bytes,
+        };
+        let commitment =
+            fetch_sender::metadata_commitment_for_test(path, &descriptor).expect("file commitment");
+        store
+            .insert_offer_source(OfferSourceInput::new(
+                offer_id,
+                descriptor.clone(),
+                HashSet::from([requester]),
+                OfferSource::File {
+                    canonical_path: fs::canonicalize(path).expect("canonical file"),
+                    metadata_commitment: commitment,
+                },
+            ))
+            .expect("insert file source");
+        descriptor
+    }
+
+    fn insert_folder_source(
+        store: &RedbV2Store,
+        requester: DeviceId,
+        offer_id: OfferId,
+        path: &Path,
+    ) -> OfferDescriptor {
+        let root_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("folder root name")
+            .to_owned();
+        let mut total_bytes = 0_u64;
+        let mut entry_count = 0_u32;
+        let mut file_count = 0_u32;
+        let mut directory_count = 0_u32;
+        let mut pending = vec![path.to_owned()];
+        while let Some(directory) = pending.pop() {
+            for child in fs::read_dir(directory).expect("read folder") {
+                let child = child.expect("folder entry");
+                let metadata = child.metadata().expect("folder metadata");
+                entry_count = entry_count.saturating_add(1);
+                if metadata.is_dir() {
+                    directory_count = directory_count.saturating_add(1);
+                    pending.push(child.path());
+                } else {
+                    file_count = file_count.saturating_add(1);
+                    total_bytes = total_bytes.saturating_add(metadata.len());
+                }
+            }
+        }
+        let descriptor = OfferDescriptor::Folder {
+            root_name: root_name.clone(),
+            total_bytes,
+            entry_count,
+            file_count,
+            directory_count,
+        };
+        let commitment = fetch_sender::metadata_commitment_for_test(path, &descriptor)
+            .expect("folder commitment");
+        store
+            .insert_offer_source(OfferSourceInput::new(
+                offer_id,
+                descriptor.clone(),
+                HashSet::from([requester]),
+                OfferSource::Folder {
+                    canonical_path: fs::canonicalize(path).expect("canonical folder"),
+                    metadata_commitment: commitment,
+                },
+            ))
+            .expect("insert folder source");
+        descriptor
+    }
+
+    async fn connect_fetch(
+        address: SocketAddr,
+        requester_identity: &meshelf_identity::InstallationIdentity,
+        origin_identity: &meshelf_identity::InstallationIdentity,
+        request: FetchRequest,
+    ) -> TcpStream {
+        let mut stream = TcpStream::connect(address).await.expect("connect fetch");
+        stream.set_nodelay(true).expect("nodelay");
+        let hello = ClientHello::signed(
+            requester_identity.device_id,
+            "BZOT",
+            DeviceId::new().to_string(),
+            requester_identity,
+        );
+        io_timeout(
+            TEST_IO_TIMEOUT,
+            write_frame_async(&mut stream, &WireMessage::ClientHello(hello)),
+            "write fetch hello",
+        )
+        .await
+        .expect("write fetch hello");
+        let response = io_timeout(
+            TEST_IO_TIMEOUT,
+            read_frame_async(&mut stream),
+            "read fetch server hello",
+        )
+        .await
+        .expect("read fetch server hello");
+        let WireMessage::ServerHello(server_hello) = response else {
+            panic!("expected fetch server hello");
+        };
+        assert!(server_hello.accepted);
+        assert_eq!(server_hello.device_id, origin_identity.device_id);
+        io_timeout(
+            TEST_IO_TIMEOUT,
+            write_v2_frame_async(&mut stream, &V2Message::FetchRequest(request)),
+            "write fetch request",
+        )
+        .await
+        .expect("write fetch request");
+        stream
+    }
+
+    async fn read_fetch_header_and_manifest(
+        stream: &mut TcpStream,
+    ) -> (meshelf_protocol::FetchHeader, Vec<ManifestEntry>, usize) {
+        let response = io_timeout(
+            TEST_IO_TIMEOUT,
+            read_v2_frame_async(stream),
+            "read fetch header",
+        )
+        .await
+        .expect("read fetch header");
+        let V2Message::FetchHeader(header) = response else {
+            panic!("expected fetch header");
+        };
+        let mut entries = Vec::new();
+        let mut chunk_count = 0;
+        while entries.len() < usize::try_from(header.manifest_entries).expect("entry count") {
+            let response = io_timeout(
+                TEST_IO_TIMEOUT,
+                read_v2_frame_async(stream),
+                "read manifest frame",
+            )
+            .await
+            .expect("read manifest frame");
+            match response {
+                V2Message::ManifestChunk(chunk) => {
+                    chunk_count += 1;
+                    entries.extend(chunk.entries);
+                }
+                V2Message::ManifestEnd(end) => {
+                    assert_eq!(end.entry_count, header.manifest_entries);
+                }
+                other => panic!("unexpected manifest response: {other:?}"),
+            }
+        }
+        if header.manifest_entries > 0 {
+            let response = io_timeout(
+                TEST_IO_TIMEOUT,
+                read_v2_frame_async(stream),
+                "read manifest end",
+            )
+            .await
+            .expect("read manifest end");
+            assert!(matches!(response, V2Message::ManifestEnd(_)));
+        }
+        (header, entries, chunk_count)
+    }
+
+    async fn admit_fetch(stream: &mut TcpStream, request_id: meshelf_core::ActivationId) {
+        io_timeout(
+            TEST_IO_TIMEOUT,
+            write_v2_frame_async(
+                stream,
+                &V2Message::FetchAdmission(meshelf_protocol::FetchAdmission {
+                    request_id,
+                    code: meshelf_protocol::FetchAdmissionCode::Accepted,
+                    entries_reserved: 0,
+                    bytes_reserved: 0,
+                    detail: None,
+                }),
+            ),
+            "write fetch admission",
+        )
+        .await
+        .expect("write fetch admission");
+    }
+
+    async fn read_v2_test(stream: &mut TcpStream, operation: &'static str) -> V2Message {
+        io_timeout(TEST_IO_TIMEOUT, read_v2_frame_async(stream), operation)
+            .await
+            .expect("read v2 frame")
+    }
+
+    async fn read_exact_test(stream: &mut TcpStream, bytes: &mut [u8], operation: &'static str) {
+        timeout(TEST_IO_TIMEOUT, stream.read_exact(bytes))
+            .await
+            .expect("read payload timeout")
+            .expect(operation);
     }
 
     fn text_announcement(
@@ -3095,6 +3453,437 @@ mod tests {
         assert!(reason.contains("maximum=16"));
         drop(excess);
         drop(held);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn unannounced_peer_cannot_fetch_known_offer_id() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let other = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let offer_id = OfferId::new();
+        let descriptor = OfferDescriptor::text("known but not announced").expect("descriptor");
+        store
+            .insert_offer_source(OfferSourceInput::new(
+                offer_id,
+                descriptor,
+                HashSet::from([other.device_id]),
+                OfferSource::Text {
+                    text: "known but not announced".to_owned(),
+                },
+            ))
+            .expect("insert source");
+        let mut stream = connect_fetch(
+            address,
+            &requester,
+            &origin,
+            FetchRequest::new(offer_id, origin.device_id, requester.device_id),
+        )
+        .await;
+        let response = read_v2_test(&mut stream, "read refusal").await;
+        let V2Message::FetchRefusal(refusal) = response else {
+            panic!("expected fetch refusal");
+        };
+        assert_eq!(refusal.code, FetchRefusalCode::NotAnnouncedToRequester);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn unpaired_peer_cannot_fetch_even_if_announced() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([]).await;
+        let offer_id = OfferId::new();
+        let descriptor =
+            OfferDescriptor::text("announced to an unpaired peer").expect("descriptor");
+        store
+            .insert_offer_source(OfferSourceInput::new(
+                offer_id,
+                descriptor,
+                HashSet::from([requester.device_id]),
+                OfferSource::Text {
+                    text: "announced to an unpaired peer".to_owned(),
+                },
+            ))
+            .expect("insert source");
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("connect unpaired peer");
+        let hello = ClientHello::signed(
+            requester.device_id,
+            "BZOT",
+            DeviceId::new().to_string(),
+            &requester,
+        );
+        io_timeout(
+            TEST_IO_TIMEOUT,
+            write_frame_async(&mut stream, &WireMessage::ClientHello(hello)),
+            "write unpaired hello",
+        )
+        .await
+        .expect("write hello");
+        let response = io_timeout(
+            TEST_IO_TIMEOUT,
+            read_frame_async(&mut stream),
+            "read unpaired hello",
+        )
+        .await
+        .expect("read hello");
+        let WireMessage::ServerHello(server_hello) = response else {
+            panic!("expected server hello");
+        };
+        assert!(!server_hello.accepted);
+        assert!(
+            store
+                .get_offer_source(offer_id)
+                .expect("read source")
+                .is_some()
+        );
+        assert_eq!(origin.device_id, server_hello.device_id);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn wrong_source_device_in_request_is_refused() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let offer_id = OfferId::new();
+        insert_text_source(&store, requester.device_id, offer_id, "wrong source");
+        let mut stream = connect_fetch(
+            address,
+            &requester,
+            &origin,
+            FetchRequest::new(offer_id, DeviceId::new(), requester.device_id),
+        )
+        .await;
+        let V2Message::FetchRefusal(refusal) = read_v2_test(&mut stream, "read refusal").await
+        else {
+            panic!("expected refusal");
+        };
+        assert_eq!(refusal.code, FetchRefusalCode::Malformed);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_offer_id_is_refused_without_touching_the_source() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let unknown = OfferId::new();
+        let mut stream = connect_fetch(
+            address,
+            &requester,
+            &origin,
+            FetchRequest::new(unknown, origin.device_id, requester.device_id),
+        )
+        .await;
+        let V2Message::FetchRefusal(refusal) = read_v2_test(&mut stream, "read refusal").await
+        else {
+            panic!("expected refusal");
+        };
+        assert_eq!(refusal.code, FetchRefusalCode::UnknownOffer);
+        assert!(store.read_offer_sources().expect("read sources").is_empty());
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn text_fetch_serves_the_stored_body_exactly() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let body = "stored text\nwith unicode: β🙂";
+        let offer_id = OfferId::new();
+        insert_text_source(&store, requester.device_id, offer_id, body);
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let request_id = request.request_id;
+        let mut stream = connect_fetch(address, &requester, &origin, request).await;
+        let (header, entries, chunks) = read_fetch_header_and_manifest(&mut stream).await;
+        assert_eq!(header.manifest_entries, 0);
+        assert_eq!(entries.len(), 0);
+        assert_eq!(chunks, 0);
+        assert_eq!(
+            header.text_sha256,
+            Some(Sha256::digest(body.as_bytes()).to_vec())
+        );
+        admit_fetch(&mut stream, request_id).await;
+        let mut received = vec![0_u8; body.len()];
+        read_exact_test(&mut stream, &mut received, "read text body").await;
+        assert_eq!(received, body.as_bytes());
+        assert!(matches!(
+            read_v2_test(&mut stream, "read text end").await,
+            V2Message::TextEnd(_)
+        ));
+        assert!(matches!(
+            read_v2_test(&mut stream, "read fetch complete").await,
+            V2Message::FetchComplete(_)
+        ));
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn text_fetch_cannot_return_source_changed() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let offer_id = OfferId::new();
+        let body = "text is durable";
+        insert_text_source(&store, requester.device_id, offer_id, body);
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let request_id = request.request_id;
+        let mut stream = connect_fetch(address, &requester, &origin, request).await;
+        let (header, _, _) = read_fetch_header_and_manifest(&mut stream).await;
+        admit_fetch(&mut stream, request_id).await;
+        let mut received = vec![0_u8; body.len()];
+        read_exact_test(&mut stream, &mut received, "read text body").await;
+        assert_eq!(received, body.as_bytes());
+        assert_eq!(header.manifest_entries, 0);
+        let response = read_v2_test(&mut stream, "read text end").await;
+        assert!(!matches!(
+            response,
+            V2Message::FetchRefusal(FetchRefusal {
+                code: FetchRefusalCode::SourceChanged,
+                ..
+            })
+        ));
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn deleted_file_source_returns_source_unavailable_and_sends_no_payload() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path = source_directory.path().join("deleted.txt");
+        fs::write(&path, b"body").expect("write source");
+        let offer_id = OfferId::new();
+        insert_file_source(&store, requester.device_id, offer_id, &path);
+        fs::remove_file(&path).expect("delete source");
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let mut stream = connect_fetch(address, &requester, &origin, request).await;
+        let V2Message::FetchRefusal(refusal) = read_v2_test(&mut stream, "read refusal").await
+        else {
+            panic!("expected source refusal");
+        };
+        assert_eq!(refusal.code, FetchRefusalCode::SourceUnavailable);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn modified_file_source_returns_source_changed_and_sends_no_payload() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path = source_directory.path().join("modified.txt");
+        fs::write(&path, b"body").expect("write source");
+        let offer_id = OfferId::new();
+        insert_file_source(&store, requester.device_id, offer_id, &path);
+        fs::write(&path, b"changed body").expect("modify source");
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let mut stream = connect_fetch(address, &requester, &origin, request).await;
+        let V2Message::FetchRefusal(refusal) = read_v2_test(&mut stream, "read refusal").await
+        else {
+            panic!("expected source refusal");
+        };
+        assert_eq!(refusal.code, FetchRefusalCode::SourceChanged);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn folder_manifest_is_chunked_within_the_control_frame() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let root = source_directory.path().join("many-files");
+        fs::create_dir(&root).expect("create root");
+        for index in 0..1500 {
+            fs::write(root.join(format!("file-{index:04}.txt")), []).expect("write file");
+        }
+        let offer_id = OfferId::new();
+        insert_folder_source(&store, requester.device_id, offer_id, &root);
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let mut stream = connect_fetch(address, &requester, &origin, request).await;
+        let (header, entries, chunk_count) = read_fetch_header_and_manifest(&mut stream).await;
+        assert_eq!(header.manifest_entries, 1500);
+        assert_eq!(entries.len(), 1500);
+        assert!(chunk_count > 1);
+        assert!(header.manifest_encoded_bytes <= V2_MAX_MANIFEST_BYTES as u64);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn manifest_contains_no_sender_absolute_path() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let root = source_directory.path().join("folder");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("item.txt"), b"body").expect("write file");
+        let offer_id = OfferId::new();
+        insert_folder_source(&store, requester.device_id, offer_id, &root);
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let mut stream = connect_fetch(address, &requester, &origin, request).await;
+        let (_, entries, _) = read_fetch_header_and_manifest(&mut stream).await;
+        let encoded = serde_json::to_string(&entries).expect("encode manifest");
+        assert!(!encoded.contains(source_directory.path().to_str().expect("temp path")));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !Path::new(&entry.relative_path).is_absolute())
+        );
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn two_peers_can_fetch_the_same_offer_concurrently() {
+        let first = meshelf_identity::InstallationIdentity::generate();
+        let second = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([first.device_id, second.device_id]).await;
+        let offer_id = OfferId::new();
+        let body = "same offer twice";
+        store
+            .insert_offer_source(OfferSourceInput::new(
+                offer_id,
+                OfferDescriptor::text(body).expect("descriptor"),
+                HashSet::from([first.device_id, second.device_id]),
+                OfferSource::Text {
+                    text: body.to_owned(),
+                },
+            ))
+            .expect("insert source");
+        let request_one = FetchRequest::new(offer_id, origin.device_id, first.device_id);
+        let request_two = FetchRequest::new(offer_id, origin.device_id, second.device_id);
+        let request_one_id = request_one.request_id;
+        let request_two_id = request_two.request_id;
+        let mut stream_one = connect_fetch(address, &first, &origin, request_one).await;
+        let mut stream_two = connect_fetch(address, &second, &origin, request_two).await;
+        let (_, _, _) = read_fetch_header_and_manifest(&mut stream_one).await;
+        let (_, _, _) = read_fetch_header_and_manifest(&mut stream_two).await;
+        admit_fetch(&mut stream_one, request_one_id).await;
+        admit_fetch(&mut stream_two, request_two_id).await;
+        let mut one = vec![0_u8; body.len()];
+        let mut two = vec![0_u8; body.len()];
+        read_exact_test(&mut stream_one, &mut one, "read first body").await;
+        read_exact_test(&mut stream_two, &mut two, "read second body").await;
+        assert_eq!(one, body.as_bytes());
+        assert_eq!(two, body.as_bytes());
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn third_concurrent_fetch_is_refused_busy_with_two_of_two_and_no_queue() {
+        let first = meshelf_identity::InstallationIdentity::generate();
+        let second = meshelf_identity::InstallationIdentity::generate();
+        let third = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([first.device_id, second.device_id, third.device_id]).await;
+        let offer_id = OfferId::new();
+        let body = "held until admission";
+        store
+            .insert_offer_source(OfferSourceInput::new(
+                offer_id,
+                OfferDescriptor::text(body).expect("descriptor"),
+                HashSet::from([first.device_id, second.device_id, third.device_id]),
+                OfferSource::Text {
+                    text: body.to_owned(),
+                },
+            ))
+            .expect("insert source");
+        let request_one = FetchRequest::new(offer_id, origin.device_id, first.device_id);
+        let request_two = FetchRequest::new(offer_id, origin.device_id, second.device_id);
+        let mut one = connect_fetch(address, &first, &origin, request_one).await;
+        let mut two = connect_fetch(address, &second, &origin, request_two).await;
+        let _ = read_fetch_header_and_manifest(&mut one).await;
+        let _ = read_fetch_header_and_manifest(&mut two).await;
+        let request_three = FetchRequest::new(offer_id, origin.device_id, third.device_id);
+        let mut three = connect_fetch(address, &third, &origin, request_three).await;
+        let V2Message::FetchRefusal(refusal) = read_v2_test(&mut three, "read busy refusal").await
+        else {
+            panic!("expected busy refusal");
+        };
+        assert_eq!(refusal.code, FetchRefusalCode::Busy);
+        assert_eq!((refusal.active_streams, refusal.max_active_streams), (2, 2));
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn successful_fetch_does_not_consume_the_offer() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let offer_id = OfferId::new();
+        let body = "still available";
+        insert_text_source(&store, requester.device_id, offer_id, body);
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let request_id = request.request_id;
+        let mut stream = connect_fetch(address, &requester, &origin, request).await;
+        let _ = read_fetch_header_and_manifest(&mut stream).await;
+        admit_fetch(&mut stream, request_id).await;
+        let mut received = vec![0_u8; body.len()];
+        read_exact_test(&mut stream, &mut received, "read body").await;
+        assert!(
+            store
+                .get_offer_source(offer_id)
+                .expect("read source")
+                .is_some()
+        );
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn source_change_mid_transfer_aborts_and_sends_no_further_bytes() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let root = source_directory.path().join("changing-folder");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("one.txt"), b"one").expect("write first file");
+        fs::write(root.join("two.txt"), b"two").expect("write second file");
+        let offer_id = OfferId::new();
+        insert_folder_source(&store, requester.device_id, offer_id, &root);
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let request_id = request.request_id;
+        let mut stream = connect_fetch(address, &requester, &origin, request).await;
+        let _ = read_fetch_header_and_manifest(&mut stream).await;
+        fs::write(root.join("two.txt"), b"changed after manifest").expect("change source");
+        admit_fetch(&mut stream, request_id).await;
+        let response = read_v2_test(&mut stream, "read abort").await;
+        let V2Message::FetchAbort(abort) = response else {
+            panic!("expected fetch abort");
+        };
+        assert_eq!(abort.code, FetchAbortCode::SourceChanged);
+        assert_eq!(abort.files_sent, 0);
+        assert_eq!(abort.bytes_sent, 0);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn refusal_never_contains_an_absolute_source_path() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path = source_directory.path().join("private.txt");
+        fs::write(&path, b"body").expect("write source");
+        let offer_id = OfferId::new();
+        insert_file_source(&store, requester.device_id, offer_id, &path);
+        fs::write(&path, b"changed").expect("change source");
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let mut stream = connect_fetch(address, &requester, &origin, request).await;
+        let response = read_v2_test(&mut stream, "read refusal").await;
+        let V2Message::FetchRefusal(refusal) = response else {
+            panic!("expected refusal");
+        };
+        let encoded = serde_json::to_string(&refusal).expect("encode refusal");
+        assert!(!encoded.contains(source_directory.path().to_str().expect("temp path")));
+        assert!(refusal.detail.is_none());
         stop_offer_server(shutdown_tx, server).await;
     }
 }

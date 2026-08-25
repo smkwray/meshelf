@@ -11,6 +11,7 @@ async-trait.workspace = true
 fs2.workspace = true
 meshelf-identity = { path = "../meshelf-identity" }
 meshelf-core = { path = "../meshelf-core" }
+meshelf-platform = { path = "../meshelf-platform" }
 meshelf-protocol = { path = "../meshelf-protocol" }
 meshelf-store = { path = "../meshelf-store" }
 renamore.workspace = true

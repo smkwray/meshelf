@@ -249,6 +249,7 @@ fn hash_metadata(
     hasher.update([0]);
     hasher.update(relative_name.as_bytes());
     hasher.update([0]);
+    hash_metadata_identity(hasher, metadata);
     hasher.update(metadata.len().to_le_bytes());
     hasher.update([u8::from(metadata.is_file()), u8::from(metadata.is_dir())]);
     hasher.update([u8::from(metadata.permissions().readonly())]);
@@ -260,6 +261,14 @@ fn hash_metadata(
     hasher.update(modified.as_secs().to_le_bytes());
     hasher.update(modified.subsec_nanos().to_le_bytes());
     Ok(())
+}
+
+/// Include a stable object identity where the host exposes one. Unix uses the
+/// device/inode pair; Windows uses the volume serial and file index. The
+/// fallback still binds the metadata commitment to the portable fields below,
+/// but does not invent a Unix-only identity for another platform.
+fn hash_metadata_identity(hasher: &mut Sha256, metadata: &Metadata) {
+    hasher.update(meshelf_platform::source_identity_bytes(metadata));
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ pub use activation::{
 pub use clipboard::{ClipboardItem, ClipboardSource, ClipboardWorker, PlatformClipboardError};
 pub use filesystem::{
     FilesystemKey, apply_owner_only_permissions, available_space, filesystem_key, preallocate,
-    sync_directory, total_space,
+    source_identity_bytes, sync_directory, total_space,
 };
 
 pub trait Notifier: Send + Sync + 'static {

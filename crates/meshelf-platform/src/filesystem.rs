@@ -43,6 +43,47 @@ pub fn filesystem_key(path: &Path) -> io::Result<FilesystemKey> {
     }
 }
 
+/// Bytes committing to a source object's identity and change state, for detecting that a file
+/// changed between being offered and being fetched.
+///
+/// Unix contributes the device/inode pair, which detects replacement even when every other
+/// attribute is identical. Windows deliberately does not: `volume_serial_number` and `file_index`
+/// are behind the unstable `windows_by_handle` feature and cannot be used on a stable toolchain, so
+/// Windows commits to attributes, creation time, last write time and size instead. That is weaker —
+/// a replacement preserving all four would go undetected there — and it is why transferred bytes are
+/// still hashed end to end rather than trusting this commitment alone.
+///
+/// This lives here because `meshelf-net` and `meshelf-control` must stay portable under product
+/// invariant 14, and because two copies of a commitment that both sides must compute identically
+/// would break revalidation the moment they drifted.
+pub fn source_identity_bytes(metadata: &std::fs::Metadata) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        bytes.extend_from_slice(b"unix");
+        bytes.extend_from_slice(&metadata.dev().to_le_bytes());
+        bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        bytes.extend_from_slice(b"windows");
+        bytes.extend_from_slice(&metadata.file_attributes().to_le_bytes());
+        bytes.extend_from_slice(&metadata.creation_time().to_le_bytes());
+        bytes.extend_from_slice(&metadata.last_write_time().to_le_bytes());
+        bytes.extend_from_slice(&metadata.file_size().to_le_bytes());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        bytes.extend_from_slice(b"portable");
+    }
+    bytes
+}
+
 /// Return bytes available to the current user on the filesystem containing `path`.
 pub fn available_space(path: &Path) -> io::Result<u64> {
     fs2::available_space(path).map_err(|error| path_error("read available space for", path, error))
