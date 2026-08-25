@@ -86,6 +86,7 @@ export component MainWindow inherits Window {
     in property <string> shelf-shortcut-help: "click or Ctrl+1–5 to copy";
     in property <[ShelfRow]> shelf-items: [];
     in-out property <string> status-text: "Open meshelf, then paste once to send";
+    in property <string> reachable-names: "Reachability not checked yet";
 
     callback paste-and-send();
     callback copy-item(string, bool);
@@ -170,6 +171,12 @@ export component MainWindow inherits Window {
                 font-size: 10px;
                 overflow: elide;
                 vertical-alignment: center;
+            }
+            Tooltip {
+                Text {
+                    text: root.reachable-names;
+                    color: #eef1f4;
+                }
             }
         }
 

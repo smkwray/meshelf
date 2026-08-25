@@ -11,10 +11,14 @@ pub use coordinator::{Coordinator, OfferPlan, PeerAnnouncement};
 pub use offer_source::{OfferInput, PreparedOfferSource, SourcePreparationError};
 
 use std::{
+    collections::HashMap,
     fs,
+    future::Future,
     io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,6 +37,19 @@ use sha2::{Digest, Sha256};
 use tokio::{runtime::Builder, task::JoinSet};
 
 pub const MESHELF_PORT: u16 = 45_832;
+
+type ProbeFuture = Pin<Box<dyn Future<Output = Result<ServerHello, ()>> + Send>>;
+
+trait PeerProbe: Send + Sync + 'static {
+    fn probe(&self, address: SocketAddr) -> ProbeFuture;
+}
+
+impl PeerProbe for PeerClient {
+    fn probe(&self, address: SocketAddr) -> ProbeFuture {
+        let client = self.clone();
+        Box::pin(async move { client.probe(address).await.map_err(|_| ()) })
+    }
+}
 
 fn operation_runtime(label: &str) -> Result<tokio::runtime::Runtime, String> {
     Builder::new_current_thread()
@@ -53,6 +70,7 @@ pub struct PeerView {
     pub online: bool,
     pub approval_available: bool,
     pub status: String,
+    pub reachable_names: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,8 +126,10 @@ pub struct Controller {
     pub identity: InstallationIdentity,
     pub installation: InstallationState,
     pub device_name: String,
-    discovery: Option<CliPeerDiscovery>,
+    discovery: Option<Arc<dyn PeerDiscovery>>,
+    probe: Arc<dyn PeerProbe>,
     pub last_status: Option<TailStatus>,
+    pub reachable_peers: HashMap<DeviceId, String>,
     pub pending: Option<PendingPeer>,
     pub selected_device: Option<DeviceId>,
 }
@@ -126,14 +146,22 @@ impl Controller {
             identity,
             installation,
             device_name,
-            discovery: CliPeerDiscovery::discover().ok(),
+            discovery: CliPeerDiscovery::discover()
+                .ok()
+                .map(|discovery| Arc::new(discovery) as Arc<dyn PeerDiscovery>),
+            probe: Arc::new(PeerClient::with_timeouts(
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            )),
             last_status: None,
+            reachable_peers: HashMap::new(),
             pending: None,
             selected_device: None,
         })
     }
 
     pub fn refresh(&mut self) -> Result<PeerView, String> {
+        self.reachable_peers.clear();
         let discovery = self
             .discovery
             .as_ref()
@@ -143,20 +171,19 @@ impl Controller {
             .map_err(|error| format!("Tailscale discovery failed: {error}"))?;
         self.device_name.clone_from(&status.self_node.hostname);
         self.merge_refreshed_status(&status)?;
-        self.last_status = Some(status.clone());
         self.pending = None;
         self.selected_device = None;
 
         let runtime = operation_runtime("probe")?;
-        let client = PeerClient::with_timeouts(Duration::from_secs(1), Duration::from_secs(2));
+        let probe = self.probe.clone();
         let candidates = runtime.block_on(async {
             let mut tasks = JoinSet::new();
             for node in status.online_peers().cloned() {
                 for address in node.addresses.iter().copied() {
-                    let client = client.clone();
+                    let probe = probe.clone();
                     let node = node.clone();
                     tasks.spawn(async move {
-                        client
+                        probe
                             .probe(SocketAddr::new(address, MESHELF_PORT))
                             .await
                             .ok()
@@ -172,9 +199,22 @@ impl Controller {
             }
             candidates
         });
+        let paired_device_ids = self
+            .installation
+            .peers
+            .peers()
+            .iter()
+            .map(|peer| peer.device_id)
+            .collect::<std::collections::HashSet<_>>();
+        self.reachable_peers = candidates
+            .iter()
+            .filter(|(_, server)| paired_device_ids.contains(&server.device_id))
+            .map(|(node, server)| (server.device_id, node.hostname.clone()))
+            .collect();
         for (node, server) in candidates {
             self.accept_discovered(node, server)?;
         }
+        self.last_status = Some(status);
         Ok(self.view())
     }
 
@@ -331,6 +371,8 @@ impl Controller {
     }
 
     fn send_text_to_mesh(&self, text: &str) -> Result<MeshSendReport, String> {
+        // Deliberate: sends attempt every paired peer; status reports only peers that answered the
+        // latest reachability probe.
         let peers = self.installation.peers.peers().to_vec();
         if peers.is_empty() {
             return Err(
@@ -496,28 +538,53 @@ impl Controller {
 
     #[must_use]
     pub fn view(&self) -> PeerView {
-        let paired_count = self.installation.peers.peers().len();
-        if let Some(device_id) = self.selected_device
-            && let Some(peer) = self.installation.peers.by_device_id(device_id)
-        {
-            return PeerView {
-                name: peer.hostname.clone(),
-                online: true,
-                approval_available: false,
-                status: if paired_count == 1 {
-                    format!("{} ready · paste text or copied files", peer.hostname)
-                } else {
-                    format!("{paired_count} devices ready · paste text or copied files")
-                },
-            };
-        }
+        let reachable_names = self.reachable_paired_names();
+        let reachable_count = reachable_names.len();
+        let reachability_checked = self.last_status.is_some();
+        let status = if !reachability_checked {
+            "Reachability not checked yet · refresh to find meshelf devices".to_owned()
+        } else if reachable_count == 0 && self.installation.peers.peers().is_empty() {
+            "No paired meshelf devices · refresh to discover devices".to_owned()
+        } else if reachable_count == 0 {
+            "No paired meshelf devices are reachable · refresh to retry".to_owned()
+        } else if reachable_count == 1 {
+            "1 device reachable · paste text or copied files".to_owned()
+        } else {
+            format!("{reachable_count} devices reachable · paste text or copied files")
+        };
+        let selected_name = self
+            .selected_device
+            .and_then(|device_id| self.reachable_peers.get(&device_id))
+            .cloned()
+            .or_else(|| reachable_names.first().cloned());
+        let reachable_names = if reachable_names.is_empty() {
+            if reachability_checked {
+                "No meshelf devices are reachable".to_owned()
+            } else {
+                "Reachability not checked yet".to_owned()
+            }
+        } else {
+            reachable_names.join("\n")
+        };
         PeerView {
-            name: "Not configured".to_owned(),
-            online: false,
+            name: selected_name.unwrap_or_else(|| "Not configured".to_owned()),
+            online: reachable_count > 0,
             approval_available: false,
-            status: "Keep meshelf open on another Tailscale device to pair automatically"
-                .to_owned(),
+            status,
+            reachable_names,
         }
+    }
+
+    fn reachable_paired_names(&self) -> Vec<String> {
+        let mut names = self
+            .installation
+            .peers
+            .peers()
+            .iter()
+            .filter_map(|peer| self.reachable_peers.get(&peer.device_id).cloned())
+            .collect::<Vec<_>>();
+        names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+        names
     }
 }
 
@@ -732,11 +799,40 @@ pub fn state_path(config_dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        collections::HashMap,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Arc,
+    };
 
     use tempfile::tempdir;
 
+    use meshelf_tailscale::DiscoveryError;
+
     use super::*;
+
+    #[derive(Debug, Clone)]
+    struct FakeDiscovery {
+        status: TailStatus,
+    }
+
+    impl PeerDiscovery for FakeDiscovery {
+        fn refresh(&self) -> Result<TailStatus, DiscoveryError> {
+            Ok(self.status.clone())
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FakeProbe {
+        answers: HashMap<SocketAddr, ServerHello>,
+    }
+
+    impl PeerProbe for FakeProbe {
+        fn probe(&self, address: SocketAddr) -> ProbeFuture {
+            let answer = self.answers.get(&address).cloned();
+            Box::pin(async move { answer.ok_or(()) })
+        }
+    }
 
     #[test]
     fn classifies_text_and_future_file_items() {
@@ -797,7 +893,9 @@ mod tests {
             installation,
             device_name: "BMST".to_owned(),
             discovery: None,
+            probe: Arc::new(FakeProbe::default()),
             last_status: None,
+            reachable_peers: HashMap::new(),
             pending: None,
             selected_device: None,
         };
@@ -853,7 +951,9 @@ mod tests {
             installation: initial.clone(),
             device_name: "BMST".to_owned(),
             discovery: None,
+            probe: Arc::new(FakeProbe::default()),
             last_status: None,
+            reachable_peers: HashMap::new(),
             pending: None,
             selected_device: None,
         };
@@ -905,6 +1005,339 @@ mod tests {
                 .expect("external peer reloaded")
                 .hostname,
             "BZOT"
+        );
+    }
+
+    fn test_controller() -> (tempfile::TempDir, Controller) {
+        let directory = tempdir().expect("temporary directory");
+        let identity = InstallationIdentity::generate();
+        let installation = InstallationState {
+            device_id: identity.device_id,
+            peers: Default::default(),
+            settings: Default::default(),
+        };
+        let controller = Controller {
+            state_path: directory.path().join("state.json"),
+            identity,
+            installation,
+            device_name: "BMST".to_owned(),
+            discovery: None,
+            probe: Arc::new(FakeProbe::default()),
+            last_status: None,
+            reachable_peers: HashMap::new(),
+            pending: None,
+            selected_device: None,
+        };
+        (directory, controller)
+    }
+
+    fn pair_test_peer(controller: &mut Controller, hostname: &str) -> DeviceId {
+        let identity = InstallationIdentity::generate();
+        let node_id = format!("node-{hostname}");
+        pair_test_peer_with_identity(controller, hostname, &node_id, None, &identity)
+    }
+
+    fn pair_test_peer_with_identity(
+        controller: &mut Controller,
+        hostname: &str,
+        node_id: &str,
+        address: Option<IpAddr>,
+        identity: &InstallationIdentity,
+    ) -> DeviceId {
+        let device_id = identity.device_id;
+        controller
+            .installation
+            .peers
+            .accept_signed(
+                &TailNode {
+                    node_id: Some(node_id.to_owned()),
+                    hostname: hostname.to_owned(),
+                    dns_name: None,
+                    addresses: address.into_iter().collect(),
+                    online: true,
+                    active: true,
+                },
+                device_id,
+                identity.public_key().to_vec(),
+            )
+            .expect("pair test peer");
+        device_id
+    }
+
+    fn test_tail_node(node_id: &str, hostname: &str, address: IpAddr) -> TailNode {
+        TailNode {
+            node_id: Some(node_id.to_owned()),
+            hostname: hostname.to_owned(),
+            dns_name: None,
+            addresses: vec![address],
+            online: true,
+            active: true,
+        }
+    }
+
+    fn test_tail_status(peers: Vec<TailNode>) -> TailStatus {
+        TailStatus {
+            backend_state: "Running".to_owned(),
+            self_node: TailNode {
+                node_id: Some("node-bmst".to_owned()),
+                hostname: "BMST".to_owned(),
+                dns_name: None,
+                addresses: Vec::new(),
+                online: true,
+                active: true,
+            },
+            peers,
+        }
+    }
+
+    fn signed_probe_answer(identity: &InstallationIdentity, hostname: &str) -> ServerHello {
+        ServerHello::signed(
+            meshelf_core::PROTOCOL_VERSION,
+            identity.device_id,
+            hostname.to_owned(),
+            false,
+            None,
+            vec![CAP_TEXT_SHELF_V1.to_owned()],
+            identity,
+        )
+    }
+
+    fn configure_fake_refresh(
+        controller: &mut Controller,
+        status: TailStatus,
+        answers: HashMap<SocketAddr, ServerHello>,
+    ) {
+        controller
+            .installation
+            .save(&controller.state_path)
+            .expect("save test state");
+        controller.discovery = Some(Arc::new(FakeDiscovery { status }));
+        controller.probe = Arc::new(FakeProbe { answers });
+    }
+
+    fn mark_refresh_complete(controller: &mut Controller) {
+        controller.last_status = Some(TailStatus {
+            backend_state: "Running".to_owned(),
+            self_node: TailNode {
+                node_id: Some("node-bmst".to_owned()),
+                hostname: "BMST".to_owned(),
+                dns_name: None,
+                addresses: Vec::new(),
+                online: true,
+                active: true,
+            },
+            peers: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn status_counts_only_reachable_peers_not_paired_ones() {
+        let (_directory, mut controller) = test_controller();
+        let reachable = pair_test_peer(&mut controller, "BZOT");
+        pair_test_peer(&mut controller, "BMBA");
+        controller
+            .reachable_peers
+            .insert(reachable, "BZOT".to_owned());
+        controller.selected_device = Some(reachable);
+        mark_refresh_complete(&mut controller);
+
+        let view = controller.view();
+
+        assert_eq!(
+            view.status,
+            "1 device reachable · paste text or copied files"
+        );
+        assert_eq!(view.reachable_names, "BZOT");
+    }
+
+    #[test]
+    fn status_before_first_refresh_does_not_claim_readiness() {
+        let (_directory, mut controller) = test_controller();
+        pair_test_peer(&mut controller, "BZOT");
+
+        let view = controller.view();
+
+        assert_eq!(
+            view.status,
+            "Reachability not checked yet · refresh to find meshelf devices"
+        );
+        assert_eq!(view.reachable_names, "Reachability not checked yet");
+        assert!(!view.status.contains("ready"));
+    }
+
+    #[test]
+    fn status_with_paired_but_unreachable_peers_says_none_are_reachable() {
+        let (_directory, mut controller) = test_controller();
+        pair_test_peer(&mut controller, "BMBA");
+        mark_refresh_complete(&mut controller);
+
+        let view = controller.view();
+
+        assert_eq!(
+            view.status,
+            "No paired meshelf devices are reachable · refresh to retry"
+        );
+        assert_eq!(view.reachable_names, "No meshelf devices are reachable");
+    }
+
+    #[test]
+    fn status_singular_and_plural_and_zero_all_read_correctly() {
+        let (_zero_directory, zero) = test_controller();
+        let mut zero = zero;
+        mark_refresh_complete(&mut zero);
+        assert_eq!(
+            zero.view().status,
+            "No paired meshelf devices · refresh to discover devices"
+        );
+
+        let (_one_directory, mut one) = test_controller();
+        let one_id = pair_test_peer(&mut one, "BZOT");
+        one.reachable_peers.insert(one_id, "BZOT".to_owned());
+        mark_refresh_complete(&mut one);
+        assert_eq!(
+            one.view().status,
+            "1 device reachable · paste text or copied files"
+        );
+
+        let (_many_directory, mut many) = test_controller();
+        let first = pair_test_peer(&mut many, "BMBA");
+        let second = pair_test_peer(&mut many, "BZOT");
+        many.reachable_peers.insert(first, "BMBA".to_owned());
+        many.reachable_peers.insert(second, "BZOT".to_owned());
+        mark_refresh_complete(&mut many);
+        assert_eq!(
+            many.view().status,
+            "2 devices reachable · paste text or copied files"
+        );
+    }
+
+    #[test]
+    fn reachable_list_names_only_peers_that_answered_the_probe() {
+        let (_directory, mut controller) = test_controller();
+        let bmba = pair_test_peer(&mut controller, "BMBA");
+        let bzot = pair_test_peer(&mut controller, "BZOT");
+        pair_test_peer(&mut controller, "BZDROPPED");
+        controller.reachable_peers.insert(bmba, "BMBA".to_owned());
+        controller.reachable_peers.insert(bzot, "BZOT".to_owned());
+        mark_refresh_complete(&mut controller);
+
+        let view = controller.view();
+
+        assert_eq!(view.reachable_names, "BMBA\nBZOT");
+        assert!(!view.reachable_names.contains("BZDROPPED"));
+    }
+
+    #[test]
+    fn refresh_inserts_only_peers_that_answered_the_probe() {
+        let (_directory, mut controller) = test_controller();
+        let bzot_identity = InstallationIdentity::generate();
+        let bmba_identity = InstallationIdentity::generate();
+        let bzot_address = IpAddr::V4(Ipv4Addr::new(100, 90, 118, 120));
+        let bmba_address = IpAddr::V4(Ipv4Addr::new(100, 90, 118, 121));
+        let bzot = pair_test_peer_with_identity(
+            &mut controller,
+            "BZOT",
+            "node-bzot",
+            Some(bzot_address),
+            &bzot_identity,
+        );
+        let bmba = pair_test_peer_with_identity(
+            &mut controller,
+            "BMBA",
+            "node-bmba",
+            Some(bmba_address),
+            &bmba_identity,
+        );
+        configure_fake_refresh(
+            &mut controller,
+            test_tail_status(vec![
+                test_tail_node("node-bzot", "BZOT", bzot_address),
+                test_tail_node("node-bmba", "BMBA", bmba_address),
+            ]),
+            HashMap::from([(
+                SocketAddr::new(bzot_address, MESHELF_PORT),
+                signed_probe_answer(&bzot_identity, "BZOT"),
+            )]),
+        );
+
+        controller.refresh().expect("fake refresh");
+
+        assert_eq!(controller.reachable_peers.len(), 1);
+        assert_eq!(
+            controller.reachable_peers.get(&bzot),
+            Some(&"BZOT".to_owned())
+        );
+        assert!(!controller.reachable_peers.contains_key(&bmba));
+    }
+
+    #[test]
+    fn refresh_clears_the_previous_reachable_set_before_repopulating() {
+        let (_directory, mut controller) = test_controller();
+        let bzot_identity = InstallationIdentity::generate();
+        let bmba_identity = InstallationIdentity::generate();
+        let bzot_address = IpAddr::V4(Ipv4Addr::new(100, 90, 118, 122));
+        let bmba_address = IpAddr::V4(Ipv4Addr::new(100, 90, 118, 123));
+        let bzot = pair_test_peer_with_identity(
+            &mut controller,
+            "BZOT",
+            "node-bzot",
+            Some(bzot_address),
+            &bzot_identity,
+        );
+        let bmba = pair_test_peer_with_identity(
+            &mut controller,
+            "BMBA",
+            "node-bmba",
+            Some(bmba_address),
+            &bmba_identity,
+        );
+        controller.reachable_peers.insert(bzot, "BZOT".to_owned());
+        configure_fake_refresh(
+            &mut controller,
+            test_tail_status(vec![
+                test_tail_node("node-bzot", "BZOT", bzot_address),
+                test_tail_node("node-bmba", "BMBA", bmba_address),
+            ]),
+            HashMap::from([(
+                SocketAddr::new(bmba_address, MESHELF_PORT),
+                signed_probe_answer(&bmba_identity, "BMBA"),
+            )]),
+        );
+
+        controller.refresh().expect("fake refresh");
+
+        assert_eq!(controller.reachable_peers.len(), 1);
+        assert!(!controller.reachable_peers.contains_key(&bzot));
+        assert_eq!(
+            controller.reachable_peers.get(&bmba),
+            Some(&"BMBA".to_owned())
+        );
+    }
+
+    #[test]
+    fn refresh_that_answers_for_an_unpaired_device_does_not_make_it_reachable() {
+        let (_directory, mut controller) = test_controller();
+        let unpaired_identity = InstallationIdentity::generate();
+        let address = IpAddr::V4(Ipv4Addr::new(100, 90, 118, 124));
+        configure_fake_refresh(
+            &mut controller,
+            test_tail_status(vec![test_tail_node("node-unpaired", "UNPAIRED", address)]),
+            HashMap::from([(
+                SocketAddr::new(address, MESHELF_PORT),
+                signed_probe_answer(&unpaired_identity, "UNPAIRED"),
+            )]),
+        );
+
+        let view = controller.refresh().expect("fake refresh");
+
+        assert!(controller.reachable_peers.is_empty());
+        assert_eq!(view.reachable_names, "No meshelf devices are reachable");
+        assert!(
+            controller
+                .installation
+                .peers
+                .by_device_id(unpaired_identity.device_id)
+                .is_some()
         );
     }
 }

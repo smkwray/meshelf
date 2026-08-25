@@ -218,6 +218,12 @@ fn apply_peer_view(window: &MainWindow, view: PeerView) {
     window.set_default_peer(view.name.into());
     window.set_default_peer_online(view.online);
     window.set_status_text(view.status.into());
+    window.set_reachable_names(view.reachable_names.into());
+}
+
+fn apply_refresh_error(window: &MainWindow, error: String) {
+    window.set_reachable_names("Reachability unavailable".into());
+    window.set_status_text(error.into());
 }
 
 fn load_shelf_snapshot(
@@ -390,7 +396,7 @@ fn refresh_in_background(
                 match result {
                     Ok(Some(view)) => apply_peer_view(&window, view),
                     Ok(None) => {}
-                    Err(error) => window.set_status_text(error.into()),
+                    Err(error) => apply_refresh_error(&window, error),
                 }
             }
         });
@@ -722,6 +728,47 @@ mod tests {
         assert!(gate.try_enter().is_none());
         drop(first);
         assert!(gate.try_enter().is_some());
+    }
+
+    #[test]
+    fn generated_ui_status_tooltip_uses_reachable_list() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().expect("test window");
+        apply_peer_view(
+            &window,
+            PeerView {
+                name: "BZOT".to_owned(),
+                online: true,
+                approval_available: false,
+                status: "2 devices reachable · paste text or copied files".to_owned(),
+                reachable_names: "BMBA\nBZOT".to_owned(),
+            },
+        );
+
+        assert_eq!(window.get_reachable_names().as_str(), "BMBA\nBZOT");
+    }
+
+    #[test]
+    fn failed_refresh_does_not_leave_stale_reachable_names() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().expect("test window");
+        apply_peer_view(
+            &window,
+            PeerView {
+                name: "BZOT".to_owned(),
+                online: true,
+                approval_available: false,
+                status: "1 device reachable · paste text or copied files".to_owned(),
+                reachable_names: "BZOT".to_owned(),
+            },
+        );
+
+        apply_refresh_error(&window, "Refresh failed".to_owned());
+
+        assert_eq!(
+            window.get_reachable_names().as_str(),
+            "Reachability unavailable"
+        );
     }
 
     #[test]
