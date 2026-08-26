@@ -13,4 +13,5 @@ meshelf-core = { path = "../../crates/meshelf-core" }
 meshelf-identity = { path = "../../crates/meshelf-identity" }
 meshelf-net = { path = "../../crates/meshelf-net" }
 meshelf-protocol = { path = "../../crates/meshelf-protocol" }
+meshelf-store = { path = "../../crates/meshelf-store" }
 tokio.workspace = true

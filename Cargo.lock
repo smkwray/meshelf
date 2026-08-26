@@ -3273,6 +3273,7 @@ dependencies = [
  "meshelf-identity",
  "meshelf-net",
  "meshelf-protocol",
+ "meshelf-store",
  "tokio",
 ]
 
@@ -3309,8 +3310,15 @@ dependencies = [
  "meshelf-bootstrap",
  "meshelf-control",
  "meshelf-core",
+ "meshelf-identity",
+ "meshelf-net",
  "meshelf-platform",
+ "meshelf-protocol",
+ "meshelf-store",
+ "meshelf-tailscale",
  "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

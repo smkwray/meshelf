@@ -6,7 +6,6 @@
 
 mod activation;
 mod destination;
-mod memory_store;
 mod model;
 mod offer;
 mod receiver;
@@ -20,10 +19,8 @@ pub use activation::{
 pub use destination::{
     DestinationPolicy, relative_path, validate_component, validate_relative_path,
 };
-pub use memory_store::MemoryReceiveStore;
 pub use model::{
-    ContentKind, DeliveryMode, DeviceId, EnvelopeValidationError, MAX_CONTROL_REQUEST_BYTES,
-    MAX_TEXT_BYTES, MessageId, PROTOCOL_VERSION, Receipt, ReceiptCode, TextEnvelope,
+    ContentKind, DeviceId, MAX_CONTROL_REQUEST_BYTES, MAX_TEXT_BYTES, MessageId, PROTOCOL_VERSION,
 };
 pub use offer::{
     CardAvailability, MAX_OFFER_ATTEMPT_DETAIL_BYTES, MAX_OFFER_FILE_BYTES,
@@ -31,11 +28,10 @@ pub use offer::{
     MAX_OFFER_TRANSFER_BYTES, OfferDescriptor, OfferDescriptorError, OfferId, OfferSource,
     OfferSourceError, V2_MAX_LIVE_ENTRIES,
 };
-pub use receiver::{ClipboardError, ClipboardSink, ReceiverService};
+pub use receiver::{ClipboardError, ClipboardSink};
 pub use settings::{SaveDestination, UserSettings};
 pub use store::{
     CleanupReport, MigrationReport, OfferAttemptCode, OfferAttemptStatus, OfferCardInput,
     OfferCardInsert, OfferCardRecord, OfferEligibilityUpdate, OfferSourceInput, OfferSourceInsert,
-    OfferSourceRecord, OfferSourceStore, ReceivePhase, ReceiveRecord, ReceiveState, ReceiveStore,
-    StoreError, TransitionOutcome,
+    OfferSourceRecord, OfferSourceStore, StoreError,
 };

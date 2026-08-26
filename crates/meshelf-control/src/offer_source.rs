@@ -389,4 +389,59 @@ mod tests {
         let prepared = prepare_source(OfferInput::Path(file)).expect("metadata-only source");
         assert!(matches!(prepared.source, OfferSource::File { .. }));
     }
+
+    #[test]
+    fn classifies_text_and_future_file_items() {
+        let directory = tempdir().expect("temporary directory");
+        let file = directory.path().join("example.txt");
+        fs::write(&file, "example").expect("write example file");
+
+        assert!(matches!(
+            prepare_source(OfferInput::Text("ordinary text".to_owned()))
+                .expect("text source")
+                .source,
+            OfferSource::Text { .. }
+        ));
+        assert!(matches!(
+            prepare_source(OfferInput::Path(file))
+                .expect("file source")
+                .source,
+            OfferSource::File { .. }
+        ));
+        assert!(matches!(
+            prepare_source(OfferInput::Path(directory.path().to_owned()))
+                .expect("folder source")
+                .source,
+            OfferSource::Folder { .. }
+        ));
+        assert!(matches!(
+            prepare_source(OfferInput::Text("C:\\future\\item.txt".to_owned()))
+                .expect("future path-looking text")
+                .source,
+            OfferSource::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn prepares_nested_folder_manifest_in_stable_order() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("package");
+        fs::create_dir_all(root.join("empty")).expect("create empty folder");
+        fs::create_dir_all(root.join("nested")).expect("create nested folder");
+        fs::write(root.join("b.txt"), "bravo").expect("write b");
+        fs::write(root.join("nested").join("a.txt"), "alpha").expect("write a");
+
+        let prepared = prepare_source(OfferInput::Path(root)).expect("prepare folder");
+        assert_eq!(
+            prepared.descriptor,
+            OfferDescriptor::Folder {
+                root_name: "package".to_owned(),
+                total_bytes: 10,
+                entry_count: 4,
+                file_count: 2,
+                directory_count: 2,
+            }
+        );
+        assert!(matches!(prepared.source, OfferSource::Folder { .. }));
+    }
 }

@@ -4,7 +4,7 @@
 //! points. In particular, opening [`RedbV2Store`] never reads or migrates the
 //! v1 receive ledger.
 
-use std::{fs, path::Path};
+use std::{fs, io::ErrorKind, path::Path};
 
 use meshelf_core::{
     ActivationId, ActivationJournalEntry, CleanupReport, ClipboardCacheRecord, ClipboardCacheState,
@@ -12,7 +12,7 @@ use meshelf_core::{
     OfferSourceInput, OfferSourceInsert, OfferSourceRecord, OfferSourceStore, StoreError,
     V2_MAX_LIVE_ENTRIES,
 };
-use meshelf_platform::{ensure_directory_tree, remove_owned_tree};
+use meshelf_platform::{ensure_directory_tree, reject_reparse_point, remove_owned_tree};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{RECEIVE_LEDGER, map_redb_error};
@@ -562,9 +562,37 @@ impl RedbV2Store {
             MigrationReport {
                 v1_body_records_removed: u64::try_from(keys.len())
                     .map_err(|_| StoreError::new("too many v1 body records"))?,
+                partials_directory_removed: false,
+                completion_markers_removed: 0,
             }
         };
         write.commit().map_err(map_redb_error)?;
+        Ok(report)
+    }
+
+    /// Perform the irreversible legacy cleanup before the v2 listener is bound.
+    ///
+    /// The redb deletion is one transaction. Files in the user's incoming directory are never
+    /// inspected as transfer authority: only the app-owned partial directory and completion
+    /// marker files are removed.
+    pub fn migrate_legacy_state(
+        &self,
+        incoming_directory: &Path,
+    ) -> Result<MigrationReport, StoreError> {
+        let mut report = self.migrate_v1_body_records()?;
+        let partials = incoming_directory.join(".meshelf-partials");
+        match remove_owned_tree(&partials) {
+            Ok(()) => report.partials_directory_removed = path_exists(&partials),
+            Err(error) => {
+                return Err(StoreError::new(format!(
+                    "legacy partial cleanup failed: {error}"
+                )));
+            }
+        }
+        report.partials_directory_removed = !path_exists(&partials);
+
+        let completed = incoming_directory.join(".meshelf-completed");
+        report.completion_markers_removed = remove_completion_markers(&completed)?;
         Ok(report)
     }
 
@@ -580,6 +608,40 @@ impl RedbV2Store {
         }
         Ok(entries)
     }
+}
+
+fn path_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn remove_completion_markers(directory: &Path) -> Result<u64, StoreError> {
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(StoreError::new(error.to_string())),
+    };
+    reject_reparse_point(directory).map_err(|error| StoreError::new(error.to_string()))?;
+    if !metadata.is_dir() {
+        return Err(StoreError::new(
+            "legacy completion marker path is not a directory",
+        ));
+    }
+    let mut removed = 0_u64;
+    for entry in fs::read_dir(directory).map_err(|error| StoreError::new(error.to_string()))? {
+        let entry = entry.map_err(|error| StoreError::new(error.to_string()))?;
+        let path = entry.path();
+        let child_metadata =
+            fs::symlink_metadata(&path).map_err(|error| StoreError::new(error.to_string()))?;
+        if child_metadata.is_dir() {
+            return Err(StoreError::new(format!(
+                "legacy completion marker is a directory: {}",
+                path.display()
+            )));
+        }
+        fs::remove_file(&path).map_err(|error| StoreError::new(error.to_string()))?;
+        removed = removed.saturating_add(1);
+    }
+    Ok(removed)
 }
 
 impl OfferSourceStore for RedbV2Store {
@@ -693,13 +755,35 @@ mod tests {
     use meshelf_core::{
         ActivationId, ActivationJournalEntry, ActivationMode, ActivationState, CardAvailability,
         ClipboardCacheRecord, ClipboardCacheState, DeviceId, OfferAttemptCode, OfferAttemptStatus,
-        OfferCardInput, OfferDescriptor, OfferId, OfferSource, OfferSourceInput, ReceiveStore,
-        TextEnvelope, V2_MAX_LIVE_ENTRIES,
+        OfferCardInput, OfferDescriptor, OfferId, OfferSource, OfferSourceInput,
+        V2_MAX_LIVE_ENTRIES,
     };
+    use redb::{Database, ReadableDatabase, ReadableTable};
     use tempfile::tempdir;
 
     use super::RedbV2Store;
-    use crate::RedbReceiveStore;
+    use crate::RECEIVE_LEDGER;
+
+    fn insert_legacy_rows(path: &PathBuf, keys: &[&str]) {
+        let database = Database::create(path).expect("legacy database");
+        let write = database.begin_write().expect("legacy write");
+        {
+            let mut table = write.open_table(RECEIVE_LEDGER).expect("legacy table");
+            for key in keys {
+                table
+                    .insert(*key, b"legacy payload".as_slice())
+                    .expect("legacy row");
+            }
+        }
+        write.commit().expect("legacy commit");
+    }
+
+    fn legacy_row_count(path: &PathBuf) -> usize {
+        let database = Database::create(path).expect("legacy reopen");
+        let read = database.begin_read().expect("legacy read");
+        let table = read.open_table(RECEIVE_LEDGER).expect("legacy table");
+        table.iter().expect("legacy rows").count()
+    }
 
     fn store() -> (tempfile::TempDir, RedbV2Store) {
         let directory = tempdir().expect("temp directory");
@@ -1176,36 +1260,40 @@ mod tests {
     }
 
     #[test]
-    fn migration_counts_and_removes_v1_body_records() {
+    fn migration_removes_every_v1_ledger_row_and_reports_the_count() {
         let directory = tempdir().expect("temp directory");
         let path = directory.path().join("meshelf.redb");
-        {
-            let v1 = RedbReceiveStore::open(&path).expect("v1 open");
-            let first = TextEnvelope::shelf_item(
-                DeviceId::new(),
-                DeviceId::new(),
-                1,
-                None,
-                meshelf_core::ContentKind::Text,
-                "first body",
-            );
-            let second = TextEnvelope::shelf_item(
-                DeviceId::new(),
-                DeviceId::new(),
-                2,
-                None,
-                meshelf_core::ContentKind::Text,
-                "second body",
-            );
-            v1.record_if_absent(&first, 1).expect("first");
-            v1.record_if_absent(&second, 2).expect("second");
-        }
+        insert_legacy_rows(&path, &["first", "second"]);
         let v2 = RedbV2Store::open(&path).expect("v2 open");
         let report = v2.migrate_v1_body_records().expect("migration");
         assert_eq!(report.v1_body_records_removed, 2);
         drop(v2);
-        let v1 = RedbReceiveStore::open(path).expect("reopen v1");
-        assert!(v1.recent(10).expect("recent").is_empty());
+        assert_eq!(legacy_row_count(&path), 0);
+    }
+
+    #[test]
+    fn migration_never_deletes_a_published_user_file() {
+        let directory = tempdir().expect("temp directory");
+        let published = directory.path().join("published.txt");
+        fs::write(&published, b"published").expect("published file");
+        let path = directory.path().join("meshelf.redb");
+        insert_legacy_rows(&path, &["published"]);
+        let v2 = RedbV2Store::open(&path).expect("v2 open");
+        v2.migrate_legacy_state(&directory.path().join("missing incoming"))
+            .expect("migration");
+        assert_eq!(fs::read(&published).expect("read published"), b"published");
+    }
+
+    #[test]
+    fn migration_counts_and_removes_v1_body_records() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("meshelf.redb");
+        insert_legacy_rows(&path, &["first", "second"]);
+        let v2 = RedbV2Store::open(&path).expect("v2 open");
+        let report = v2.migrate_v1_body_records().expect("migration");
+        assert_eq!(report.v1_body_records_removed, 2);
+        drop(v2);
+        assert_eq!(legacy_row_count(&path), 0);
     }
 
     #[test]
@@ -1214,21 +1302,88 @@ mod tests {
         let published = directory.path().join("published.txt");
         fs::write(&published, b"published").expect("published file");
         let path = directory.path().join("meshelf.redb");
-        {
-            let v1 = RedbReceiveStore::open(&path).expect("v1 open");
-            let record = TextEnvelope::shelf_item(
-                DeviceId::new(),
-                DeviceId::new(),
-                1,
-                None,
-                meshelf_core::ContentKind::Path,
-                published.to_string_lossy(),
-            );
-            v1.record_if_absent(&record, 1).expect("record");
-        }
+        insert_legacy_rows(&path, &["published"]);
         let v2 = RedbV2Store::open(&path).expect("v2 open");
-        v2.migrate_v1_body_records().expect("migration");
+        v2.migrate_legacy_state(&directory.path().join("missing incoming"))
+            .expect("migration");
         assert_eq!(fs::read(&published).expect("read published"), b"published");
+    }
+
+    #[test]
+    fn migration_removes_partials_and_completion_markers_only() {
+        let directory = tempdir().expect("temporary directory");
+        let incoming = directory.path().join("Meshelf Incoming");
+        fs::create_dir_all(incoming.join(".meshelf-partials/old")).expect("partials directory");
+        fs::write(incoming.join(".meshelf-partials/old/payload"), b"partial")
+            .expect("partial payload");
+        fs::create_dir_all(incoming.join(".meshelf-completed")).expect("completed directory");
+        fs::write(
+            incoming.join(".meshelf-completed/old-transfer.json"),
+            br#"{"final_path":"user-output.txt"}"#,
+        )
+        .expect("completion marker");
+        let published = incoming.join("user-output.txt");
+        fs::write(&published, b"published user data").expect("published file");
+
+        let store = RedbV2Store::open(directory.path().join("meshelf.redb")).expect("open store");
+        let report = store.migrate_legacy_state(&incoming).expect("migration");
+
+        assert!(report.partials_directory_removed);
+        assert_eq!(report.completion_markers_removed, 1);
+        assert!(!incoming.join(".meshelf-partials").exists());
+        assert!(
+            !incoming
+                .join(".meshelf-completed/old-transfer.json")
+                .exists()
+        );
+        assert_eq!(
+            fs::read(&published).expect("published file"),
+            b"published user data"
+        );
+        assert!(incoming.exists());
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let directory = tempdir().expect("temporary directory");
+        let incoming = directory.path().join("Meshelf Incoming");
+        fs::create_dir_all(incoming.join(".meshelf-partials/old")).expect("partials directory");
+        fs::create_dir_all(incoming.join(".meshelf-completed")).expect("completed directory");
+        fs::write(incoming.join(".meshelf-completed/old.json"), b"marker").expect("marker");
+        let store = RedbV2Store::open(directory.path().join("meshelf.redb")).expect("open store");
+
+        let first = store
+            .migrate_legacy_state(&incoming)
+            .expect("first migration");
+        let second = store
+            .migrate_legacy_state(&incoming)
+            .expect("second migration");
+
+        assert_eq!(first.v1_body_records_removed, 0);
+        assert_eq!(first.completion_markers_removed, 1);
+        assert_eq!(second.v1_body_records_removed, 0);
+        assert_eq!(second.completion_markers_removed, 0);
+        assert!(second.partials_directory_removed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_blocks_when_cleanup_fails() {
+        let directory = tempdir().expect("temporary directory");
+        let incoming = directory.path().join("Meshelf Incoming");
+        fs::create_dir_all(&incoming).expect("incoming directory");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside directory");
+        std::os::unix::fs::symlink(&outside, incoming.join(".meshelf-partials"))
+            .expect("partial symlink");
+        let store = RedbV2Store::open(directory.path().join("meshelf.redb")).expect("open store");
+
+        let error = store
+            .migrate_legacy_state(&incoming)
+            .expect_err("reparse cleanup must block startup");
+        assert!(error.message().contains("legacy partial cleanup failed"));
+        assert!(incoming.join(".meshelf-partials").exists());
+        assert!(outside.exists());
     }
 
     #[test]

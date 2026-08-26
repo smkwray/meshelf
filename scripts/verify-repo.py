@@ -21,6 +21,7 @@ REQUIRED = [
     "START_HERE.md",
     "Cargo.toml",
     "apps/desktop/ui/main.slint",
+    "crates/meshelf-core/src/activation.rs",
     "crates/meshelf-core/src/receiver.rs",
     "crates/meshelf-net/src/lib.rs",
     "crates/meshelf-platform/src/clipboard.rs",
@@ -138,8 +139,8 @@ def check_invariants() -> None:
     net = (ROOT / "crates/meshelf-net/src/lib.rs").read_text(encoding="utf-8")
     if "pub struct DenyAll" not in net or "bind_discovered_tailscale_address" not in net:
         fail("network deny-by-default/private-bind seams are missing")
-    receiver = (ROOT / "crates/meshelf-core/src/receiver.rs").read_text(encoding="utf-8")
-    if "UncertainNoReplay" not in receiver or "ReceivePhase::Applying" not in receiver:
+    activation = (ROOT / "crates/meshelf-core/src/activation.rs").read_text(encoding="utf-8")
+    if "UncertainNoReplay" not in activation or "ApplyingClipboard" not in activation:
         fail("at-most-once uncertain-boundary handling is missing")
     clipboard = (ROOT / "crates/meshelf-platform/src/clipboard.rs").read_text(encoding="utf-8")
     explicit_read = clipboard.split("ClipboardCommand::Read(response) =>", 1)

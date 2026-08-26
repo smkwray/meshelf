@@ -979,7 +979,8 @@ where
         let mut directory_paths = HashSet::new();
         for entry in &plan.entries {
             if entry.kind == FileEntryKind::Directory {
-                let path = payload_root.join(meshelf_core::relative_path(&entry.relative_path));
+                let path =
+                    payload_root.join(crate::destination::relative_path(&entry.relative_path));
                 directory_paths.insert(path);
             }
         }
@@ -997,7 +998,7 @@ where
             let path = if plan.content_kind == ContentKind::File {
                 payload_root.clone()
             } else {
-                payload_root.join(meshelf_core::relative_path(&entry.relative_path))
+                payload_root.join(crate::destination::relative_path(&entry.relative_path))
             };
             if let Some(parent) = path.parent() {
                 ensure_directory_tree(parent)?;

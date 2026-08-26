@@ -4,85 +4,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CardAvailability, DeviceId, MAX_OFFER_ATTEMPT_DETAIL_BYTES, MessageId, OfferDescriptor,
-    OfferId, OfferSource, TextEnvelope,
+    CardAvailability, DeviceId, MAX_OFFER_ATTEMPT_DETAIL_BYTES, OfferDescriptor, OfferId,
+    OfferSource,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReceivePhase {
-    Recorded,
-    Applying,
-    Applied,
-    ClipboardFailed,
-    Rejected,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReceiveState {
-    pub phase: ReceivePhase,
-    pub detail: Option<String>,
-}
-
-impl ReceiveState {
-    #[must_use]
-    pub const fn recorded() -> Self {
-        Self {
-            phase: ReceivePhase::Recorded,
-            detail: None,
-        }
-    }
-
-    #[must_use]
-    pub const fn applying() -> Self {
-        Self {
-            phase: ReceivePhase::Applying,
-            detail: None,
-        }
-    }
-
-    #[must_use]
-    pub const fn applied() -> Self {
-        Self {
-            phase: ReceivePhase::Applied,
-            detail: None,
-        }
-    }
-
-    #[must_use]
-    pub fn clipboard_failed(detail: impl Into<String>) -> Self {
-        Self {
-            phase: ReceivePhase::ClipboardFailed,
-            detail: Some(detail.into()),
-        }
-    }
-
-    #[must_use]
-    pub fn rejected(detail: impl Into<String>) -> Self {
-        Self {
-            phase: ReceivePhase::Rejected,
-            detail: Some(detail.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReceiveRecord {
-    pub envelope: TextEnvelope,
-    pub state: ReceiveState,
-    pub first_seen_unix_ms: u64,
-    pub updated_at_unix_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransitionOutcome {
-    Changed(ReceiveRecord),
-    Mismatch(ReceiveRecord),
-    Missing,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("receive store error: {message}")]
+#[error("store error: {message}")]
 pub struct StoreError {
     message: String,
 }
@@ -101,30 +28,6 @@ impl StoreError {
     }
 }
 
-pub trait ReceiveStore: Send + Sync + 'static {
-    /// Inserts the message in `Recorded` if absent and returns the current record.
-    /// Implementations must perform the check-and-insert atomically.
-    fn record_if_absent(
-        &self,
-        envelope: &TextEnvelope,
-        now_unix_ms: u64,
-    ) -> Result<ReceiveRecord, StoreError>;
-
-    fn get(&self, message_id: MessageId) -> Result<Option<ReceiveRecord>, StoreError>;
-
-    /// Atomically changes the state only when the current phase equals `expected`.
-    fn transition(
-        &self,
-        message_id: MessageId,
-        expected: ReceivePhase,
-        next: ReceiveState,
-        now_unix_ms: u64,
-    ) -> Result<TransitionOutcome, StoreError>;
-}
-
-/// The sender-side durable source record. Text is intentionally the only
-/// payload retained here; file and folder sources remain references to the
-/// user's existing objects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferSourceRecord {
     pub offer_id: OfferId,
@@ -182,18 +85,14 @@ pub struct OfferEligibilityUpdate {
     pub remaining_recipients: u32,
 }
 
-/// The sender-side durable source authority. Implementations must make each
-/// mutation durable and atomic; callers never maintain a parallel registry.
 pub trait OfferSourceStore: Send + Sync + 'static {
     fn insert_offer_source(&self, input: OfferSourceInput)
     -> Result<OfferSourceInsert, StoreError>;
-
     fn remove_explicit_refusal(
         &self,
         offer_id: OfferId,
         recipient: DeviceId,
     ) -> Result<OfferEligibilityUpdate, StoreError>;
-
     fn get_offer_source(&self, offer_id: OfferId) -> Result<Option<OfferSourceRecord>, StoreError>;
 }
 
@@ -301,4 +200,6 @@ pub struct CleanupReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MigrationReport {
     pub v1_body_records_removed: u64,
+    pub partials_directory_removed: bool,
+    pub completion_markers_removed: u64,
 }

@@ -1,30 +1,15 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use meshelf_core::{
-    ClipboardError, ClipboardSink, ContentKind, MemoryReceiveStore, ReceiptCode, ReceiveStore,
-    ReceiverService, TextEnvelope,
-};
+use meshelf_core::{OfferDescriptor, OfferId, OfferSource, OfferSourceInput};
 use meshelf_identity::InstallationIdentity;
-use meshelf_net::{CoreEnvelopeHandler, ExactDeviceAllowList, PeerClient, ServerIdentity, serve};
-use meshelf_protocol::ClientHello;
+use meshelf_net::{
+    ExactDeviceAllowList, OfferAnnouncementHandler, OfferFetchHandler, PeerClient, ServerIdentity,
+    V2OfferServices, serve_v2_with_offers_and_fetch,
+};
+use meshelf_protocol::{ClientHello, OfferAckCode, OfferAnnouncement};
+use meshelf_store::RedbV2Store;
 use tokio::{net::TcpListener, sync::watch};
-
-#[derive(Debug, Default)]
-struct SimClipboard(Mutex<Vec<String>>);
-
-impl ClipboardSink for SimClipboard {
-    fn set_text(&self, text: &str) -> Result<(), ClipboardError> {
-        self.0
-            .lock()
-            .map_err(|_| ClipboardError::new("simulation clipboard mutex poisoned"))?
-            .push(text.to_owned());
-        Ok(())
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,89 +17,79 @@ async fn main() -> Result<()> {
     let bzot_identity = InstallationIdentity::generate();
     let bmst = bmst_identity.device_id;
     let bzot = bzot_identity.device_id;
-    let clipboard = Arc::new(SimClipboard::default());
-    let receive_store = Arc::new(MemoryReceiveStore::new());
-    let service = Arc::new(ReceiverService::new(
-        bzot,
-        receive_store.clone(),
-        clipboard.clone(),
-    ));
+    let source_path =
+        std::env::temp_dir().join(format!("meshelf-sim-source-{}.redb", OfferId::new()));
+    let card_path = std::env::temp_dir().join(format!("meshelf-sim-card-{}.redb", OfferId::new()));
+    let source_store = Arc::new(RedbV2Store::open(&source_path).context("open source store")?);
+    let card_store = Arc::new(RedbV2Store::open(&card_path).context("open card store")?);
+    let offer_id = OfferId::new();
+    source_store.insert_offer_source(OfferSourceInput::new(
+        offer_id,
+        OfferDescriptor::text("meshelf loopback: α\nβ\n🙂")?,
+        HashSet::from([bzot]),
+        OfferSource::Text {
+            text: "meshelf loopback: α\nβ\n🙂".to_owned(),
+        },
+    ))?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .context("bind loopback receiver")?;
     let address = listener.local_addr().context("read listener address")?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server = tokio::spawn(serve(
+    let server = tokio::spawn(serve_v2_with_offers_and_fetch(
         listener,
         ServerIdentity {
             signing_identity: bzot_identity.clone(),
             device_name: "BZOT".to_owned(),
         },
         Arc::new(ExactDeviceAllowList::new([bmst])),
-        Arc::new(CoreEnvelopeHandler::new(service)),
+        V2OfferServices {
+            announcement_receiver: Arc::new(OfferAnnouncementHandler::new(card_store.clone())),
+            fetch_sender: Arc::new(OfferFetchHandler::new(bmst, source_store)),
+        },
         Duration::from_secs(2),
         shutdown_rx,
     ));
-
-    let message = TextEnvelope::shelf_item(
+    let announcement = OfferAnnouncement::new(
+        offer_id,
         bmst,
         bzot,
-        now_unix_ms(),
-        None,
-        ContentKind::Text,
-        "meshelf loopback: α\nβ\n🙂",
+        1,
+        OfferDescriptor::text("meshelf loopback: α\nβ\n🙂")?,
     );
     let client = PeerClient::with_timeouts(Duration::from_secs(2), Duration::from_secs(2));
     let first = client
-        .push(
+        .announce_offer_v2(
             address,
-            ClientHello::signed(bmst, "BMST", "simulation-1", &bmst_identity),
-            message.clone(),
+            ClientHello::signed_v2(bmst, "BMST", "simulation-1", &bmst_identity),
+            announcement.clone(),
             &bzot_identity.public_key(),
         )
         .await
-        .context("first send")?;
+        .context("first announcement")?;
     let duplicate = client
-        .push(
+        .announce_offer_v2(
             address,
-            ClientHello::signed(bmst, "BMST", "simulation-2", &bmst_identity),
-            message,
+            ClientHello::signed_v2(bmst, "BMST", "simulation-2", &bmst_identity),
+            announcement,
             &bzot_identity.public_key(),
         )
         .await
-        .context("duplicate send")?;
-
-    let writes = clipboard
-        .0
-        .lock()
-        .map_err(|_| anyhow::anyhow!("simulation clipboard mutex poisoned"))?
-        .clone();
-    let stored = receive_store
-        .get(first.message_id)
-        .context("read stored shelf item")?
-        .context("shelf item missing")?;
-    if first.code != ReceiptCode::Stored
-        || duplicate.code != ReceiptCode::Stored
-        || !writes.is_empty()
-        || stored.envelope.text != "meshelf loopback: α\nβ\n🙂"
-    {
+        .context("duplicate announcement")?;
+    if first.code != OfferAckCode::Stored || duplicate.code != OfferAckCode::Duplicate {
         bail!(
-            "simulation failed: first={:?}, duplicate={:?}, writes={writes:?}",
+            "simulation failed: first={:?}, duplicate={:?}",
             first.code,
             duplicate.code
         );
     }
-
+    if card_store.read_offer_shelf()?.len() != 1 {
+        bail!("simulation stored an unexpected number of cards");
+    }
     shutdown_tx.send(true).context("request shutdown")?;
     server.await.context("join server")??;
-    println!("PASS: direct two-peer shelf send stored once without changing the clipboard");
+    let _ = std::fs::remove_file(source_path);
+    let _ = std::fs::remove_file(card_path);
+    println!("PASS: direct protocol-2 announcement stored exactly one metadata card");
     Ok(())
-}
-
-fn now_unix_ms() -> u64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    u64::try_from(millis).unwrap_or(u64::MAX)
 }
