@@ -2,7 +2,6 @@
 param(
     [string]$SourceDirectory = $PSScriptRoot,
     [string]$InstallDirectory = (Join-Path $env:LOCALAPPDATA "Programs\meshelf"),
-    [switch]$EnableStartAtLogin,
     [switch]$Launch
 )
 
@@ -51,9 +50,6 @@ $desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "meshelf.
 $startMenuShortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "meshelf\meshelf.lnk"
 Set-MeshelfShortcut $desktopShortcut
 Set-MeshelfShortcut $startMenuShortcut
-if ($EnableStartAtLogin) {
-    Set-MeshelfShortcut (Join-Path ([Environment]::GetFolderPath("Startup")) "meshelf.lnk")
-}
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $pathEntries = @($userPath -split ';' | Where-Object { $_ })

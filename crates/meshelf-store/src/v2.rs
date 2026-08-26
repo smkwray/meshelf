@@ -1,8 +1,8 @@
-//! Additive protocol-v2 offer, cleanup, and clipboard-cache indexes.
+//! Protocol-v2 offer, cleanup, and clipboard-cache indexes.
 //!
-//! Nothing in this module is selected by the current v1 production entry
-//! points. In particular, opening [`RedbV2Store`] never reads or migrates the
-//! v1 receive ledger.
+//! Opening [`RedbV2Store`] does not itself read or migrate the v1 receive
+//! ledger; startup calls [`RedbV2Store::migrate_legacy_state`] before the
+//! listener binds.
 
 use std::{fs, io::ErrorKind, path::Path};
 
@@ -544,9 +544,9 @@ impl RedbV2Store {
         Ok(previous)
     }
 
-    /// Explicit migration for the later cutover step. Opening a v2 store does
-    /// not call this function. Published user files are outside the v1 ledger
-    /// and are not inspected or removed.
+    /// Delete remaining v1 receive-ledger rows. Opening a v2 store does not
+    /// call this function; [`Self::migrate_legacy_state`] does. Published user
+    /// files are outside the v1 ledger and are not inspected or removed.
     pub fn migrate_v1_body_records(&self) -> Result<MigrationReport, StoreError> {
         let write = self.database.begin_write().map_err(map_redb_error)?;
         let report = {
@@ -1384,6 +1384,34 @@ mod tests {
         assert!(error.message().contains("legacy partial cleanup failed"));
         assert!(incoming.join(".meshelf-partials").exists());
         assert!(outside.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_blocks_when_cleanup_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempdir().expect("temporary directory");
+        let incoming = directory.path().join("Meshelf Incoming");
+        let partials = incoming.join(".meshelf-partials");
+        fs::create_dir_all(&partials).expect("partials directory");
+        let held = partials.join("held.bin");
+        fs::write(&held, b"held").expect("held file");
+        // Share mode 0 denies FILE_SHARE_DELETE, so an open handle blocks
+        // removing the leftover tree on Windows without elevation.
+        let _blocked = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&held)
+            .expect("open blocking handle");
+        let store = RedbV2Store::open(directory.path().join("meshelf.redb")).expect("open store");
+
+        let error = store
+            .migrate_legacy_state(&incoming)
+            .expect_err("blocked leftover cleanup must refuse startup");
+        assert!(error.message().contains("legacy partial cleanup failed"));
+        assert!(partials.exists());
     }
 
     #[test]

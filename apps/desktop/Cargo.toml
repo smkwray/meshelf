@@ -12,7 +12,6 @@ publish = false
 anyhow.workspace = true
 dirs.workspace = true
 meshelf-core = { path = "../../crates/meshelf-core" }
-meshelf-bootstrap = { path = "../../crates/meshelf-bootstrap" }
 meshelf-control = { path = "../../crates/meshelf-control" }
 meshelf-identity = { path = "../../crates/meshelf-identity" }
 meshelf-net = { path = "../../crates/meshelf-net" }

@@ -1,8 +1,8 @@
-//! Additive protocol-v2 offer and receiver-initiated fetch types.
+//! Protocol-v2 offer and receiver-initiated fetch types.
 //!
-//! This module is deliberately not part of [`super::WireMessage`].  The v1
-//! production entry point therefore cannot select or accept these messages
-//! until a later cutover step explicitly wires them in.
+//! Hello frames still use [`super::WireMessage`]. Offer, fetch, and payload
+//! frames use [`V2Message`] on the production protocol-2 connection after a
+//! version-2 hello is accepted.
 
 use std::io::{Read, Write};
 
@@ -19,8 +19,7 @@ use super::{FileEntryKind, ProtocolError};
 pub const V2_PROTOCOL_VERSION: u16 = 2;
 pub const CAP_OFFER_PULL_V2: &str = "offer-pull-v2";
 
-// These are the v2 bounds.  V1's MAX_FRAME_BYTES remains unchanged because
-// the production v1 entry point still selects its original framing.
+// Hello frames keep MAX_FRAME_BYTES. Offer and fetch frames use these v2 bounds.
 pub const V2_MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const V2_MAX_TEXT_PAYLOAD_BYTES: usize = MAX_TEXT_BYTES;
 pub const V2_MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;

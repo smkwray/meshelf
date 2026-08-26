@@ -21,13 +21,12 @@ use std::{
 };
 
 use meshelf_identity::InstallationIdentity;
-use meshelf_net::PeerClient;
+use meshelf_net::{NetError, PeerClient};
 use meshelf_protocol::{
-    CAP_OFFER_PULL_V2, ClientHello, OfferAckCode, ServerHello, V2_PROTOCOL_VERSION,
+    CAP_OFFER_PULL_V2, ClientHello, OfferAck, OfferAckCode, ServerHello, V2_PROTOCOL_VERSION,
 };
 use meshelf_tailscale::{
-    CliPeerDiscovery, InstallationState, InstallationStore, PeerDiscovery, SshBootstrap,
-    SshBootstrapRequest, TailNode, TailStatus,
+    CliPeerDiscovery, InstallationState, InstallationStore, PeerDiscovery, TailNode, TailStatus,
 };
 use tokio::{runtime::Builder, task::JoinSet};
 
@@ -53,17 +52,10 @@ fn operation_runtime(label: &str) -> Result<tokio::runtime::Runtime, String> {
         .map_err(|error| format!("{label} runtime unavailable: {error}"))
 }
 
-#[derive(Debug, Clone)]
-pub struct PendingPeer {
-    pub node: TailNode,
-    pub server: ServerHello,
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerView {
     pub name: String,
     pub online: bool,
-    pub approval_available: bool,
     pub status: String,
     pub reachable_names: String,
 }
@@ -72,23 +64,84 @@ pub struct PeerView {
 pub struct MeshSendReport {
     pub stored_on: Vec<String>,
     pub unavailable: Vec<String>,
+    pub version_mismatch: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnnouncePeerOutcome {
+    Stored(String),
+    Unavailable(String),
+    VersionMismatch(String),
 }
 
 impl MeshSendReport {
     #[must_use]
     pub fn status(&self) -> String {
-        match (self.stored_on.len(), self.unavailable.len()) {
-            (0, 0) => "No paired devices accepted the offer".to_owned(),
-            (stored, 0) => format!(
-                "Added to {stored} device{}",
-                if stored == 1 { "" } else { "s" }
-            ),
-            (stored, _) => format!(
-                "Added to {stored} device{}; unavailable: {}",
-                if stored == 1 { "" } else { "s" },
-                self.unavailable.join(", ")
-            ),
+        let stored = match self.stored_on.len() {
+            0 => None,
+            1 => Some("Added to 1 device".to_owned()),
+            count => Some(format!("Added to {count} devices")),
+        };
+        let mismatches = if self.version_mismatch.is_empty() {
+            None
+        } else {
+            Some(self.version_mismatch.join("; "))
+        };
+        let unavailable = if self.unavailable.is_empty() {
+            None
+        } else {
+            Some(format!("unavailable {}", self.unavailable.join(", ")))
+        };
+        match (stored, mismatches, unavailable) {
+            (None, None, None) => "No paired devices accepted the offer".to_owned(),
+            (None, Some(mismatches), None) => mismatches,
+            (None, None, Some(unavailable)) => {
+                format!("offer was not stored on any peer: {unavailable}")
+            }
+            (None, Some(mismatches), Some(unavailable)) => {
+                format!("{mismatches}; {unavailable}")
+            }
+            (Some(stored), None, None) => stored,
+            (Some(stored), Some(mismatches), None) => format!("{stored}; {mismatches}"),
+            (Some(stored), None, Some(unavailable)) => format!("{stored}; {unavailable}"),
+            (Some(stored), Some(mismatches), Some(unavailable)) => {
+                format!("{stored}; {mismatches}; {unavailable}")
+            }
         }
+    }
+}
+
+/// User-facing announce outcome. `Ok` means at least one peer stored the offer; the string still
+/// names every peer that missed it and why. `Err` is total failure.
+pub fn report_announce_outcome(report: MeshSendReport) -> Result<String, String> {
+    let status = report.status();
+    if report.stored_on.is_empty() {
+        Err(status)
+    } else {
+        Ok(status)
+    }
+}
+
+fn reason_is_protocol_update(reason: &str) -> bool {
+    let lowered = reason.to_ascii_lowercase();
+    lowered.contains("protocol") && lowered.contains("update")
+}
+
+fn classify_announce_result(
+    hostname: String,
+    result: Result<OfferAck, NetError>,
+) -> AnnouncePeerOutcome {
+    match result {
+        Ok(ack) if matches!(ack.code, OfferAckCode::Stored | OfferAckCode::Duplicate) => {
+            AnnouncePeerOutcome::Stored(hostname)
+        }
+        Err(error @ NetError::ProtocolMismatch { .. }) => {
+            AnnouncePeerOutcome::VersionMismatch(error.to_string())
+        }
+        Err(NetError::Rejected(reason)) if reason_is_protocol_update(&reason) => {
+            AnnouncePeerOutcome::VersionMismatch(reason)
+        }
+        _ => AnnouncePeerOutcome::Unavailable(hostname),
     }
 }
 
@@ -120,7 +173,7 @@ pub fn announce_offer_plan(
             tasks.spawn(async move {
                 let hostname = item.hostname;
                 let Some(peer) = peer else {
-                    return (hostname, false);
+                    return AnnouncePeerOutcome::Unavailable(hostname);
                 };
                 let Some(address) = peer
                     .addresses
@@ -129,7 +182,7 @@ pub fn announce_offer_plan(
                     .find(|address| address.is_ipv4())
                     .or_else(|| peer.addresses.first().copied())
                 else {
-                    return (hostname, false);
+                    return AnnouncePeerOutcome::Unavailable(hostname);
                 };
                 let hello = ClientHello::signed_v2(
                     identity.device_id,
@@ -137,33 +190,37 @@ pub fn announce_offer_plan(
                     item.announcement.offer_id.to_string(),
                     &identity,
                 );
-                let stored = PeerClient::default()
-                    .announce_offer_v2(
-                        SocketAddr::new(address, MESHELF_PORT),
-                        hello,
-                        item.announcement,
-                        &peer.public_key,
-                    )
-                    .await
-                    .is_ok_and(|ack| {
-                        matches!(ack.code, OfferAckCode::Stored | OfferAckCode::Duplicate)
-                    });
-                (hostname, stored)
+                classify_announce_result(
+                    hostname,
+                    PeerClient::default()
+                        .announce_offer_v2(
+                            SocketAddr::new(address, MESHELF_PORT),
+                            hello,
+                            item.announcement,
+                            &peer.public_key,
+                        )
+                        .await,
+                )
             });
         }
         let mut report = MeshSendReport {
             stored_on: Vec::new(),
             unavailable: Vec::new(),
+            version_mismatch: Vec::new(),
         };
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((hostname, true)) => report.stored_on.push(hostname),
-                Ok((hostname, false)) => report.unavailable.push(hostname),
+                Ok(AnnouncePeerOutcome::Stored(hostname)) => report.stored_on.push(hostname),
+                Ok(AnnouncePeerOutcome::Unavailable(hostname)) => report.unavailable.push(hostname),
+                Ok(AnnouncePeerOutcome::VersionMismatch(reason)) => {
+                    report.version_mismatch.push(reason)
+                }
                 Err(error) => report.unavailable.push(format!("worker ({error})")),
             }
         }
         report.stored_on.sort();
         report.unavailable.sort();
+        report.version_mismatch.sort();
         Ok(report)
     })
 }
@@ -177,7 +234,6 @@ pub struct Controller {
     probe: Arc<dyn PeerProbe>,
     pub last_status: Option<TailStatus>,
     pub reachable_peers: HashMap<meshelf_core::DeviceId, String>,
-    pub pending: Option<PendingPeer>,
     pub selected_device: Option<meshelf_core::DeviceId>,
 }
 
@@ -202,7 +258,6 @@ impl Controller {
             )),
             last_status: None,
             reachable_peers: HashMap::new(),
-            pending: None,
             selected_device: None,
         })
     }
@@ -223,7 +278,6 @@ impl Controller {
                 Ok(())
             })
             .map_err(|error| format!("could not save meshelf state: {error}"))?;
-        self.pending = None;
         self.selected_device = None;
 
         let runtime = operation_runtime("probe")?;
@@ -291,52 +345,6 @@ impl Controller {
         Ok(())
     }
 
-    pub fn approve_pending(&mut self) -> Result<PeerView, String> {
-        let pending = self
-            .pending
-            .clone()
-            .ok_or_else(|| "no discovered meshelf device is waiting for approval".to_owned())?;
-        let local_status = self
-            .last_status
-            .as_ref()
-            .ok_or_else(|| "local Tailscale identity is unavailable".to_owned())?;
-        let node_id = local_status
-            .self_node
-            .node_id
-            .clone()
-            .ok_or_else(|| "local Tailscale node has no stable node ID".to_owned())?;
-        let bootstrap = SshBootstrap::discover(&pending.node).ok_or_else(|| {
-            "no configured SSH route was found for this Tailscale peer".to_owned()
-        })?;
-        let response = bootstrap
-            .authorize(&SshBootstrapRequest::signed(
-                self.identity.device_id,
-                node_id,
-                local_status.self_node.hostname.clone(),
-                local_status.self_node.addresses.clone(),
-                &self.identity,
-            ))
-            .map_err(|error| format!("one-side SSH bootstrap failed: {error}"))?;
-        if response.device_id != pending.server.device_id
-            || response.node_id != pending.node.node_id.clone().unwrap_or_default()
-            || response.public_key != pending.server.public_key
-            || !response.has_valid_signature()
-        {
-            return Err("SSH bootstrap identity mismatch".to_owned());
-        }
-        let device_id = pending.server.device_id;
-        let response_node = response_to_tail_node(&response);
-        let key = response.public_key.clone();
-        self.installation = InstallationStore::new(self.state_path.clone())
-            .update(self.identity.device_id, |state| {
-                state.peers.accept_signed(&response_node, device_id, key)
-            })
-            .map_err(|error| format!("could not save reciprocal peer approval: {error}"))?;
-        self.selected_device = Some(device_id);
-        self.pending = None;
-        Ok(self.view())
-    }
-
     pub fn select_peer(&mut self, selector: Option<&str>) -> Result<(), String> {
         if let Some(selector) = selector {
             if let Ok(device_id) = selector.parse::<meshelf_core::DeviceId>()
@@ -402,7 +410,6 @@ impl Controller {
         PeerView {
             name: selected_name.unwrap_or_else(|| "Not configured".to_owned()),
             online: !names.is_empty(),
-            approval_available: self.pending.is_some(),
             status,
             reachable_names,
         }
@@ -418,18 +425,6 @@ impl Controller {
             .collect::<Vec<_>>();
         names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
         names
-    }
-}
-
-#[must_use]
-pub fn response_to_tail_node(response: &meshelf_tailscale::SshBootstrapResponse) -> TailNode {
-    TailNode {
-        node_id: Some(response.node_id.clone()),
-        hostname: response.hostname.clone(),
-        dns_name: None,
-        addresses: response.addresses.clone(),
-        online: true,
-        active: true,
     }
 }
 
@@ -493,7 +488,6 @@ mod restored_control_tests {
             probe: Arc::new(FakeProbe::default()),
             last_status: None,
             reachable_peers: HashMap::new(),
-            pending: None,
             selected_device: None,
         };
         (directory, controller)
@@ -630,7 +624,7 @@ mod restored_control_tests {
     }
 
     #[test]
-    fn stale_resident_controller_preserves_ssh_bootstrap() {
+    fn stale_resident_controller_preserves_already_paired_peer() {
         let (_directory, mut controller) = test_controller();
         let peer_identity = InstallationIdentity::generate();
         let peer_id = pair_test_peer_with_identity(
@@ -869,5 +863,211 @@ mod restored_control_tests {
                 .by_device_id(unpaired_identity.device_id)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn version_mismatch_is_reported_distinctly_from_unreachable() {
+        let mismatch = classify_announce_result(
+            "BZOT".to_owned(),
+            Err(NetError::ProtocolMismatch {
+                peer: "BZOT".to_owned(),
+                version: 1,
+                expected: V2_PROTOCOL_VERSION,
+            }),
+        );
+        let unreachable = classify_announce_result(
+            "BMBA".to_owned(),
+            Err(NetError::Unavailable(
+                "announce connect timed out".to_owned(),
+            )),
+        );
+        let mut report = MeshSendReport {
+            stored_on: Vec::new(),
+            unavailable: Vec::new(),
+            version_mismatch: Vec::new(),
+        };
+        match mismatch {
+            AnnouncePeerOutcome::VersionMismatch(reason) => report.version_mismatch.push(reason),
+            other => panic!("expected version mismatch, got {other:?}"),
+        }
+        match unreachable {
+            AnnouncePeerOutcome::Unavailable(hostname) => report.unavailable.push(hostname),
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+
+        let message = report.status();
+
+        assert_eq!(report.unavailable, ["BMBA"]);
+        assert!(
+            report
+                .version_mismatch
+                .iter()
+                .any(|reason| reason.contains("BZOT"))
+        );
+        assert!(!report.unavailable.iter().any(|name| name.contains("BZOT")));
+        assert!(message.contains("BMBA"));
+        assert!(message.contains("unavailable"));
+        assert!(message.contains("BZOT"));
+        assert!(
+            !message.contains("unavailable BMBA, BZOT")
+                && !message.contains("unavailable: BMBA, BZOT")
+                && !message.contains("unavailable BZOT")
+        );
+    }
+
+    #[test]
+    fn version_mismatch_message_names_the_peer_and_says_to_update() {
+        let from_server_hello = classify_announce_result(
+            "BZOT".to_owned(),
+            Err(NetError::ProtocolMismatch {
+                peer: "BZOT".to_owned(),
+                version: 1,
+                expected: V2_PROTOCOL_VERSION,
+            }),
+        );
+        let AnnouncePeerOutcome::VersionMismatch(message) = from_server_hello else {
+            panic!("v1 server hello must be a version mismatch");
+        };
+        assert!(message.contains("BZOT"));
+        assert!(message.contains("protocol 1"));
+        assert!(message.to_ascii_lowercase().contains("update"));
+        assert!(message.contains("protocol 2"));
+
+        let listener_reason = meshelf_net::v1_client_refusal_reason("BZOT", DeviceId::new(), 1);
+        let from_listener = classify_announce_result(
+            "BZOT".to_owned(),
+            Err(NetError::Rejected(listener_reason.clone())),
+        );
+        let AnnouncePeerOutcome::VersionMismatch(carried) = from_listener else {
+            panic!("listener refusal reason must reach the sender");
+        };
+        assert_eq!(carried, listener_reason);
+        assert!(carried.contains("BZOT"));
+        assert!(carried.contains("protocol version 1"));
+        assert!(carried.to_ascii_lowercase().contains("update"));
+    }
+
+    #[test]
+    fn partial_announcement_reports_which_peers_missed_it_and_why() {
+        let report = MeshSendReport {
+            stored_on: vec!["BMST".to_owned()],
+            unavailable: vec!["BMBA".to_owned()],
+            version_mismatch: vec![
+                NetError::ProtocolMismatch {
+                    peer: "BZOT".to_owned(),
+                    version: 1,
+                    expected: V2_PROTOCOL_VERSION,
+                }
+                .to_string(),
+            ],
+        };
+
+        let status = report_announce_outcome(report).expect("partial success is not total failure");
+
+        assert!(status.contains("1 device") || status.contains("BMST"));
+        assert!(status.contains("BMBA"));
+        assert!(status.contains("unavailable"));
+        assert!(status.contains("BZOT"));
+        assert!(status.contains("protocol 1"));
+        assert!(status.to_ascii_lowercase().contains("update"));
+        assert!(
+            !status.contains("unavailable BMBA, BZOT")
+                && !status.contains("unavailable: BMBA, BZOT")
+                && !status.contains("unavailable BZOT")
+        );
+        assert_ne!(status, "Added to 1 device");
+        assert!(!status.eq_ignore_ascii_case("offer announced to the mesh"));
+    }
+
+    #[test]
+    fn no_ssh_trust_path_is_reachable_from_production() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+        let forbidden = [
+            "trust-ssh",
+            "pair-stdio",
+            "approve_pending",
+            "SshBootstrap",
+            "meshelf-bootstrap",
+            "ssh_trust_available",
+            "--ssh-bootstrap-stdin",
+        ];
+        let mut scanned = 0_usize;
+        visit_production_sources(&root, &root, &forbidden, &mut scanned);
+        assert!(
+            scanned > 20,
+            "production scan must cover the source tree, not an empty walk ({scanned} files)"
+        );
+    }
+
+    fn visit_production_sources(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        forbidden: &[&str],
+        scanned: &mut usize,
+    ) {
+        const SKIP_DIRS: &[&str] = &[
+            ".git",
+            "target",
+            "do",
+            "status",
+            "release",
+            "_icon_work",
+            "local-data",
+            "__pycache__",
+            ".venv",
+            ".idea",
+            ".vscode",
+            ".worktrees",
+            "docs",
+            "prompts",
+            "handoffs",
+            "manifests",
+            "config",
+            "assets",
+            "tests",
+        ];
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if SKIP_DIRS.iter().any(|skip| name == *skip) {
+                    continue;
+                }
+                visit_production_sources(root, &path, forbidden, scanned);
+                continue;
+            }
+            if name.contains("sync-conflict-") {
+                continue;
+            }
+            let extension = path.extension().and_then(|ext| ext.to_str());
+            if !matches!(extension, Some("rs" | "toml" | "ps1" | "sh")) {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let production = if extension == Some("rs") {
+                source
+                    .split("\n#[cfg(test)]\nmod ")
+                    .next()
+                    .expect("production source")
+            } else {
+                &source
+            };
+            *scanned += 1;
+            for token in forbidden {
+                assert!(
+                    !production.contains(token),
+                    "{} still exposes {token}",
+                    path.strip_prefix(root).unwrap_or(&path).display()
+                );
+            }
+        }
     }
 }

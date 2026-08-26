@@ -2,7 +2,6 @@
 param(
     [string]$OutputDirectory = "",
     [switch]$Install,
-    [switch]$EnableStartAtLogin,
     [switch]$Launch
 )
 
@@ -73,9 +72,6 @@ Set-Content -LiteralPath "$zip.sha256" -Encoding ascii -Value "$zipHash  $([Syst
 
 if ($Install) {
     $installArgs = @{ SourceDirectory = $stage }
-    if ($EnableStartAtLogin) {
-        $installArgs.EnableStartAtLogin = $true
-    }
     if ($Launch) {
         $installArgs.Launch = $true
     }

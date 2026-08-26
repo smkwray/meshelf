@@ -49,6 +49,7 @@ pub enum LocalResponse {
         offer_id: OfferId,
         descriptor: OfferDescriptor,
         announcements: Vec<PeerAnnouncement>,
+        status: String,
     },
     NoPeers,
     RefusalRecorded,
@@ -80,7 +81,7 @@ pub enum LocalResponse {
 /// durable authority; these hooks are the only place a binary attaches network fan-out and a real
 /// fetch worker.
 pub trait LocalRuntime: Send + Sync + 'static {
-    fn announce(&self, plan: &OfferPlan) -> Result<(), String>;
+    fn announce(&self, plan: &OfferPlan) -> Result<String, String>;
     fn activate(&self, plan: &ActivationPlan) -> Result<(), String>;
 }
 
@@ -88,8 +89,8 @@ pub trait LocalRuntime: Send + Sync + 'static {
 pub struct NoopRuntime;
 
 impl LocalRuntime for NoopRuntime {
-    fn announce(&self, _plan: &OfferPlan) -> Result<(), String> {
-        Ok(())
+    fn announce(&self, _plan: &OfferPlan) -> Result<String, String> {
+        Ok(String::new())
     }
 
     fn activate(&self, _plan: &ActivationPlan) -> Result<(), String> {
@@ -151,10 +152,11 @@ pub fn dispatch_with_runtime(
             }
             match coordinator.create_offer(OfferInput::Text(text)) {
                 Ok(Some(plan)) => match runtime.announce(&plan) {
-                    Ok(()) => LocalResponse::OfferCreated {
+                    Ok(status) => LocalResponse::OfferCreated {
                         offer_id: plan.offer_id,
                         descriptor: plan.descriptor,
                         announcements: plan.announcements,
+                        status,
                     },
                     Err(message) => LocalResponse::Error { message },
                 },
@@ -165,10 +167,11 @@ pub fn dispatch_with_runtime(
         LocalRequest::AnnouncePath { path } => {
             match coordinator.create_offer(OfferInput::Path(path)) {
                 Ok(Some(plan)) => match runtime.announce(&plan) {
-                    Ok(()) => LocalResponse::OfferCreated {
+                    Ok(status) => LocalResponse::OfferCreated {
                         offer_id: plan.offer_id,
                         descriptor: plan.descriptor,
                         announcements: plan.announcements,
+                        status,
                     },
                     Err(message) => LocalResponse::Error { message },
                 },
@@ -215,10 +218,8 @@ pub fn dispatch_with_runtime(
             }
         }
         LocalRequest::CancelActivation { activation_id } => {
-            // The desktop owns active connection handles. This response is intentionally a
-            // routed acknowledgement; the UI cancellation path invokes the same fetch task's
-            // abort handle locally, while headless clients can use it for parity once resident
-            // activation execution is enabled at the protocol cutover.
+            // The desktop owns active connection handles. This response is a routed
+            // acknowledgement; the UI cancellation path aborts the in-process fetch task.
             LocalResponse::ActivationCancelled { activation_id }
         }
     }
@@ -271,9 +272,9 @@ mod tests {
     }
 
     impl LocalRuntime for RecordingRuntime {
-        fn announce(&self, _plan: &OfferPlan) -> Result<(), String> {
+        fn announce(&self, _plan: &OfferPlan) -> Result<String, String> {
             self.announces.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(String::new())
         }
 
         fn activate(&self, _plan: &ActivationPlan) -> Result<(), String> {
@@ -285,7 +286,7 @@ mod tests {
     struct ClipboardFailingRuntime;
 
     impl LocalRuntime for ClipboardFailingRuntime {
-        fn announce(&self, _plan: &OfferPlan) -> Result<(), String> {
+        fn announce(&self, _plan: &OfferPlan) -> Result<String, String> {
             unreachable!("clipboard failure runtime does not announce")
         }
 
@@ -395,6 +396,41 @@ mod tests {
         assert!(matches!(response, LocalResponse::OfferCreated { .. }));
         assert_eq!(runtime.announces.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.activations.load(Ordering::SeqCst), 0);
+    }
+
+    struct PartialAnnounceRuntime;
+
+    impl LocalRuntime for PartialAnnounceRuntime {
+        fn announce(&self, _plan: &OfferPlan) -> Result<String, String> {
+            Ok(
+                "Added to 1 device; BZOT is running Meshelf protocol 1; update it to protocol 2."
+                    .to_owned(),
+            )
+        }
+
+        fn activate(&self, _plan: &ActivationPlan) -> Result<(), String> {
+            unreachable!("partial announce runtime does not activate")
+        }
+    }
+
+    #[test]
+    fn offer_created_carries_the_announce_outcome_status() {
+        let directory = tempdir().expect("temporary directory");
+        let (coordinator, _store, _identity, _peer) = coordinator_with_peer(&directory);
+        let response = dispatch_with_runtime(
+            &coordinator,
+            LocalRequest::AnnounceText {
+                text: "partial".to_owned(),
+            },
+            &PartialAnnounceRuntime,
+        );
+        let LocalResponse::OfferCreated { status, .. } = response else {
+            panic!("expected offer created, got {response:?}");
+        };
+        assert!(status.contains("1 device"));
+        assert!(status.contains("BZOT"));
+        assert!(status.contains("protocol 1"));
+        assert!(status.to_ascii_lowercase().contains("update"));
     }
 
     #[test]

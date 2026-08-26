@@ -3140,17 +3140,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "meshelf-bootstrap"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs",
- "meshelf-identity",
- "meshelf-tailscale",
- "serde_json",
-]
-
-[[package]]
 name = "meshelf-control"
 version = "0.1.0"
 dependencies = [
@@ -3186,7 +3175,6 @@ dependencies = [
  "anyhow",
  "dirs",
  "i-slint-backend-testing",
- "meshelf-bootstrap",
  "meshelf-control",
  "meshelf-core",
  "meshelf-identity",
@@ -3307,7 +3295,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
- "meshelf-bootstrap",
  "meshelf-control",
  "meshelf-core",
  "meshelf-identity",

@@ -12,6 +12,7 @@ use meshelf_control::{
     ActivationPlan, Controller, MESHELF_PORT, OfferPlan, announce_offer_plan,
     coordinator::Coordinator,
     local_control::{self, LocalRequest, LocalResponse, LocalRuntime},
+    report_announce_outcome,
 };
 use meshelf_core::{
     ActivationMode, ClipboardError, ClipboardSink, DeviceId, OfferDescriptor, OfferId,
@@ -39,10 +40,6 @@ fn main() -> Result<()> {
     let Some(command) = args.next() else {
         return usage();
     };
-    if command == "pair-stdio" {
-        return meshelf_bootstrap::run_stdio();
-    }
-
     let remaining = args.collect::<Vec<_>>();
     if command == "serve" {
         return run_serve(remaining);
@@ -83,22 +80,7 @@ fn main() -> Result<()> {
                 println!("{}", view.status);
                 println!("peer: {}", view.name);
                 println!("online: {}", view.online);
-                println!("ssh_trust_available: {}", view.approval_available);
             }
-        }
-        "trust-ssh" | "approve" => {
-            controller
-                .refresh()
-                .map_err(|error| anyhow::anyhow!(error))?;
-            if selector.is_some() {
-                bail!(
-                    "peer selection for a pending discovery is not needed; refresh exposes the first candidate"
-                )
-            }
-            let view = controller
-                .approve_pending()
-                .map_err(|error| anyhow::anyhow!(error))?;
-            println!("trusted both ways: {}", view.name);
         }
         "clipboard-read" | "paste-clipboard" => {
             let clipboard =
@@ -287,20 +269,13 @@ struct HeadlessRuntime {
 }
 
 impl LocalRuntime for HeadlessRuntime {
-    fn announce(&self, plan: &OfferPlan) -> Result<(), String> {
-        let report =
-            announce_offer_plan(&self.state_path, &self.identity, &self.device_name, plan)?;
-        if report.stored_on.is_empty() {
-            return Err(format!(
-                "offer was not stored on any peer{}",
-                if report.unavailable.is_empty() {
-                    String::new()
-                } else {
-                    format!(": unavailable {}", report.unavailable.join(", "))
-                }
-            ));
-        }
-        Ok(())
+    fn announce(&self, plan: &OfferPlan) -> Result<String, String> {
+        report_announce_outcome(announce_offer_plan(
+            &self.state_path,
+            &self.identity,
+            &self.device_name,
+            plan,
+        )?)
     }
 
     fn activate(&self, plan: &ActivationPlan) -> Result<(), String> {
@@ -554,13 +529,8 @@ fn submit_announce_request(config: &std::path::Path, request: LocalRequest) -> R
         control_request(config, &encoded).context("could not contact the meshelf resident")?;
     match serde_json::from_slice::<LocalResponse>(&response)? {
         LocalResponse::OfferCreated {
-            offer_id,
-            announcements,
-            ..
-        } => println!(
-            "Announced offer {offer_id} to {} paired device(s)",
-            announcements.len()
-        ),
+            offer_id, status, ..
+        } => println!("Announced offer {offer_id}: {status}"),
         LocalResponse::NoPeers => bail!("no other meshelf device is paired"),
         LocalResponse::Error { message } => bail!("{message}"),
         other => bail!("resident returned an unexpected response: {other:?}"),
@@ -615,13 +585,8 @@ fn run_announce(args: Vec<String>) -> Result<()> {
     let response: LocalResponse = serde_json::from_slice(&response)?;
     match response {
         LocalResponse::OfferCreated {
-            offer_id,
-            announcements,
-            ..
-        } => println!(
-            "Announced offer {offer_id} to {} paired device(s)",
-            announcements.len()
-        ),
+            offer_id, status, ..
+        } => println!("Announced offer {offer_id}: {status}"),
         LocalResponse::NoPeers => bail!("no other meshelf device is paired"),
         LocalResponse::Error { message } => bail!("{message}"),
         LocalResponse::RefusalRecorded | LocalResponse::Settings { .. } => {
@@ -705,6 +670,6 @@ fn run_activate(args: Vec<String>) -> Result<()> {
 
 fn usage() -> Result<()> {
     bail!(
-        "usage: meshelfctl [status|refresh|trust-ssh|clipboard-read|send|serve|announce|shelf|activate] [--peer NAME_OR_ID]\n  send requires exactly one of --clipboard, --stdin, or --text TEXT\n  announce requires exactly one of --clipboard, --text TEXT, --stdin, or --path PATH\n  activate requires OFFER_ID and optionally --save\n  pair-stdio is the fixed SSH bootstrap command"
+        "usage: meshelfctl [status|refresh|clipboard-read|send|serve|announce|shelf|activate] [--peer NAME_OR_ID]\n  send requires exactly one of --clipboard, --stdin, or --text TEXT\n  announce requires exactly one of --clipboard, --text TEXT, --stdin, or --path PATH\n  activate requires OFFER_ID and optionally --save"
     )
 }

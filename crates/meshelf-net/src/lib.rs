@@ -2177,9 +2177,16 @@ fn require_v2_server_hello(
     operation: &str,
 ) -> Result<(), NetError> {
     if server.protocol_version != V2_PROTOCOL_VERSION {
-        return Err(NetError::Rejected(format!(
-            "{operation} server uses an unsupported protocol version"
-        )));
+        let peer = if server.device_name.trim().is_empty() {
+            "peer".to_owned()
+        } else {
+            server.device_name.clone()
+        };
+        return Err(NetError::ProtocolMismatch {
+            peer,
+            version: server.protocol_version,
+            expected: V2_PROTOCOL_VERSION,
+        });
     }
     if !server
         .capabilities
@@ -2306,6 +2313,17 @@ async fn refuse_excess_connection(
     .await
 }
 
+#[must_use]
+pub fn v1_client_refusal_reason(
+    device_name: &str,
+    device_id: DeviceId,
+    protocol_version: u16,
+) -> String {
+    format!(
+        "Peer {device_name} ({device_id}) uses protocol version {protocol_version}; update it to meshelf protocol 2"
+    )
+}
+
 async fn handle_v2_connection<G>(
     mut stream: TcpStream,
     remote: SocketAddr,
@@ -2321,10 +2339,8 @@ where
     )
     .await?;
     if hello.protocol_version != V2_PROTOCOL_VERSION {
-        let reason = format!(
-            "Peer {} ({}) uses protocol version {}; update it to meshelf protocol 2",
-            hello.device_name, hello.device_id, hello.protocol_version
-        );
+        let reason =
+            v1_client_refusal_reason(&hello.device_name, hello.device_id, hello.protocol_version);
         let refusal = WireMessage::ServerHello(ServerHello::signed(
             V2_PROTOCOL_VERSION,
             context.identity.device_id(),
@@ -2469,6 +2485,12 @@ pub enum NetError {
     Timeout(&'static str),
     #[error("peer rejected connection: {0}")]
     Rejected(String),
+    #[error("{peer} is running Meshelf protocol {version}; update it to protocol {expected}.")]
+    ProtocolMismatch {
+        peer: String,
+        version: u16,
+        expected: u16,
+    },
     #[error("peer unavailable: {0}")]
     Unavailable(String),
     #[error("unexpected wire message: {0}")]
@@ -2755,6 +2777,66 @@ mod tests {
         assert!(
             matches!(result, Err(NetError::Rejected(reason)) if reason.contains("offer-pull-v2"))
         );
+        server.await.expect("server join");
+    }
+
+    #[tokio::test]
+    async fn announcement_client_reports_protocol_mismatch_from_v1_server() {
+        let client_identity = InstallationIdentity::generate();
+        let server_identity = InstallationIdentity::generate();
+        let response_identity = server_identity.clone();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let _ = read_frame_async(&mut stream).await.expect("hello");
+            let response = WireMessage::ServerHello(ServerHello::signed(
+                1,
+                server_identity.device_id,
+                "BZOT".to_owned(),
+                true,
+                None,
+                vec!["text-shelf-v1".to_owned()],
+                &response_identity,
+            ));
+            write_frame_async(&mut stream, &response)
+                .await
+                .expect("response");
+        });
+        let announcement = OfferAnnouncement::new(
+            OfferId::new(),
+            client_identity.device_id,
+            server_identity.device_id,
+            1,
+            OfferDescriptor::text("announcement").expect("descriptor"),
+        );
+        let result = PeerClient::default()
+            .announce_offer_v2(
+                address,
+                ClientHello::signed_v2(
+                    client_identity.device_id,
+                    "client",
+                    "nonce",
+                    &client_identity,
+                ),
+                announcement,
+                &server_identity.public_key(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(NetError::ProtocolMismatch {
+                ref peer,
+                version: 1,
+                expected: V2_PROTOCOL_VERSION,
+            }) if peer == "BZOT"
+        ));
+        let message = result.expect_err("protocol mismatch").to_string();
+        assert!(message.contains("BZOT"));
+        assert!(message.contains("protocol 1"));
+        assert!(message.to_ascii_lowercase().contains("update"));
         server.await.expect("server join");
     }
 

@@ -1,8 +1,6 @@
-//! Filesystem primitives used by later pull-v2 admission and publication steps.
+//! Filesystem primitives for pull-v2 admission, staging, and publication.
 //!
-//! These helpers are deliberately platform-facing and are not called by the production entry
-//! point in Step 3. In particular, a free-space report is never a substitute for successful
-//! preallocation.
+//! A free-space report is never a substitute for successful preallocation.
 
 use std::{
     fs::{self, File},

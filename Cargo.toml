@@ -3,7 +3,6 @@ members = [
     "apps/desktop",
     "apps/meshelfctl",
     "crates/meshelf-core",
-    "crates/meshelf-bootstrap",
     "crates/meshelf-control",
     "crates/meshelf-identity",
     "crates/meshelf-net",

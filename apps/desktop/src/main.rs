@@ -22,6 +22,7 @@ use meshelf_control::{
     coordinator::{Coordinator, OfferPlan},
     local_control::{self, LocalRuntime},
     offer_source::OfferInput,
+    report_announce_outcome,
 };
 use meshelf_core::{
     ActivationMode, CardAvailability, ClipboardError, ClipboardSink, DeviceId, OfferCardRecord,
@@ -200,20 +201,13 @@ struct DesktopLocalRuntime {
 }
 
 impl LocalRuntime for DesktopLocalRuntime {
-    fn announce(&self, plan: &OfferPlan) -> Result<(), String> {
-        let report =
-            announce_offer_plan(&self.state_path, &self.identity, &self.device_name, plan)?;
-        if report.stored_on.is_empty() {
-            return Err(format!(
-                "offer was not stored on any peer{}",
-                if report.unavailable.is_empty() {
-                    String::new()
-                } else {
-                    format!(": unavailable {}", report.unavailable.join(", "))
-                }
-            ));
-        }
-        Ok(())
+    fn announce(&self, plan: &OfferPlan) -> Result<String, String> {
+        report_announce_outcome(announce_offer_plan(
+            &self.state_path,
+            &self.identity,
+            &self.device_name,
+            plan,
+        )?)
     }
 
     fn activate(&self, plan: &ActivationPlan) -> Result<(), String> {
@@ -373,7 +367,7 @@ fn create_and_announce(
     coordinator: &Coordinator,
     runtime: &dyn LocalRuntime,
     input: OfferInput,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let Some(plan) = coordinator.create_offer(input)? else {
         return Err("no other meshelf device is paired".to_owned());
     };
@@ -795,12 +789,6 @@ fn run_activation(
 }
 
 fn main() -> Result<()> {
-    if std::env::args()
-        .any(|argument| argument == "pair-stdio" || argument == "--ssh-bootstrap-stdin")
-    {
-        return meshelf_bootstrap::run_stdio();
-    }
-
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -996,7 +984,6 @@ fn main() -> Result<()> {
                                                 local_runtime.as_ref(),
                                                 OfferInput::Text(text),
                                             )
-                                            .map(|()| "Offer announced to the mesh".to_owned())
                                         }
                                         ClipboardItem::Files(paths) => {
                                             if paths.is_empty() {
@@ -1005,14 +992,15 @@ fn main() -> Result<()> {
                                                         .to_owned(),
                                                 );
                                             }
+                                            let mut statuses = Vec::new();
                                             for path in paths {
-                                                create_and_announce(
+                                                statuses.push(create_and_announce(
                                                     &coordinator,
                                                     local_runtime.as_ref(),
                                                     OfferInput::Path(path),
-                                                )?;
+                                                )?);
                                             }
-                                            Ok("Offer announced to the mesh".to_owned())
+                                            Ok(statuses.join("; "))
                                         }
                                     });
                                 drop(permit);
@@ -1472,7 +1460,6 @@ mod tests {
             PeerView {
                 name: "BZOT".to_owned(),
                 online: true,
-                approval_available: false,
                 status: "2 devices reachable · paste text or copied files".to_owned(),
                 reachable_names: "BMBA\nBZOT".to_owned(),
             },
@@ -1490,7 +1477,6 @@ mod tests {
             PeerView {
                 name: "BZOT".to_owned(),
                 online: true,
-                approval_available: false,
                 status: "1 device reachable · paste text or copied files".to_owned(),
                 reachable_names: "BZOT".to_owned(),
             },
