@@ -34,6 +34,7 @@ pub trait ClipboardSource: Send + Sync + 'static {
 #[error("platform clipboard error: {message}")]
 pub struct PlatformClipboardError {
     message: String,
+    uncertain: bool,
 }
 
 impl PlatformClipboardError {
@@ -41,6 +42,30 @@ impl PlatformClipboardError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            uncertain: false,
+        }
+    }
+
+    #[must_use]
+    fn uncertain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain: true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_uncertain(&self) -> bool {
+        self.uncertain
+    }
+}
+
+impl From<PlatformClipboardError> for ClipboardError {
+    fn from(error: PlatformClipboardError) -> Self {
+        if error.is_uncertain() {
+            Self::uncertain(error.to_string())
+        } else {
+            Self::new(error.to_string())
         }
     }
 }
@@ -123,7 +148,11 @@ impl ClipboardWorker {
             })?;
         response_rx
             .recv()
-            .map_err(|error| PlatformClipboardError::new(error.to_string()))?
+            .map_err(|error| {
+                PlatformClipboardError::uncertain(format!(
+                    "clipboard worker stopped after accepting the operation: {error}"
+                ))
+            })?
             .map_err(PlatformClipboardError::new)
     }
 
@@ -145,7 +174,19 @@ impl ClipboardSource for ClipboardWorker {
 impl ClipboardSink for ClipboardWorker {
     fn set_text(&self, text: &str) -> Result<(), ClipboardError> {
         self.request(|response| ClipboardCommand::Write(text.to_owned(), response))
-            .map_err(|error| ClipboardError::new(error.to_string()))
+            .map_err(ClipboardError::from)
+    }
+}
+
+fn require_exact_text(expected: &str, observed: &str) -> Result<(), String> {
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "clipboard text verification failed: wrote {} UTF-8 bytes but read back {}",
+            expected.len(),
+            observed.len()
+        ))
     }
 }
 
@@ -177,7 +218,15 @@ fn clipboard_thread(
                 let _ = response.send(result);
             }
             ClipboardCommand::Write(text, response) => {
-                let result = clipboard.set_text(text).map_err(|error| error.to_string());
+                let result = clipboard
+                    .set_text(&text)
+                    .map_err(|error| format!("clipboard text write failed: {error}"))
+                    .and_then(|()| {
+                        clipboard.get_text().map_err(|error| {
+                            format!("clipboard text verification read failed: {error}")
+                        })
+                    })
+                    .and_then(|observed| require_exact_text(&text, &observed));
                 let _ = response.send(result);
             }
             ClipboardCommand::WriteFiles(paths, response) => {
@@ -193,5 +242,20 @@ fn clipboard_thread(
             }
             ClipboardCommand::Shutdown => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_text_verification_rejects_a_stale_clipboard() {
+        assert!(require_exact_text("offered text", "offered text").is_ok());
+        let error = require_exact_text("offered text", "stale clipboard")
+            .expect_err("stale clipboard must not verify");
+        assert!(error.contains("wrote 12 UTF-8 bytes but read back 15"));
+        assert!(!error.contains("offered text"));
+        assert!(!error.contains("stale clipboard"));
     }
 }

@@ -225,13 +225,8 @@ impl LocalRuntime for DesktopLocalRuntime {
         let clipboard = clipboard_for_activation(plan.mode, self.clipboard.clone())?;
         let offer_store = self.offer_store.clone();
         let state_root = self.state_root.clone();
-        thread::spawn(move || {
-            let (_cancel, cancel) = watch::channel(false);
-            if let Err(error) = run_activation(input, offer_store, clipboard, state_root, cancel) {
-                tracing::warn!(%error, "headless offer activation failed");
-            }
-        });
-        Ok(())
+        let (_cancel, cancel) = watch::channel(false);
+        run_activation(input, offer_store, clipboard, state_root, cancel)
     }
 }
 
@@ -265,9 +260,7 @@ enum ActivationClipboard {
 impl ClipboardSink for ActivationClipboard {
     fn set_text(&self, text: &str) -> Result<(), ClipboardError> {
         match self {
-            Self::Worker(worker) => worker
-                .set_text(text)
-                .map_err(|error| ClipboardError::new(error.to_string())),
+            Self::Worker(worker) => worker.set_text(text),
             Self::Unavailable => Err(ClipboardError::new(
                 "clipboard adapter is unavailable for this activation",
             )),
@@ -278,9 +271,7 @@ impl ClipboardSink for ActivationClipboard {
 impl FetchClipboard for ActivationClipboard {
     fn set_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
         match self {
-            Self::Worker(worker) => worker
-                .set_files(paths)
-                .map_err(|error| ClipboardError::new(error.to_string())),
+            Self::Worker(worker) => worker.set_files(paths).map_err(ClipboardError::from),
             Self::Unavailable => Err(ClipboardError::new(
                 "clipboard adapter is unavailable for this activation",
             )),
@@ -714,7 +705,12 @@ fn build_activation_input(
         plan.activation_id.to_string(),
         &state.identity,
     );
-    let request = FetchRequest::new(plan.offer_id, plan.source_device, state.identity.device_id);
+    let request = FetchRequest {
+        request_id: plan.activation_id,
+        offer_id: plan.offer_id,
+        source_device: plan.source_device,
+        requester_device: state.identity.device_id,
+    };
     let activation = FetchActivation::new(
         request.request_id,
         plan.source_device,

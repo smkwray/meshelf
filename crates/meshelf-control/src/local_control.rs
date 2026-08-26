@@ -58,10 +58,12 @@ pub enum LocalResponse {
     Shelf {
         offers: Vec<OfferCardRecord>,
     },
-    ActivationStarted {
+    ActivationCompleted {
         activation_id: ActivationId,
         offer_id: OfferId,
         mode: ActivationMode,
+        files_processed: u32,
+        bytes_processed: u64,
     },
     ActivationCancelled {
         activation_id: ActivationId,
@@ -196,11 +198,17 @@ pub fn dispatch_with_runtime(
         LocalRequest::ActivateOffer { offer_id, mode } => {
             match coordinator.plan_activation(offer_id, mode) {
                 Ok(plan) => match runtime.activate(&plan) {
-                    Ok(()) => LocalResponse::ActivationStarted {
-                        activation_id: plan.activation_id,
-                        offer_id: plan.offer_id,
-                        mode: plan.mode,
-                    },
+                    Ok(()) => {
+                        let (files_processed, bytes_processed) =
+                            descriptor_counts(&plan.descriptor);
+                        LocalResponse::ActivationCompleted {
+                            activation_id: plan.activation_id,
+                            offer_id: plan.offer_id,
+                            mode: plan.mode,
+                            files_processed,
+                            bytes_processed,
+                        }
+                    }
                     Err(message) => LocalResponse::ActivationRefused { message },
                 },
                 Err(message) => LocalResponse::ActivationRefused { message },
@@ -213,6 +221,18 @@ pub fn dispatch_with_runtime(
             // activation execution is enabled at the protocol cutover.
             LocalResponse::ActivationCancelled { activation_id }
         }
+    }
+}
+
+fn descriptor_counts(descriptor: &OfferDescriptor) -> (u32, u64) {
+    match descriptor {
+        OfferDescriptor::Text { utf8_bytes, .. } => (0, u64::from(*utf8_bytes)),
+        OfferDescriptor::File { total_bytes, .. } => (1, *total_bytes),
+        OfferDescriptor::Folder {
+            file_count,
+            total_bytes,
+            ..
+        } => (*file_count, *total_bytes),
     }
 }
 
@@ -259,6 +279,21 @@ mod tests {
         fn activate(&self, _plan: &ActivationPlan) -> Result<(), String> {
             self.activations.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    struct ClipboardFailingRuntime;
+
+    impl LocalRuntime for ClipboardFailingRuntime {
+        fn announce(&self, _plan: &OfferPlan) -> Result<(), String> {
+            unreachable!("clipboard failure runtime does not announce")
+        }
+
+        fn activate(&self, _plan: &ActivationPlan) -> Result<(), String> {
+            Err(
+                "fetch ended with ClipboardFailed (files 0, bytes 440): verification mismatch"
+                    .to_owned(),
+            )
         }
     }
 
@@ -384,8 +419,46 @@ mod tests {
             },
             &runtime,
         );
-        assert!(matches!(response, LocalResponse::ActivationStarted { .. }));
+        assert!(matches!(
+            response,
+            LocalResponse::ActivationCompleted {
+                files_processed: 0,
+                bytes_processed: 4,
+                ..
+            }
+        ));
         assert_eq!(runtime.activations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn clipboard_failure_cannot_be_reported_as_activation_completed() {
+        let directory = tempdir().expect("temporary directory");
+        let (coordinator, store, _identity, source_device) = coordinator_with_peer(&directory);
+        store
+            .insert_offer_card(OfferCardInput::new(
+                source_device,
+                OfferId::new(),
+                OfferDescriptor::text("x".repeat(440)).expect("descriptor"),
+                CardAvailability::Available,
+            ))
+            .expect("card");
+        let offer_id = store.read_offer_shelf().expect("shelf")[0].offer_id;
+
+        let response = dispatch_with_runtime(
+            &coordinator,
+            LocalRequest::ActivateOffer {
+                offer_id,
+                mode: ActivationMode::Clipboard,
+            },
+            &ClipboardFailingRuntime,
+        );
+
+        assert!(matches!(
+            response,
+            LocalResponse::ActivationRefused { message }
+                if message.contains("ClipboardFailed")
+                    && message.contains("files 0, bytes 440")
+        ));
     }
 
     #[test]

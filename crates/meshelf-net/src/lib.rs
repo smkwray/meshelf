@@ -24,10 +24,10 @@ use meshelf_core::{
 };
 use meshelf_identity::InstallationIdentity;
 use meshelf_protocol::{
-    CAP_OFFER_PULL_V2, ClientHello, OfferAck, OfferAckCode, OfferAnnouncement, ProtocolError,
-    ServerHello, V2_MAX_INBOUND_HANDLERS, V2_PROTOCOL_VERSION, V2Message, WireMessage,
-    read_client_hello_async, read_frame_async, read_v2_frame_async, validate_v2_message,
-    write_frame_async, write_v2_frame_async,
+    CAP_OFFER_PULL_V2, ClientHello, FetchAdmissionCode, FetchReceiptCode, FetchRefusalCode,
+    OfferAck, OfferAckCode, OfferAnnouncement, ProtocolError, ServerHello, V2_MAX_INBOUND_HANDLERS,
+    V2_PROTOCOL_VERSION, V2Message, WireMessage, read_client_hello_async, read_frame_async,
+    read_v2_frame_async, validate_v2_message, write_frame_async, write_v2_frame_async,
 };
 use meshelf_store::RedbV2Store;
 use thiserror::Error;
@@ -2485,6 +2485,33 @@ pub enum NetError {
     FetchService(&'static str),
     #[error("fetch service failed: {0}")]
     FetchServiceOwned(String),
+    #[error(
+        "origin refused fetch with {code:?} (active streams {active_streams}/{max_active_streams}): {detail:?}"
+    )]
+    FetchRefused {
+        code: FetchRefusalCode,
+        active_streams: u32,
+        max_active_streams: u32,
+        detail: Option<String>,
+    },
+    #[error(
+        "receiver refused fetch admission with {code:?} (reserved entries {entries_reserved}, reserved bytes {bytes_reserved}): {detail:?}"
+    )]
+    FetchAdmissionRefused {
+        code: FetchAdmissionCode,
+        entries_reserved: u32,
+        bytes_reserved: u64,
+        detail: Option<String>,
+    },
+    #[error(
+        "fetch ended with {code:?} (files {files_processed}, bytes {bytes_processed}): {detail:?}"
+    )]
+    FetchTerminal {
+        code: FetchReceiptCode,
+        files_processed: u32,
+        bytes_processed: u64,
+        detail: Option<String>,
+    },
     #[error("inbound handler limit was closed")]
     HandlerLimitClosed,
 }

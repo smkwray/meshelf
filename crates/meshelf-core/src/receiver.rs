@@ -4,6 +4,7 @@ use thiserror::Error;
 #[error("clipboard error: {message}")]
 pub struct ClipboardError {
     message: String,
+    uncertain: bool,
 }
 
 impl ClipboardError {
@@ -11,12 +12,26 @@ impl ClipboardError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            uncertain: false,
+        }
+    }
+
+    #[must_use]
+    pub fn uncertain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain: true,
         }
     }
 
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    #[must_use]
+    pub fn is_uncertain(&self) -> bool {
+        self.uncertain
     }
 }
 

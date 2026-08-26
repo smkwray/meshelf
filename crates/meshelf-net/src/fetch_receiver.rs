@@ -77,8 +77,7 @@ pub trait FetchClipboard: ClipboardSink {
 
 impl FetchClipboard for meshelf_platform::ClipboardWorker {
     fn set_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
-        meshelf_platform::ClipboardWorker::set_files(self, paths)
-            .map_err(|error| ClipboardError::new(error.to_string()))
+        meshelf_platform::ClipboardWorker::set_files(self, paths).map_err(ClipboardError::from)
     }
 }
 
@@ -398,21 +397,43 @@ where
             .map_err(|error| NetError::OfferStorage(error.to_string()))?
             .ok_or_else(|| NetError::Rejected("offer card is not available".to_owned()))?;
 
-        let header = self.read_header(stream, io_timeout_duration).await?;
+        let header = match self
+            .read_header(stream, &activation, &card, io_timeout_duration)
+            .await
+        {
+            Ok(header) => header,
+            Err(error) => {
+                let attempt_code = match &error {
+                    NetError::FetchRefused {
+                        code: meshelf_protocol::FetchRefusalCode::SourceUnavailable,
+                        ..
+                    } => OfferAttemptCode::SourceUnavailable,
+                    NetError::FetchRefused {
+                        code: meshelf_protocol::FetchRefusalCode::SourceChanged,
+                        ..
+                    } => OfferAttemptCode::SourceChanged,
+                    NetError::FetchRefused {
+                        code: meshelf_protocol::FetchRefusalCode::Busy,
+                        ..
+                    } => OfferAttemptCode::Busy,
+                    _ => OfferAttemptCode::Failed,
+                };
+                self.record_attempt_with_counts(
+                    &activation,
+                    attempt_code,
+                    0,
+                    0,
+                    Some(safe_detail(&error.to_string())),
+                )?;
+                return Err(error);
+            }
+        };
         let mut plan = match validate_header(&header, &card, &activation) {
             Ok(plan) => plan,
             Err(code) => {
-                self.write_admission(
-                    stream,
-                    activation.request_id,
-                    code,
-                    0,
-                    0,
-                    None,
-                    io_timeout_duration,
-                )
-                .await?;
-                return Ok(());
+                return self
+                    .refuse_admission(stream, &activation, code, None, io_timeout_duration)
+                    .await;
             }
         };
 
@@ -420,30 +441,14 @@ where
             .read_manifest(stream, &header, &mut plan, io_timeout_duration)
             .await
         {
-            self.write_admission(
-                stream,
-                activation.request_id,
-                code,
-                0,
-                0,
-                None,
-                io_timeout_duration,
-            )
-            .await?;
-            return Ok(());
+            return self
+                .refuse_admission(stream, &activation, code, None, io_timeout_duration)
+                .await;
         }
         if let Err(code) = validate_manifest(&header, &card.descriptor, &plan) {
-            self.write_admission(
-                stream,
-                activation.request_id,
-                code,
-                0,
-                0,
-                None,
-                io_timeout_duration,
-            )
-            .await?;
-            return Ok(());
+            return self
+                .refuse_admission(stream, &activation, code, None, io_timeout_duration)
+                .await;
         }
 
         let destination = self.destination_for(&activation, &header.descriptor)?;
@@ -451,37 +456,33 @@ where
             && !header.descriptor.is_text()
             && self.uncertain_clipboard.load(Ordering::Acquire)
         {
-            self.write_admission(
-                stream,
-                activation.request_id,
-                FetchAdmissionCode::RefusedBusy,
-                0,
-                0,
-                Some("clipboard file activation is uncertain after recovery".to_owned()),
-                io_timeout_duration,
-            )
-            .await?;
-            return Ok(());
+            return self
+                .refuse_admission(
+                    stream,
+                    &activation,
+                    FetchAdmissionCode::RefusedBusy,
+                    Some("clipboard file activation is uncertain after recovery".to_owned()),
+                    io_timeout_duration,
+                )
+                .await;
         }
         if let Some(destination) = &destination {
             if let Err(error) = ensure_directory_tree(destination) {
-                self.write_admission(
-                    stream,
-                    activation.request_id,
-                    FetchAdmissionCode::DestinationUnavailable,
-                    0,
-                    0,
-                    Some(safe_detail(&error.to_string())),
-                    io_timeout_duration,
-                )
-                .await?;
-                return Ok(());
+                return self
+                    .refuse_admission(
+                        stream,
+                        &activation,
+                        FetchAdmissionCode::DestinationUnavailable,
+                        Some(safe_detail(&error.to_string())),
+                        io_timeout_duration,
+                    )
+                    .await;
             }
             require_directory(destination)?;
         }
 
         let payload_bytes = plan.total_bytes;
-        let permit = if payload_bytes == 0 {
+        let permit = if !needs_filesystem_reservation(plan.content_kind, payload_bytes) {
             None
         } else {
             let Some(destination) = destination.as_deref() else {
@@ -492,30 +493,26 @@ where
             match self.ledger.reserve(destination, payload_bytes) {
                 Ok(permit) => Some(permit),
                 Err(ReservationError::InsufficientSpace { .. }) => {
-                    self.write_admission(
-                        stream,
-                        activation.request_id,
-                        FetchAdmissionCode::InsufficientSpace,
-                        0,
-                        0,
-                        None,
-                        io_timeout_duration,
-                    )
-                    .await?;
-                    return Ok(());
+                    return self
+                        .refuse_admission(
+                            stream,
+                            &activation,
+                            FetchAdmissionCode::InsufficientSpace,
+                            None,
+                            io_timeout_duration,
+                        )
+                        .await;
                 }
                 Err(error) => {
-                    self.write_admission(
-                        stream,
-                        activation.request_id,
-                        FetchAdmissionCode::DestinationUnavailable,
-                        0,
-                        0,
-                        Some(safe_detail(&error.to_string())),
-                        io_timeout_duration,
-                    )
-                    .await?;
-                    return Ok(());
+                    return self
+                        .refuse_admission(
+                            stream,
+                            &activation,
+                            FetchAdmissionCode::DestinationUnavailable,
+                            Some(safe_detail(&error.to_string())),
+                            io_timeout_duration,
+                        )
+                        .await;
                 }
             }
         };
@@ -549,17 +546,15 @@ where
                 )));
             }
             drop(permit);
-            self.write_admission(
-                stream,
-                activation.request_id,
-                FetchAdmissionCode::AllocationFailed,
-                0,
-                0,
-                Some(safe_detail(&error.to_string())),
-                io_timeout_duration,
-            )
-            .await?;
-            return Ok(());
+            return self
+                .refuse_admission(
+                    stream,
+                    &activation,
+                    FetchAdmissionCode::AllocationFailed,
+                    Some(safe_detail(&error.to_string())),
+                    io_timeout_duration,
+                )
+                .await;
         }
         reject_reparse_point(&staging_root)?;
 
@@ -617,17 +612,24 @@ where
                                 "publication failed: {error}; {cleanup_error}"
                             )));
                         }
-                        self.send_receipt(
-                            stream,
-                            FetchReceiptCode::InternalError,
+                        self.record_attempt_with_counts(
+                            &activation,
+                            OfferAttemptCode::Failed,
                             plan.file_count,
                             plan.total_bytes,
                             Some(safe_detail(&error.to_string())),
-                            &activation,
-                            io_timeout_duration,
-                        )
-                        .await?;
-                        return Ok(());
+                        )?;
+                        return self
+                            .finish_terminal(
+                                stream,
+                                FetchReceiptCode::InternalError,
+                                plan.file_count,
+                                plan.total_bytes,
+                                Some(safe_detail(&error.to_string())),
+                                &activation,
+                                io_timeout_duration,
+                            )
+                            .await;
                     }
                 };
                 match self
@@ -655,17 +657,24 @@ where
                                 "side effect failed: {error}; {cleanup_error}"
                             )));
                         }
-                        self.send_receipt(
-                            stream,
-                            FetchReceiptCode::ClipboardFailed,
+                        self.record_attempt_with_counts(
+                            &activation,
+                            OfferAttemptCode::ClipboardFailed,
                             plan.file_count,
                             plan.total_bytes,
                             Some(safe_detail(&error.to_string())),
-                            &activation,
-                            io_timeout_duration,
-                        )
-                        .await?;
-                        return Ok(());
+                        )?;
+                        return self
+                            .finish_terminal(
+                                stream,
+                                FetchReceiptCode::ClipboardFailed,
+                                plan.file_count,
+                                plan.total_bytes,
+                                Some(safe_detail(&error.to_string())),
+                                &activation,
+                                io_timeout_duration,
+                            )
+                            .await;
                     }
                     Err(SideEffectFailure::Uncertain(error)) => {
                         self.cleanup_blocked.store(true, Ordering::Release);
@@ -766,16 +775,20 @@ where
                     return Err(cleanup_error);
                 }
                 drop(permit);
-                let _ = self.record_attempt_with_counts(
+                let detail = format!("connection lost after {files} files and {bytes} bytes");
+                self.record_attempt_with_counts(
                     &activation,
                     OfferAttemptCode::Failed,
                     files,
                     bytes,
-                    Some(format!(
-                        "connection lost after {files} files and {bytes} bytes"
-                    )),
-                );
-                Ok(())
+                    Some(detail.clone()),
+                )?;
+                Err(NetError::FetchTerminal {
+                    code: FetchReceiptCode::ConnectionLost,
+                    files_processed: files,
+                    bytes_processed: bytes,
+                    detail: Some(detail),
+                })
             }
             Err(ReceiveFailure::Cancelled { files, bytes }) => {
                 let cleanup_result = self
@@ -793,7 +806,7 @@ where
                     bytes,
                     None,
                 )?;
-                self.send_receipt(
+                self.finish_terminal(
                     stream,
                     FetchReceiptCode::Cancelled,
                     files,
@@ -824,7 +837,7 @@ where
                     bytes,
                     Some(detail.clone()),
                 )?;
-                self.send_receipt(
+                self.finish_terminal(
                     stream,
                     FetchReceiptCode::VerificationFailed,
                     files,
@@ -844,7 +857,20 @@ where
                     self.cleanup_blocked.store(true, Ordering::Release);
                     return Err(cleanup_error);
                 }
-                Err(error)
+                let detail = safe_detail(&error.to_string());
+                self.record_attempt_with_counts(
+                    &activation,
+                    OfferAttemptCode::Failed,
+                    0,
+                    0,
+                    Some(detail.clone()),
+                )?;
+                Err(NetError::FetchTerminal {
+                    code: FetchReceiptCode::InternalError,
+                    files_processed: 0,
+                    bytes_processed: 0,
+                    detail: Some(detail),
+                })
             }
         }
     }
@@ -852,6 +878,8 @@ where
     async fn read_header(
         &self,
         stream: &mut TcpStream,
+        activation: &FetchActivation,
+        card: &OfferCardRecord,
         io_timeout_duration: Duration,
     ) -> Result<FetchHeader, NetError> {
         let message = io_timeout(
@@ -861,10 +889,28 @@ where
         )
         .await?;
         validate_v2_message(&message)?;
-        let V2Message::FetchHeader(header) = message else {
-            return Err(NetError::UnexpectedMessage("expected fetch header"));
-        };
-        Ok(header)
+        match message {
+            V2Message::FetchHeader(header) => Ok(header),
+            V2Message::FetchRefusal(refusal) => {
+                if refusal.request_id != activation.request_id
+                    || refusal.offer_id != activation.offer_id
+                {
+                    return Err(NetError::IdentityMismatch(
+                        "fetch refusal does not match the activation".to_owned(),
+                    ));
+                }
+                refusal.validate_for(&card.descriptor)?;
+                Err(NetError::FetchRefused {
+                    code: refusal.code,
+                    active_streams: refusal.active_streams,
+                    max_active_streams: refusal.max_active_streams,
+                    detail: refusal.detail,
+                })
+            }
+            _ => Err(NetError::UnexpectedMessage(
+                "expected fetch header or refusal",
+            )),
+        }
     }
 
     async fn read_manifest(
@@ -1261,11 +1307,9 @@ where
                     ))
                 })
                 .and_then(|text| {
-                    self.clipboard.set_text(text).map_err(|error| {
-                        SideEffectFailure::Terminal(NetError::FetchServiceOwned(
-                            error.message().to_owned(),
-                        ))
-                    })
+                    self.clipboard
+                        .set_text(text)
+                        .map_err(classify_clipboard_failure)
                 }),
             (OfferDescriptor::Text { .. }, ActivationMode::Save, None) => {
                 Err(SideEffectFailure::Terminal(NetError::Rejected(
@@ -1305,9 +1349,11 @@ where
                         self.cleanup_blocked.store(true, Ordering::Release);
                         detail.push_str(&format!("; candidate cleanup failed: {cleanup_error}"));
                     }
-                    return Err(SideEffectFailure::Terminal(NetError::FetchServiceOwned(
-                        detail,
-                    )));
+                    return Err(if error.is_uncertain() {
+                        SideEffectFailure::Uncertain(NetError::FetchServiceOwned(detail))
+                    } else {
+                        SideEffectFailure::Terminal(NetError::FetchServiceOwned(detail))
+                    });
                 }
                 let previous = self
                     .store
@@ -1394,7 +1440,7 @@ where
             plan,
             Some(detail.clone()),
         );
-        self.send_receipt(
+        self.finish_terminal(
             stream,
             FetchReceiptCode::UncertainNoReplay,
             files,
@@ -1404,6 +1450,42 @@ where
             io_timeout_duration,
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn refuse_admission(
+        &self,
+        stream: &mut TcpStream,
+        activation: &FetchActivation,
+        code: FetchAdmissionCode,
+        detail: Option<String>,
+        io_timeout_duration: Duration,
+    ) -> Result<(), NetError> {
+        self.write_admission(
+            stream,
+            activation.request_id,
+            code.clone(),
+            0,
+            0,
+            detail.clone(),
+            io_timeout_duration,
+        )
+        .await?;
+        let attempt_code = match code {
+            FetchAdmissionCode::RefusedBusy => OfferAttemptCode::Busy,
+            FetchAdmissionCode::Cancelled => OfferAttemptCode::Cancelled,
+            _ => OfferAttemptCode::Failed,
+        };
+        let attempt_detail = detail
+            .clone()
+            .or_else(|| Some(format!("fetch admission refused with {code:?}")));
+        self.record_attempt_with_counts(activation, attempt_code, 0, 0, attempt_detail)?;
+        Err(NetError::FetchAdmissionRefused {
+            code,
+            entries_reserved: 0,
+            bytes_reserved: 0,
+            detail,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1461,6 +1543,44 @@ where
             "write fetch receipt",
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_terminal(
+        &self,
+        stream: &mut TcpStream,
+        code: FetchReceiptCode,
+        files_processed: u32,
+        bytes_processed: u64,
+        detail: Option<String>,
+        activation: &FetchActivation,
+        io_timeout_duration: Duration,
+    ) -> Result<(), NetError> {
+        self.send_receipt(
+            stream,
+            code.clone(),
+            files_processed,
+            bytes_processed,
+            detail.clone(),
+            activation,
+            io_timeout_duration,
+        )
+        .await?;
+        Err(NetError::FetchTerminal {
+            code,
+            files_processed,
+            bytes_processed,
+            detail,
+        })
+    }
+}
+
+fn classify_clipboard_failure(error: ClipboardError) -> SideEffectFailure {
+    let detail = NetError::FetchServiceOwned(error.message().to_owned());
+    if error.is_uncertain() {
+        SideEffectFailure::Uncertain(detail)
+    } else {
+        SideEffectFailure::Terminal(detail)
     }
 }
 
@@ -1612,6 +1732,10 @@ fn validate_header(
         text: None,
         staged_files: Vec::new(),
     })
+}
+
+fn needs_filesystem_reservation(content_kind: ContentKind, payload_bytes: u64) -> bool {
+    content_kind != ContentKind::Text && payload_bytes > 0
 }
 
 fn validate_manifest(
@@ -1867,8 +1991,8 @@ mod tests {
     };
     use meshelf_protocol::{
         FetchAbort, FetchAbortCode, FetchAdmissionCode, FetchComplete, FetchHeader,
-        FetchReceiptCode, FileEnd, FileEntryKind, FileStart, ManifestChunk, ManifestEnd, V2Message,
-        read_v2_frame_async, write_v2_frame_async,
+        FetchReceiptCode, FileEnd, FileEntryKind, FileStart, ManifestChunk, ManifestEnd, TextEnd,
+        V2Message, read_v2_frame_async, write_v2_frame_async,
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1880,10 +2004,18 @@ mod tests {
 
     const TEST_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+    #[test]
+    fn nonempty_text_does_not_require_a_filesystem_reservation() {
+        assert!(!needs_filesystem_reservation(ContentKind::Text, 442));
+        assert!(needs_filesystem_reservation(ContentKind::File, 442));
+    }
+
     #[derive(Debug, Default)]
     struct TestClipboard {
         files: Mutex<Vec<PathBuf>>,
+        texts: Mutex<Vec<String>>,
         text_calls: Mutex<u32>,
+        fail_text: Mutex<Option<ClipboardError>>,
         fail_files: Mutex<bool>,
         observe_existing: Mutex<Option<PathBuf>>,
         existed_at_call: Mutex<Option<bool>>,
@@ -1891,8 +2023,20 @@ mod tests {
     }
 
     impl ClipboardSink for TestClipboard {
-        fn set_text(&self, _text: &str) -> Result<(), ClipboardError> {
+        fn set_text(&self, text: &str) -> Result<(), ClipboardError> {
             *self.text_calls.lock().expect("clipboard text lock") += 1;
+            if let Some(error) = self
+                .fail_text
+                .lock()
+                .expect("clipboard text failure lock")
+                .clone()
+            {
+                return Err(error);
+            }
+            self.texts
+                .lock()
+                .expect("clipboard texts lock")
+                .push(text.to_owned());
             Ok(())
         }
     }
@@ -1933,6 +2077,13 @@ mod tests {
         chunk: ManifestChunk,
         manifest_sha256: Vec<u8>,
         manifest_encoded_bytes: u64,
+    }
+
+    struct TextActivation {
+        activation: FetchActivation,
+        descriptor: OfferDescriptor,
+        text: String,
+        digest: Vec<u8>,
     }
 
     struct ReceiverFixture {
@@ -2005,6 +2156,32 @@ mod tests {
                 chunk,
                 manifest_sha256,
                 manifest_encoded_bytes,
+            }
+        }
+
+        fn text_activation(&self, text: &str) -> TextActivation {
+            let offer_id = OfferId::new();
+            let request_id = ActivationId::new();
+            let descriptor = OfferDescriptor::text(text).expect("text descriptor");
+            self.store
+                .insert_offer_card(OfferCardInput::new(
+                    self.source_device,
+                    offer_id,
+                    descriptor.clone(),
+                    CardAvailability::Available,
+                ))
+                .expect("insert text offer card");
+            TextActivation {
+                activation: FetchActivation::new(
+                    request_id,
+                    self.source_device,
+                    offer_id,
+                    ActivationMode::Clipboard,
+                    None,
+                ),
+                descriptor,
+                text: text.to_owned(),
+                digest: Sha256::digest(text.as_bytes()).to_vec(),
             }
         }
 
@@ -2099,6 +2276,59 @@ mod tests {
             };
             (client, server, admission)
         }
+
+        async fn start_text(
+            &self,
+            activation: &TextActivation,
+        ) -> (
+            TcpStream,
+            tokio::task::JoinHandle<Result<(), NetError>>,
+            FetchAdmission,
+        ) {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind text receiver test listener");
+            let address = listener.local_addr().expect("text receiver test address");
+            let source_device = activation.activation.source_device;
+            let receiver_activation = activation.activation.clone();
+            let receiver = self.receiver();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept text receiver test");
+                receiver
+                    .receive(
+                        source_device,
+                        receiver_activation,
+                        &mut stream,
+                        TEST_IO_TIMEOUT,
+                    )
+                    .await
+            });
+            let mut client = TcpStream::connect(address)
+                .await
+                .expect("connect text receiver test");
+            write_v2_frame_async(
+                &mut client,
+                &V2Message::FetchHeader(FetchHeader {
+                    request_id: activation.activation.request_id,
+                    offer_id: activation.activation.offer_id,
+                    descriptor: activation.descriptor.clone(),
+                    manifest_entries: 0,
+                    manifest_encoded_bytes: 0,
+                    text_sha256: Some(activation.digest.clone()),
+                    manifest_sha256: None,
+                }),
+            )
+            .await
+            .expect("write text fetch header");
+            let response = timeout(TEST_IO_TIMEOUT, read_v2_frame_async(&mut client))
+                .await
+                .expect("read text admission timeout")
+                .expect("read text admission");
+            let V2Message::FetchAdmission(admission) = response else {
+                panic!("expected text fetch admission");
+            };
+            (client, server, admission)
+        }
     }
 
     fn assert_no_payload_artifacts(root: &Path) {
@@ -2177,6 +2407,127 @@ mod tests {
             panic!("expected fetch receipt");
         };
         receipt
+    }
+
+    async fn send_text_and_complete(
+        client: &mut TcpStream,
+        activation: &TextActivation,
+    ) -> meshelf_protocol::FetchReceipt {
+        client
+            .write_all(activation.text.as_bytes())
+            .await
+            .expect("write text bytes");
+        write_v2_frame_async(
+            client,
+            &V2Message::TextEnd(TextEnd {
+                request_id: activation.activation.request_id,
+                sha256: activation.digest.clone(),
+            }),
+        )
+        .await
+        .expect("write text end");
+        write_v2_frame_async(
+            client,
+            &V2Message::FetchComplete(FetchComplete {
+                request_id: activation.activation.request_id,
+                files_sent: 0,
+                bytes_sent: activation.text.len() as u64,
+                content_set_sha256: activation.digest.clone(),
+            }),
+        )
+        .await
+        .expect("write text complete");
+        let message = timeout(TEST_IO_TIMEOUT, read_v2_frame_async(client))
+            .await
+            .expect("read text receipt timeout")
+            .expect("read text receipt");
+        let V2Message::FetchReceipt(receipt) = message else {
+            panic!("expected text fetch receipt");
+        };
+        receipt
+    }
+
+    #[tokio::test]
+    async fn completed_text_activation_performed_the_exact_clipboard_write() {
+        let fixture = ReceiverFixture::new();
+        let text = format!("HEAD-{}-TAIL", "x".repeat(428));
+        assert_eq!(text.len(), 438);
+        let activation = fixture.text_activation(&text);
+        let (mut client, server, admission) = fixture.start_text(&activation).await;
+        assert_eq!(admission.code, FetchAdmissionCode::Accepted);
+
+        let receipt = send_text_and_complete(&mut client, &activation).await;
+        assert_eq!(receipt.code, FetchReceiptCode::Completed);
+        assert_eq!(receipt.files_received, 0);
+        assert_eq!(receipt.bytes_received, text.len() as u64);
+        server
+            .await
+            .expect("text receiver task")
+            .expect("completed text activation");
+        assert_eq!(
+            fixture
+                .clipboard
+                .texts
+                .lock()
+                .expect("clipboard texts")
+                .as_slice(),
+            [text]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_text_clipboard_write_is_counted_clipboard_failed_not_completed() {
+        let fixture = ReceiverFixture::new();
+        let text = format!("HEAD-{}-TAIL", "x".repeat(430));
+        let activation = fixture.text_activation(&text);
+        *fixture
+            .clipboard
+            .fail_text
+            .lock()
+            .expect("clipboard text failure lock") =
+            Some(ClipboardError::new("injected text clipboard failure"));
+        let (mut client, server, admission) = fixture.start_text(&activation).await;
+        assert_eq!(admission.code, FetchAdmissionCode::Accepted);
+
+        let receipt = send_text_and_complete(&mut client, &activation).await;
+        assert_eq!(receipt.code, FetchReceiptCode::ClipboardFailed);
+        assert_eq!(receipt.files_received, 0);
+        assert_eq!(receipt.bytes_received, text.len() as u64);
+        assert!(
+            receipt
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("injected text clipboard failure"))
+        );
+        assert!(matches!(
+            server.await.expect("text receiver task"),
+            Err(NetError::FetchTerminal {
+                code: FetchReceiptCode::ClipboardFailed,
+                files_processed: 0,
+                bytes_processed,
+                ..
+            }) if bytes_processed == text.len() as u64
+        ));
+        assert!(
+            fixture
+                .clipboard
+                .texts
+                .lock()
+                .expect("clipboard texts")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn clipboard_worker_crash_is_uncertain_not_terminal() {
+        assert!(matches!(
+            classify_clipboard_failure(ClipboardError::uncertain("worker stopped")),
+            SideEffectFailure::Uncertain(_)
+        ));
+        assert!(matches!(
+            classify_clipboard_failure(ClipboardError::new("platform rejected write")),
+            SideEffectFailure::Terminal(_)
+        ));
     }
 
     #[test]
@@ -2401,10 +2752,15 @@ mod tests {
         assert_eq!(admission.entries_reserved, 0);
         assert_eq!(admission.bytes_reserved, 0);
         drop(client);
-        server
-            .await
-            .expect("receiver task")
-            .expect("allocation refusal");
+        assert!(matches!(
+            server.await.expect("receiver task"),
+            Err(NetError::FetchAdmissionRefused {
+                code: FetchAdmissionCode::AllocationFailed,
+                entries_reserved: 0,
+                bytes_reserved: 0,
+                ..
+            })
+        ));
         assert_no_payload_artifacts(&fixture.state_root);
     }
 
@@ -2473,10 +2829,15 @@ mod tests {
         assert_eq!(receipt.code, FetchReceiptCode::VerificationFailed);
         assert_eq!(receipt.files_received, 0);
         assert_eq!(receipt.bytes_received, 3);
-        server
-            .await
-            .expect("receiver task")
-            .expect("verification result");
+        assert!(matches!(
+            server.await.expect("receiver task"),
+            Err(NetError::FetchTerminal {
+                code: FetchReceiptCode::VerificationFailed,
+                files_processed: 0,
+                bytes_processed: 3,
+                ..
+            })
+        ));
         assert_no_payload_artifacts(&fixture.state_root);
         let attempt = fixture
             .store
@@ -2512,10 +2873,15 @@ mod tests {
         .expect("write file start");
         client.write_all(b"a").await.expect("write partial payload");
         drop(client);
-        server
-            .await
-            .expect("receiver task")
-            .expect("disconnect result");
+        assert!(matches!(
+            server.await.expect("receiver task"),
+            Err(NetError::FetchTerminal {
+                code: FetchReceiptCode::ConnectionLost,
+                files_processed: 0,
+                bytes_processed: 1,
+                ..
+            })
+        ));
         assert_no_payload_artifacts(&fixture.state_root);
         let attempt = fixture
             .store
@@ -2569,7 +2935,15 @@ mod tests {
                 .expect("socket close"),
             0
         );
-        server.await.expect("receiver task").expect("cancel result");
+        assert!(matches!(
+            server.await.expect("receiver task"),
+            Err(NetError::FetchTerminal {
+                code: FetchReceiptCode::Cancelled,
+                files_processed: 0,
+                bytes_processed: 0,
+                ..
+            })
+        ));
         assert_no_payload_artifacts(&fixture.state_root);
         let attempt = fixture
             .store
@@ -2706,10 +3080,15 @@ mod tests {
         assert_eq!(second_admission.code, FetchAdmissionCode::Accepted);
         let receipt = send_file_and_complete(&mut second_client, &second, bytes, digest).await;
         assert_eq!(receipt.code, FetchReceiptCode::ClipboardFailed);
-        second_server
-            .await
-            .expect("second receiver task")
-            .expect("second clipboard failure");
+        assert!(matches!(
+            second_server.await.expect("second receiver task"),
+            Err(NetError::FetchTerminal {
+                code: FetchReceiptCode::ClipboardFailed,
+                files_processed: 1,
+                bytes_processed: 3,
+                ..
+            })
+        ));
         assert!(old.payload_path.exists());
         assert!(
             fixture
@@ -2868,7 +3247,15 @@ mod tests {
         assert_eq!(admission.entries_reserved, 0);
         assert_eq!(admission.bytes_reserved, 0);
         drop(client);
-        server.await.expect("receiver task").expect("busy refusal");
+        assert!(matches!(
+            server.await.expect("receiver task"),
+            Err(NetError::FetchAdmissionRefused {
+                code: FetchAdmissionCode::RefusedBusy,
+                entries_reserved: 0,
+                bytes_reserved: 0,
+                ..
+            })
+        ));
         assert!(candidate.exists());
         assert!(
             fixture

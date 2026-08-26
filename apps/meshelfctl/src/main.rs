@@ -265,7 +265,6 @@ impl ClipboardSink for HeadlessActivationClipboard {
             .as_ref()
             .ok_or_else(|| ClipboardError::new("clipboard is unavailable for this activation"))?
             .set_text(text)
-            .map_err(|error| ClipboardError::new(error.to_string()))
     }
 }
 
@@ -275,7 +274,7 @@ impl FetchClipboard for HeadlessActivationClipboard {
             .as_ref()
             .ok_or_else(|| ClipboardError::new("clipboard is unavailable for this activation"))?
             .set_files(paths)
-            .map_err(|error| ClipboardError::new(error.to_string()))
+            .map_err(ClipboardError::from)
     }
 }
 
@@ -328,9 +327,12 @@ impl LocalRuntime for HeadlessRuntime {
                     .ok_or_else(|| "save activation has no destination setting".to_owned())?,
             )?),
         };
-        let request = FetchRequest::new(plan.offer_id, plan.source_device, self.identity.device_id);
-        let request_id = request.request_id;
-        let mode = plan.mode;
+        let request = FetchRequest {
+            request_id: plan.activation_id,
+            offer_id: plan.offer_id,
+            source_device: plan.source_device,
+            requester_device: self.identity.device_id,
+        };
         let input = HeadlessActivationInput {
             address,
             hello: ClientHello::signed_v2(
@@ -341,7 +343,7 @@ impl LocalRuntime for HeadlessRuntime {
             ),
             request,
             activation: FetchActivation::new(
-                request_id,
+                plan.activation_id,
                 plan.source_device,
                 plan.offer_id,
                 plan.mode,
@@ -351,17 +353,12 @@ impl LocalRuntime for HeadlessRuntime {
         };
         let offer_store = self.offer_store.clone();
         let state_root = self.state_root.clone();
-        thread::spawn(move || {
-            let clipboard = if mode == ActivationMode::Clipboard {
-                ClipboardWorker::new().ok()
-            } else {
-                None
-            };
-            if let Err(error) = run_headless_activation(input, offer_store, clipboard, state_root) {
-                tracing::warn!(%error, "headless offer activation failed");
-            }
-        });
-        Ok(())
+        let clipboard = if plan.mode == ActivationMode::Clipboard {
+            Some(ClipboardWorker::new().map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
+        run_headless_activation(input, offer_store, clipboard, state_root)
     }
 }
 
@@ -631,7 +628,7 @@ fn run_announce(args: Vec<String>) -> Result<()> {
             bail!("resident returned an unexpected response")
         }
         LocalResponse::Shelf { .. }
-        | LocalResponse::ActivationStarted { .. }
+        | LocalResponse::ActivationCompleted { .. }
         | LocalResponse::ActivationCancelled { .. }
         | LocalResponse::ActivationRefused { .. } => {
             bail!("resident returned an unexpected response")
@@ -690,11 +687,15 @@ fn run_activate(args: Vec<String>) -> Result<()> {
     let response = control_request(&config_dir()?, &request)
         .context("could not contact the meshelf resident")?;
     match serde_json::from_slice::<LocalResponse>(&response)? {
-        LocalResponse::ActivationStarted {
+        LocalResponse::ActivationCompleted {
             activation_id,
             offer_id,
             mode,
-        } => println!("activation {activation_id} started for {offer_id} ({mode:?})"),
+            files_processed,
+            bytes_processed,
+        } => println!(
+            "activation {activation_id} completed for {offer_id} ({mode:?}; files {files_processed}, bytes {bytes_processed})"
+        ),
         LocalResponse::ActivationRefused { message } => bail!("{message}"),
         LocalResponse::Error { message } => bail!("{message}"),
         other => bail!("resident returned an unexpected response: {other:?}"),

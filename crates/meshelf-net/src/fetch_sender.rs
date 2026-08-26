@@ -16,11 +16,12 @@ use meshelf_core::{
     OfferDescriptor, OfferSource, OfferSourceRecord, OfferSourceStore,
 };
 use meshelf_protocol::{
-    FetchAbort, FetchAbortCode, FetchAdmissionCode, FetchComplete, FetchHeader, FetchReceipt,
-    FetchRefusal, FetchRefusalCode, FetchRequest, FileEnd, FileEntryKind, FileStart, ManifestChunk,
-    ManifestEnd, ManifestEntry, TextEnd, V2_MAX_ACTIVE_PAYLOAD_STREAMS, V2_MAX_MANIFEST_BYTES,
-    V2_MAX_MANIFEST_ENTRIES, V2_MAX_RELATIVE_PATH_BYTES, V2_STREAM_BUFFER_BYTES, V2Message,
-    chunk_manifest, encoded_manifest_bytes, validate_v2_message, write_v2_frame_async,
+    FetchAbort, FetchAbortCode, FetchAdmission, FetchAdmissionCode, FetchComplete, FetchHeader,
+    FetchReceipt, FetchRefusal, FetchRefusalCode, FetchRequest, FileEnd, FileEntryKind, FileStart,
+    ManifestChunk, ManifestEnd, ManifestEntry, TextEnd, V2_MAX_ACTIVE_PAYLOAD_STREAMS,
+    V2_MAX_MANIFEST_BYTES, V2_MAX_MANIFEST_ENTRIES, V2_MAX_RELATIVE_PATH_BYTES,
+    V2_STREAM_BUFFER_BYTES, V2Message, chunk_manifest, encoded_manifest_bytes, validate_v2_message,
+    write_v2_frame_async,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -321,14 +322,7 @@ impl OfferFetchHandler {
         let V2Message::FetchAdmission(admission) = admission else {
             return Err(NetError::UnexpectedMessage("expected fetch_admission"));
         };
-        if admission.request_id != request.request_id {
-            return Err(NetError::IdentityMismatch(
-                "fetch admission request ID does not match".to_owned(),
-            ));
-        }
-        if admission.code != FetchAdmissionCode::Accepted {
-            return Ok(());
-        }
+        require_accepted_admission(admission, request.request_id)?;
 
         if plan.text.is_none() {
             match build_source_plan(record, request.request_id) {
@@ -776,7 +770,37 @@ fn validate_receipt(
             "fetch receipt offer ID does not match".to_owned(),
         ));
     }
-    Ok(())
+    if receipt.code == meshelf_protocol::FetchReceiptCode::Completed {
+        Ok(())
+    } else {
+        Err(NetError::FetchTerminal {
+            code: receipt.code.clone(),
+            files_processed: receipt.files_received,
+            bytes_processed: receipt.bytes_received,
+            detail: receipt.detail.clone(),
+        })
+    }
+}
+
+fn require_accepted_admission(
+    admission: FetchAdmission,
+    request_id: meshelf_core::ActivationId,
+) -> Result<(), NetError> {
+    if admission.request_id != request_id {
+        return Err(NetError::IdentityMismatch(
+            "fetch admission request ID does not match".to_owned(),
+        ));
+    }
+    if admission.code == FetchAdmissionCode::Accepted {
+        Ok(())
+    } else {
+        Err(NetError::FetchAdmissionRefused {
+            code: admission.code,
+            entries_reserved: admission.entries_reserved,
+            bytes_reserved: admission.bytes_reserved,
+            detail: admission.detail,
+        })
+    }
 }
 
 fn build_source_plan(
@@ -1230,4 +1254,33 @@ pub(crate) fn metadata_commitment_for_test(
         .ok()?;
     }
     Some(commitment.finalize().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refused_admission_is_not_a_successful_transfer() {
+        let request_id = meshelf_core::ActivationId::new();
+        let result = require_accepted_admission(
+            FetchAdmission {
+                request_id,
+                code: FetchAdmissionCode::InvalidManifest,
+                entries_reserved: 0,
+                bytes_reserved: 0,
+                detail: Some("descriptor mismatch".to_owned()),
+            },
+            request_id,
+        );
+        assert!(matches!(
+            result,
+            Err(NetError::FetchAdmissionRefused {
+                code: FetchAdmissionCode::InvalidManifest,
+                entries_reserved: 0,
+                bytes_reserved: 0,
+                ..
+            })
+        ));
+    }
 }
