@@ -8,18 +8,30 @@ import {
 
 export struct ShelfRow {
     icon: string,
+    offer-id: string,
+    kind: string,
+    origin-device: string,
+    name: string,
+    size: string,
     preview: string,
+    counts: string,
+    availability: string,
+    progress: string,
+    active: bool,
+    can-activate: bool,
+    can-save: bool,
     detail: string,
-    payload: string,
-    file-item: bool,
     shortcut: string,
+    save-shortcut: string,
 }
 
 component ShelfCard inherits Rectangle {
     in property <ShelfRow> item-data;
     callback activated();
+    callback alternate-activated();
+    callback cancelled();
 
-    height: 54px;
+    height: 70px;
     border-radius: 7px;
     background: touch.pressed ? #252c35 : touch.has-hover ? #20262e : #181d23;
     border-width: 1px;
@@ -39,20 +51,42 @@ component ShelfCard inherits Rectangle {
         VerticalBox {
             spacing: 2px;
             Text {
-                text: root.item-data.preview;
+                text: root.item-data.kind + "  ·  " + root.item-data.origin-device;
                 color: #eef1f4;
                 font-size: 12px;
                 overflow: elide;
             }
             Text {
-                text: root.item-data.detail;
+                text: root.item-data.preview != "" ? root.item-data.preview : root.item-data.name;
                 color: #8f9aa5;
                 font-size: 10px;
                 overflow: elide;
             }
+            Text {
+                text: root.item-data.size + (root.item-data.counts != "" ? "  ·  " + root.item-data.counts : "") + "  ·  " + root.item-data.availability;
+                color: #7d8995;
+                font-size: 9px;
+                overflow: elide;
+            }
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        if root.item-data.active: Text {
+            text: root.item-data.progress;
+            color: #d5eeee;
+            font-size: 9px;
+            vertical-alignment: center;
+        }
+        if root.item-data.active: Button {
+            text: "Cancel";
+            clicked => { root.cancelled(); }
+        }
+        if !root.item-data.active && root.item-data.can-save: Button {
+            text: "Save  " + root.item-data.save-shortcut;
+            enabled: root.item-data.can-activate;
+            clicked => { root.alternate-activated(); }
         }
         Rectangle {
-            width: 38px;
+            width: 34px;
             background: transparent;
             Text {
                 text: root.item-data.shortcut;
@@ -65,6 +99,7 @@ component ShelfCard inherits Rectangle {
     }
 
     touch := TouchArea {
+        width: parent.width - 116px;
         clicked => { root.activated(); }
     }
 }
@@ -87,10 +122,14 @@ export component MainWindow inherits Window {
     in property <[ShelfRow]> shelf-items: [];
     in-out property <string> status-text: "Open meshelf, then paste once to send";
     in property <string> reachable-names: "Reachability not checked yet";
+    in property <string> destination-text: "Downloads";
 
     callback paste-and-send();
-    callback copy-item(string, bool);
+    callback activate-offer(string, string);
+    callback cancel-activation(string);
     callback refresh-peers();
+    callback choose-folder();
+    callback reset-destination();
 
     init => { keyboard.focus(); }
 
@@ -100,29 +139,51 @@ export component MainWindow inherits Window {
         focus-on-click: false;
         focus-on-tab-navigation: false;
         capture-key-pressed(event) => {
-            if (!event.repeat && event.modifiers.control) {
+            if (!event.repeat && (event.modifiers.control || event.modifiers.meta)) {
                 if (event.text == "v") {
                     root.paste-and-send();
                     return accept;
                 }
-                if (event.text == "1" && root.shelf-items.length > 0) {
-                    root.copy-item(root.shelf-items[0].payload, root.shelf-items[0].file-item);
+                if (event.text == "1" && root.shelf-items.length > 0 && root.shelf-items[0].can-activate) {
+                    root.activate-offer(root.shelf-items[0].offer-id, "clipboard");
                     return accept;
                 }
-                if (event.text == "2" && root.shelf-items.length > 1) {
-                    root.copy-item(root.shelf-items[1].payload, root.shelf-items[1].file-item);
+                if (event.text == "2" && root.shelf-items.length > 1 && root.shelf-items[1].can-activate) {
+                    root.activate-offer(root.shelf-items[1].offer-id, "clipboard");
                     return accept;
                 }
-                if (event.text == "3" && root.shelf-items.length > 2) {
-                    root.copy-item(root.shelf-items[2].payload, root.shelf-items[2].file-item);
+                if (event.text == "3" && root.shelf-items.length > 2 && root.shelf-items[2].can-activate) {
+                    root.activate-offer(root.shelf-items[2].offer-id, "clipboard");
                     return accept;
                 }
-                if (event.text == "4" && root.shelf-items.length > 3) {
-                    root.copy-item(root.shelf-items[3].payload, root.shelf-items[3].file-item);
+                if (event.text == "4" && root.shelf-items.length > 3 && root.shelf-items[3].can-activate) {
+                    root.activate-offer(root.shelf-items[3].offer-id, "clipboard");
                     return accept;
                 }
-                if (event.text == "5" && root.shelf-items.length > 4) {
-                    root.copy-item(root.shelf-items[4].payload, root.shelf-items[4].file-item);
+                if (event.text == "5" && root.shelf-items.length > 4 && root.shelf-items[4].can-activate) {
+                    root.activate-offer(root.shelf-items[4].offer-id, "clipboard");
+                    return accept;
+                }
+            }
+            if (!event.repeat && event.modifiers.alt) {
+                if (event.text == "1" && root.shelf-items.length > 0 && root.shelf-items[0].can-save && root.shelf-items[0].can-activate) {
+                    root.activate-offer(root.shelf-items[0].offer-id, "save");
+                    return accept;
+                }
+                if (event.text == "2" && root.shelf-items.length > 1 && root.shelf-items[1].can-save && root.shelf-items[1].can-activate) {
+                    root.activate-offer(root.shelf-items[1].offer-id, "save");
+                    return accept;
+                }
+                if (event.text == "3" && root.shelf-items.length > 2 && root.shelf-items[2].can-save && root.shelf-items[2].can-activate) {
+                    root.activate-offer(root.shelf-items[2].offer-id, "save");
+                    return accept;
+                }
+                if (event.text == "4" && root.shelf-items.length > 3 && root.shelf-items[3].can-save && root.shelf-items[3].can-activate) {
+                    root.activate-offer(root.shelf-items[3].offer-id, "save");
+                    return accept;
+                }
+                if (event.text == "5" && root.shelf-items.length > 4 && root.shelf-items[4].can-save && root.shelf-items[4].can-activate) {
+                    root.activate-offer(root.shelf-items[4].offer-id, "save");
                     return accept;
                 }
             }
@@ -155,6 +216,32 @@ export component MainWindow inherits Window {
                 text: "Paste  " + root.paste-shortcut;
                 enabled: root.default-peer-online;
                 clicked => { root.paste-and-send(); }
+            }
+        }
+
+        Rectangle {
+            height: 34px;
+            border-radius: 5px;
+            background: #182025;
+            HorizontalBox {
+                padding: 6px;
+                spacing: 8px;
+                Text {
+                    text: "SAVE DESTINATION  ·  " + root.destination-text;
+                    color: #aab4be;
+                    font-size: 10px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button {
+                    text: "Choose folder…";
+                    clicked => { root.choose-folder(); }
+                }
+                Button {
+                    text: "Reset to Downloads";
+                    clicked => { root.reset-destination(); }
+                }
             }
         }
 
@@ -225,7 +312,13 @@ export component MainWindow inherits Window {
                 spacing: 5px;
                 for row[index] in root.shelf-items: ShelfCard {
                     item-data: row;
-                    activated => { root.copy-item(row.payload, row.file-item); }
+                    activated => {
+                        if (row.can-activate) { root.activate-offer(row.offer-id, "clipboard"); }
+                    }
+                    alternate-activated => {
+                        if (row.can-save && row.can-activate) { root.activate-offer(row.offer-id, "save"); }
+                    }
+                    cancelled => { root.cancel-activation(row.offer-id); }
                 }
             }
         }

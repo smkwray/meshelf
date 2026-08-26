@@ -7,7 +7,10 @@ pub mod coordinator;
 pub mod local_control;
 pub mod offer_source;
 
-pub use coordinator::{Coordinator, OfferPlan, PeerAnnouncement};
+pub use coordinator::{
+    ActivationPlan, Coordinator, NotifyingOfferCardStore, OfferPlan, PeerAnnouncement,
+    ShelfChangeNotifier,
+};
 pub use offer_source::{OfferInput, PreparedOfferSource, SourcePreparationError};
 
 use std::{

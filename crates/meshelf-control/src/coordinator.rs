@@ -1,9 +1,17 @@
 //! The resident, durable paste-to-offer coordinator.
 
-use std::{path::PathBuf, sync::Arc, time::SystemTime};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
+    time::SystemTime,
+};
 
-use meshelf_core::{DeviceId, OfferDescriptor, OfferId, OfferSourceInput, OfferSourceStore};
+use meshelf_core::{
+    ActivationId, ActivationMode, DeviceId, OfferCardInput, OfferCardInsert, OfferCardRecord,
+    OfferDescriptor, OfferId, OfferSourceInput, OfferSourceStore, SaveDestination, StoreError,
+};
 use meshelf_identity::InstallationIdentity;
+use meshelf_net::OfferCardStore;
 use meshelf_protocol::OfferAnnouncement;
 use meshelf_store::RedbV2Store;
 use meshelf_tailscale::InstallationStore;
@@ -24,10 +32,87 @@ pub struct OfferPlan {
     pub announcements: Vec<PeerAnnouncement>,
 }
 
+/// In-process notification for the resident shelf. It carries no card data; consumers reread the
+/// v2 store after receiving it, so the store remains the sole shelf authority.
+#[derive(Clone, Default)]
+pub struct ShelfChangeNotifier {
+    subscribers: Arc<Mutex<Vec<mpsc::Sender<()>>>>,
+}
+
+impl ShelfChangeNotifier {
+    pub fn subscribe(&self) -> mpsc::Receiver<()> {
+        let (sender, receiver) = mpsc::channel();
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.push(sender);
+        }
+        receiver
+    }
+
+    pub fn notify(&self) {
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.retain(|sender| sender.send(()).is_ok());
+        }
+    }
+}
+
+/// Card-store composition for the resident shelf. Announcement handlers use this wrapper so a
+/// durable card insertion wakes the desktop's metadata-only shelf without carrying card data in
+/// the notification.
+pub struct NotifyingOfferCardStore {
+    inner: Arc<dyn OfferCardStore>,
+    shelf_changes: ShelfChangeNotifier,
+}
+
+impl NotifyingOfferCardStore {
+    #[must_use]
+    pub fn new(inner: Arc<dyn OfferCardStore>, shelf_changes: ShelfChangeNotifier) -> Self {
+        Self {
+            inner,
+            shelf_changes,
+        }
+    }
+}
+
+impl OfferCardStore for NotifyingOfferCardStore {
+    fn get_offer_card(
+        &self,
+        source_device: DeviceId,
+        offer_id: OfferId,
+    ) -> Result<Option<OfferCardRecord>, StoreError> {
+        self.inner.get_offer_card(source_device, offer_id)
+    }
+
+    fn read_offer_shelf(&self) -> Result<Vec<OfferCardRecord>, StoreError> {
+        self.inner.read_offer_shelf()
+    }
+
+    fn insert_offer_card(&self, input: OfferCardInput) -> Result<OfferCardInsert, StoreError> {
+        let result = self.inner.insert_offer_card(input)?;
+        if result.inserted {
+            self.shelf_changes.notify();
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationPlan {
+    pub activation_id: ActivationId,
+    pub source_device: DeviceId,
+    pub offer_id: OfferId,
+    pub descriptor: OfferDescriptor,
+    pub mode: ActivationMode,
+    /// A save activation snapshots the controller setting here. The platform resolves Downloads
+    /// only when the pull starts; a later settings edit therefore affects future activations only.
+    pub destination: Option<SaveDestination>,
+}
+
 pub struct Coordinator {
     identity: DeviceId,
     installation_store: InstallationStore,
     offer_store: Arc<dyn OfferSourceStore>,
+    card_store: Option<Arc<dyn OfferCardStore>>,
+    shelf_changes: ShelfChangeNotifier,
 }
 
 impl Coordinator {
@@ -41,7 +126,73 @@ impl Coordinator {
             identity,
             installation_store,
             offer_store,
+            card_store: None,
+            shelf_changes: ShelfChangeNotifier::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_card_store(mut self, card_store: Arc<dyn OfferCardStore>) -> Self {
+        self.card_store = Some(Arc::new(NotifyingOfferCardStore::new(
+            card_store,
+            self.shelf_changes.clone(),
+        )));
+        self
+    }
+
+    pub fn card_store(&self) -> Option<Arc<dyn OfferCardStore>> {
+        self.card_store.clone()
+    }
+
+    #[must_use]
+    pub fn shelf_changes(&self) -> ShelfChangeNotifier {
+        self.shelf_changes.clone()
+    }
+
+    pub fn read_shelf(&self) -> Result<Vec<OfferCardRecord>, String> {
+        self.card_store
+            .as_ref()
+            .ok_or_else(|| "v2 offer-card store is not configured".to_owned())?
+            .read_offer_shelf()
+            .map_err(|error| format!("could not read offer shelf: {error}"))
+    }
+
+    pub fn plan_activation(
+        &self,
+        offer_id: OfferId,
+        mode: ActivationMode,
+    ) -> Result<ActivationPlan, String> {
+        let card = self
+            .card_store
+            .as_ref()
+            .ok_or_else(|| "v2 offer-card store is not configured".to_owned())?
+            .read_offer_shelf()
+            .map_err(|error| format!("could not read offer shelf: {error}"))?
+            .into_iter()
+            .find(|card| card.offer_id == offer_id)
+            .ok_or_else(|| format!("offer {offer_id} is not on this shelf"))?;
+        if mode == ActivationMode::Save && card.descriptor.is_text() {
+            return Err("text offers cannot use save activation".to_owned());
+        }
+        if matches!(
+            card.availability,
+            meshelf_core::CardAvailability::SourceChanged
+        ) {
+            return Err("the offer source changed; activation is disabled".to_owned());
+        }
+        let destination = if mode == ActivationMode::Save {
+            Some(self.settings()?.save_destination)
+        } else {
+            None
+        };
+        Ok(ActivationPlan {
+            activation_id: ActivationId::new(),
+            source_device: card.source_device,
+            offer_id: card.offer_id,
+            descriptor: card.descriptor,
+            mode,
+            destination,
+        })
     }
 
     pub fn open(
@@ -50,13 +201,16 @@ impl Coordinator {
     ) -> Result<(Self, InstallationIdentity), String> {
         let identity = InstallationIdentity::load_or_create()
             .map_err(|error| format!("could not load meshelf installation identity: {error}"))?;
-        let store = RedbV2Store::open(offer_path)
-            .map_err(|error| format!("could not open v2 offer store: {error}"))?;
+        let store = Arc::new(
+            RedbV2Store::open(offer_path)
+                .map_err(|error| format!("could not open v2 offer store: {error}"))?,
+        );
         let coordinator = Self::new(
             identity.device_id,
             InstallationStore::new(state_path),
-            Arc::new(store),
-        );
+            store.clone(),
+        )
+        .with_card_store(store);
         Ok((coordinator, identity))
     }
 
@@ -91,6 +245,7 @@ impl Coordinator {
                 source,
             ))
             .map_err(|error| format!("could not durably store offer: {error}"))?;
+        self.shelf_changes.notify();
 
         let created_at_unix_ms = now_unix_ms();
         let announcements = peers
@@ -190,6 +345,44 @@ mod tests {
         let store = Arc::new(RedbV2Store::open(offer_path).expect("open store"));
         let coordinator = Coordinator::new(identity.device_id, installation_store, store.clone());
         (directory, coordinator, store, peer_id)
+    }
+
+    #[test]
+    fn announcement_card_insert_wakes_the_shelf_subscriber() {
+        let directory = tempdir().expect("temporary directory");
+        let source = InstallationIdentity::generate();
+        let target = InstallationIdentity::generate();
+        let store = Arc::new(
+            RedbV2Store::open(directory.path().join("offers.redb")).expect("open offer store"),
+        );
+        let coordinator = Coordinator::new(
+            target.device_id,
+            InstallationStore::new(directory.path().join("state.json")),
+            store.clone(),
+        )
+        .with_card_store(store);
+        let subscriber = coordinator.shelf_changes().subscribe();
+        let handler = meshelf_net::OfferAnnouncementHandler::new(
+            coordinator.card_store().expect("card store"),
+        );
+        let announcement = OfferAnnouncement::new(
+            OfferId::new(),
+            source.device_id,
+            target.device_id,
+            1,
+            OfferDescriptor::text("announced metadata").expect("descriptor"),
+        );
+
+        let ack = handler
+            .handle_sync(source.device_id, target.device_id, announcement)
+            .expect("announcement");
+
+        assert_eq!(ack.code, meshelf_protocol::OfferAckCode::Stored);
+        assert!(
+            subscriber
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_ok()
+        );
     }
 
     #[test]

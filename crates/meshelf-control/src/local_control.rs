@@ -3,7 +3,8 @@
 use std::{io, path::PathBuf};
 
 use meshelf_core::{
-    DeviceId, MAX_CONTROL_REQUEST_BYTES, MAX_TEXT_BYTES, OfferDescriptor, OfferId, UserSettings,
+    ActivationId, ActivationMode, DeviceId, MAX_CONTROL_REQUEST_BYTES, MAX_TEXT_BYTES,
+    OfferCardRecord, OfferDescriptor, OfferId, UserSettings,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +32,14 @@ pub enum LocalRequest {
     SetSettings {
         settings: UserSettings,
     },
+    Shelf,
+    ActivateOffer {
+        offer_id: OfferId,
+        mode: ActivationMode,
+    },
+    CancelActivation {
+        activation_id: ActivationId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +54,20 @@ pub enum LocalResponse {
     RefusalRecorded,
     Settings {
         settings: UserSettings,
+    },
+    Shelf {
+        offers: Vec<OfferCardRecord>,
+    },
+    ActivationStarted {
+        activation_id: ActivationId,
+        offer_id: OfferId,
+        mode: ActivationMode,
+    },
+    ActivationCancelled {
+        activation_id: ActivationId,
+    },
+    ActivationRefused {
+        message: String,
     },
     Error {
         message: String,
@@ -131,6 +154,27 @@ pub fn dispatch(coordinator: &Coordinator, request: LocalRequest) -> LocalRespon
             Ok(settings) => LocalResponse::Settings { settings },
             Err(message) => LocalResponse::Error { message },
         },
+        LocalRequest::Shelf => match coordinator.read_shelf() {
+            Ok(offers) => LocalResponse::Shelf { offers },
+            Err(message) => LocalResponse::Error { message },
+        },
+        LocalRequest::ActivateOffer { offer_id, mode } => {
+            match coordinator.plan_activation(offer_id, mode) {
+                Ok(plan) => LocalResponse::ActivationStarted {
+                    activation_id: plan.activation_id,
+                    offer_id: plan.offer_id,
+                    mode: plan.mode,
+                },
+                Err(message) => LocalResponse::ActivationRefused { message },
+            }
+        }
+        LocalRequest::CancelActivation { activation_id } => {
+            // The desktop owns active connection handles. This response is intentionally a
+            // routed acknowledgement; the UI cancellation path invokes the same fetch task's
+            // abort handle locally, while headless clients can use it for parity once resident
+            // activation execution is enabled at the protocol cutover.
+            LocalResponse::ActivationCancelled { activation_id }
+        }
     }
 }
 

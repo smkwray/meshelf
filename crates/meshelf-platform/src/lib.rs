@@ -6,6 +6,7 @@
 mod activation;
 mod clipboard;
 mod filesystem;
+mod folder_dialog;
 
 pub use activation::{
     MAX_CONTROL_REQUEST_BYTES, MAX_CONTROL_RESPONSE_BYTES, ResidentLock, acquire_resident_lock,
@@ -20,6 +21,7 @@ pub use filesystem::{
     rename_exclusive_portable, require_directory, source_identity_bytes, sync_directory,
     total_space,
 };
+pub use folder_dialog::{choose_folder, resolve_save_destination};
 
 pub trait Notifier: Send + Sync + 'static {
     fn received_clipboard(&self, source_name: &str) -> Result<(), String>;

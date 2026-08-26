@@ -10,6 +10,8 @@ use meshelf_control::{
     coordinator::Coordinator,
     local_control::{self, LocalRequest, LocalResponse},
 };
+use meshelf_core::OfferDescriptor;
+use meshelf_core::{ActivationMode, OfferId};
 use meshelf_platform::{
     ClipboardItem, ClipboardSource, ClipboardWorker, acquire_resident_lock, listen_with_control,
     request as control_request,
@@ -32,6 +34,12 @@ fn main() -> Result<()> {
     }
     if command == "announce" {
         return run_announce(remaining);
+    }
+    if command == "shelf" {
+        return run_shelf(remaining);
+    }
+    if command == "activate" {
+        return run_activate(remaining);
     }
 
     let (selector, options) = take_peer_selector(remaining)?;
@@ -224,6 +232,25 @@ fn run_announce(args: Vec<String>) -> Result<()> {
     let mut arguments = args.into_iter();
     while let Some(argument) = arguments.next() {
         let candidate = match argument.as_str() {
+            "--clipboard" => {
+                let clipboard =
+                    ClipboardWorker::new().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                match clipboard
+                    .read_item()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                {
+                    ClipboardItem::Text(text) => LocalRequest::AnnounceText { text },
+                    ClipboardItem::Files(paths) if paths.len() == 1 => LocalRequest::AnnouncePath {
+                        path: paths.into_iter().next().expect("one path"),
+                    },
+                    ClipboardItem::Files(paths) => {
+                        bail!(
+                            "announce --clipboard requires one file or folder; clipboard contains {}",
+                            paths.len()
+                        )
+                    }
+                }
+            }
             "--text" => LocalRequest::AnnounceText {
                 text: arguments.next().context("--text requires a value")?,
             },
@@ -240,7 +267,7 @@ fn run_announce(args: Vec<String>) -> Result<()> {
         }
         source = Some(candidate);
     }
-    let request = source.context("announce requires --text, --stdin, or --path")?;
+    let request = source.context("announce requires --clipboard, --text, --stdin, or --path")?;
     let encoded = local_control::encode_request(&request)?;
     let response = control_request(&config_dir()?, &encoded)
         .context("could not contact the meshelf resident")?;
@@ -259,12 +286,80 @@ fn run_announce(args: Vec<String>) -> Result<()> {
         LocalResponse::RefusalRecorded | LocalResponse::Settings { .. } => {
             bail!("resident returned an unexpected response")
         }
+        LocalResponse::Shelf { .. }
+        | LocalResponse::ActivationStarted { .. }
+        | LocalResponse::ActivationCancelled { .. }
+        | LocalResponse::ActivationRefused { .. } => {
+            bail!("resident returned an unexpected response")
+        }
+    }
+    Ok(())
+}
+
+fn run_shelf(args: Vec<String>) -> Result<()> {
+    if !args.is_empty() {
+        bail!("shelf does not accept options")
+    }
+    let request = local_control::encode_request(&LocalRequest::Shelf)?;
+    let response = control_request(&config_dir()?, &request)
+        .context("could not contact the meshelf resident")?;
+    match serde_json::from_slice::<LocalResponse>(&response)? {
+        LocalResponse::Shelf { offers } => {
+            for offer in offers {
+                println!(
+                    "{}\t{}\t{}",
+                    offer.offer_id,
+                    offer.source_device,
+                    descriptor_kind(&offer.descriptor)
+                );
+            }
+        }
+        LocalResponse::Error { message } => bail!("{message}"),
+        other => bail!("resident returned an unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn descriptor_kind(descriptor: &OfferDescriptor) -> &'static str {
+    match descriptor {
+        OfferDescriptor::Text { .. } => "text",
+        OfferDescriptor::File { .. } => "file",
+        OfferDescriptor::Folder { .. } => "folder",
+    }
+}
+
+fn run_activate(args: Vec<String>) -> Result<()> {
+    let mut arguments = args.into_iter();
+    let offer_id: OfferId = arguments
+        .next()
+        .context("activate requires OFFER_ID")?
+        .parse()
+        .context("OFFER_ID is not a valid offer ID")?;
+    let mut mode = ActivationMode::Clipboard;
+    for argument in arguments {
+        match argument.as_str() {
+            "--save" => mode = ActivationMode::Save,
+            _ => bail!("unknown activate option: {argument}"),
+        }
+    }
+    let request = local_control::encode_request(&LocalRequest::ActivateOffer { offer_id, mode })?;
+    let response = control_request(&config_dir()?, &request)
+        .context("could not contact the meshelf resident")?;
+    match serde_json::from_slice::<LocalResponse>(&response)? {
+        LocalResponse::ActivationStarted {
+            activation_id,
+            offer_id,
+            mode,
+        } => println!("activation {activation_id} started for {offer_id} ({mode:?})"),
+        LocalResponse::ActivationRefused { message } => bail!("{message}"),
+        LocalResponse::Error { message } => bail!("{message}"),
+        other => bail!("resident returned an unexpected response: {other:?}"),
     }
     Ok(())
 }
 
 fn usage() -> Result<()> {
     bail!(
-        "usage: meshelfctl [status|refresh|trust-ssh|clipboard-read|send|serve|announce] [--peer NAME_OR_ID]\n  send requires exactly one of --clipboard, --stdin, or --text TEXT\n  announce requires exactly one of --text TEXT, --stdin, or --path PATH\n  pair-stdio is the fixed SSH bootstrap command"
+        "usage: meshelfctl [status|refresh|trust-ssh|clipboard-read|send|serve|announce|shelf|activate] [--peer NAME_OR_ID]\n  send requires exactly one of --clipboard, --stdin, or --text TEXT\n  announce requires exactly one of --clipboard, --text TEXT, --stdin, or --path PATH\n  activate requires OFFER_ID and optionally --save\n  pair-stdio is the fixed SSH bootstrap command"
     )
 }

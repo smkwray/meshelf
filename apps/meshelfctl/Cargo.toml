@@ -12,5 +12,6 @@ anyhow.workspace = true
 dirs.workspace = true
 meshelf-bootstrap = { path = "../../crates/meshelf-bootstrap" }
 meshelf-control = { path = "../../crates/meshelf-control" }
+meshelf-core = { path = "../../crates/meshelf-core" }
 meshelf-platform = { path = "../../crates/meshelf-platform" }
 serde_json.workspace = true

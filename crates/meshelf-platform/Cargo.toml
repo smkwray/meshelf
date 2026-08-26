@@ -8,7 +8,9 @@ license-file.workspace = true
 
 [dependencies]
 arboard.workspace = true
+dirs.workspace = true
 fs2.workspace = true
 meshelf-core = { path = "../meshelf-core" }
+rfd.workspace = true
 renamore.workspace = true
 thiserror.workspace = true
