@@ -4,7 +4,13 @@
 //! ledger; startup calls [`RedbV2Store::migrate_legacy_state`] before the
 //! listener binds.
 
-use std::{fs, io::ErrorKind, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    io::ErrorKind,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
 use meshelf_core::{
     ActivationId, ActivationJournalEntry, CleanupReport, ClipboardCacheRecord, ClipboardCacheState,
@@ -40,12 +46,111 @@ const CACHE_COMPLETED: &str = "completed";
 
 #[derive(Debug)]
 pub struct RedbV2Store {
-    database: Database,
+    database: Arc<Database>,
+    path: PathBuf,
+}
+
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    let _ = out.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                Some(Component::ParentDir) | Some(Component::CurDir) | None => {
+                    if !out.has_root() {
+                        out.push(component);
+                    }
+                }
+            },
+            component => out.push(component),
+        }
+    }
+    out
+}
+
+/// Logical identity of an offer-store file. Equivalent spellings of the same
+/// location share one key; a path that cannot be named fails instead of keeping
+/// the caller's unresolved spelling.
+pub fn store_identity(path: &Path) -> Result<PathBuf, StoreError> {
+    let normalized = normalize_path(path.to_path_buf());
+    if normalized.file_name().is_none() {
+        return Err(StoreError::new(
+            "offer store path has no file name and cannot be used as a store identity",
+        ));
+    }
+    resolve_store_identity(&normalized).or_else(|_| {
+        let absolute = std::path::absolute(&normalized).map_err(|error| {
+            StoreError::new(format!("offer store path could not be resolved: {error}"))
+        })?;
+        resolve_store_identity(&normalize_path(absolute))
+    })
+}
+
+fn resolve_store_identity(path: &Path) -> Result<PathBuf, StoreError> {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let Some(name) = path.file_name() else {
+        return Err(StoreError::new(
+            "offer store path has no file name and cannot be used as a store identity",
+        ));
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && let Ok(parent) = fs::canonicalize(parent)
+    {
+        return Ok(parent.join(name));
+    }
+    Err(StoreError::new(
+        "offer store path could not be resolved to a store identity",
+    ))
+}
+
+fn open_shared_database(path: &Path) -> Result<(Arc<Database>, PathBuf), StoreError> {
+    static OPEN: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
+    let registry = OPEN.get_or_init(|| Mutex::new(HashMap::new()));
+    for _ in 0..64 {
+        let identity = store_identity(path)?;
+        {
+            let map = registry.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(existing) = map.get(&identity).and_then(Weak::upgrade) {
+                return Ok((existing, identity));
+            }
+        }
+        match Database::create(path) {
+            Ok(database) => {
+                let identity = store_identity(path)?;
+                let database = Arc::new(database);
+                let mut map = registry.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(existing) = map.get(&identity).and_then(Weak::upgrade) {
+                    return Ok((existing, identity));
+                }
+                map.insert(identity.clone(), Arc::downgrade(&database));
+                return Ok((database, identity));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("already open") {
+                    std::thread::yield_now();
+                    continue;
+                }
+                return Err(map_redb_error(error));
+            }
+        }
+    }
+    Err(StoreError::new(
+        "offer store is already open and could not be attached",
+    ))
 }
 
 impl RedbV2Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let database = Database::create(path).map_err(map_redb_error)?;
+        let (database, path) = open_shared_database(path.as_ref())?;
         let write = database.begin_write().map_err(map_redb_error)?;
         {
             write.open_table(OFFER_SOURCES_V2).map_err(map_redb_error)?;
@@ -58,7 +163,12 @@ impl RedbV2Store {
                 .map_err(map_redb_error)?;
         }
         write.commit().map_err(map_redb_error)?;
-        Ok(Self { database })
+        Ok(Self { database, path })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn insert_offer_source(
@@ -314,6 +424,15 @@ impl RedbV2Store {
                 return Err(StoreError::new("offer card does not exist"));
             };
             let mut record: OfferCardRecord = decode_json!(&bytes)?;
+            record.availability = match status.code {
+                meshelf_core::OfferAttemptCode::SourceUnavailable => {
+                    meshelf_core::CardAvailability::SourceUnavailable
+                }
+                meshelf_core::OfferAttemptCode::SourceChanged => {
+                    meshelf_core::CardAvailability::SourceChanged
+                }
+                _ => record.availability,
+            };
             record.last_attempt = Some(status);
             let encoded = encode_json!(&record)?;
             table
@@ -414,16 +533,24 @@ impl RedbV2Store {
         write.commit().map_err(map_redb_error)
     }
 
-    /// Deletes all journaled staging roots. A missing root is already clean;
-    /// any other cleanup failure is reported and its journal entry is kept.
+    /// Deletes abandoned journaled staging. A journal that records an uncertain
+    /// clipboard side effect is preserved so a later activation cannot replay it.
     pub fn startup_cleanup(&self) -> Result<CleanupReport, StoreError> {
         let entries = self.activation_journal_entries()?;
         let journaled_entries = u32::try_from(entries.len())
             .map_err(|_| StoreError::new("too many activation journal entries"))?;
         let mut removed = Vec::new();
         let mut failures = Vec::new();
+        let mut record_uncertain = Vec::new();
 
         for entry in &entries {
+            if entry.state.is_uncertain_side_effect() {
+                let _ = remove_owned_tree(&entry.staging_root);
+                if entry.state != meshelf_core::ActivationState::UncertainNoReplay {
+                    record_uncertain.push(entry.activation_id);
+                }
+                continue;
+            }
             match remove_owned_tree(&entry.staging_root) {
                 Ok(()) => removed.push(entry.activation_id),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -447,6 +574,13 @@ impl RedbV2Store {
             write.commit().map_err(map_redb_error)?;
         }
 
+        for activation_id in &record_uncertain {
+            self.update_activation_state(
+                *activation_id,
+                meshelf_core::ActivationState::UncertainNoReplay,
+            )?;
+        }
+
         if !failures.is_empty() {
             let failed_ids = failures
                 .iter()
@@ -465,6 +599,16 @@ impl RedbV2Store {
             removed_entries: u32::try_from(removed.len())
                 .map_err(|_| StoreError::new("too many cleaned activation entries"))?,
         })
+    }
+
+    pub fn has_uncertain_side_effect(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .activation_journal_entries()?
+            .iter()
+            .any(|entry| entry.state.is_uncertain_side_effect())
+            || self
+                .get_clipboard_cache(ClipboardCacheState::InFlight)?
+                .is_some())
     }
 
     pub fn set_clipboard_cache(&self, record: &ClipboardCacheRecord) -> Result<(), StoreError> {
@@ -750,7 +894,11 @@ fn cache_key(state: ClipboardCacheState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs, path::PathBuf};
+    use std::{
+        collections::HashSet,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use meshelf_core::{
         ActivationId, ActivationJournalEntry, ActivationMode, ActivationState, CardAvailability,
@@ -802,6 +950,74 @@ mod tests {
                 text: text.to_owned(),
             },
         )
+    }
+
+    #[test]
+    fn normalize_path_keeps_repeated_leading_parent_dirs() {
+        assert_eq!(
+            super::normalize_path(PathBuf::from("../../offers.redb")),
+            PathBuf::from("../../offers.redb")
+        );
+        assert_eq!(
+            super::normalize_path(PathBuf::from("../../../offers.redb")),
+            PathBuf::from("../../../offers.redb")
+        );
+        assert_eq!(
+            super::normalize_path(PathBuf::from("../foo/../../offers.redb")),
+            PathBuf::from("../../offers.redb")
+        );
+        assert_eq!(
+            super::normalize_path(PathBuf::from("/../../offers.redb")),
+            PathBuf::from("/offers.redb")
+        );
+    }
+
+    #[test]
+    fn equivalent_store_spellings_share_identity_before_the_file_exists() {
+        let directory = tempdir().expect("temporary directory");
+        let base = directory.path().join("offers.redb");
+        let dotted = directory.path().join(".").join("offers.redb");
+        let via_parent = directory
+            .path()
+            .join("subdir")
+            .join("..")
+            .join("offers.redb");
+        let first = super::store_identity(&base).expect("base identity");
+        assert_eq!(
+            first,
+            super::store_identity(&dotted).expect("dotted identity")
+        );
+        assert_eq!(
+            first,
+            super::store_identity(&via_parent).expect("parent-dotdot identity")
+        );
+    }
+
+    #[test]
+    fn unresolvable_store_path_fails_explicitly() {
+        let error = super::store_identity(Path::new("")).expect_err("empty path has no file name");
+        assert!(error.message().contains("no file name"));
+    }
+
+    #[test]
+    fn two_opens_of_the_same_path_share_store_identity() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("offers.redb");
+        let first = RedbV2Store::open(&path).expect("open first handle");
+        let second = RedbV2Store::open(&path).expect("open second handle");
+        assert_eq!(first.path(), second.path());
+        let input = text_input("shared identity");
+        let id = input.offer_id;
+        first
+            .insert_offer_source(input)
+            .expect("insert on first handle");
+        assert!(
+            second
+                .get_offer_source(id)
+                .expect("read second handle")
+                .is_some(),
+            "a second open of the same path must observe the first handle's writes"
+        );
     }
 
     #[test]
@@ -1165,6 +1381,48 @@ mod tests {
                 .expect("journal entry"),
             entry
         );
+    }
+
+    #[test]
+    fn uncertain_journal_survives_startup_cleanup() {
+        let (directory, store) = store();
+        let root = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+        let abandoned = journal_entry(root.join("abandoned"));
+        let mut uncertain = journal_entry(root.join("uncertain"));
+        uncertain.state = ActivationState::UncertainNoReplay;
+        store.prepare_staging(&abandoned).expect("abandoned");
+        store.prepare_staging(&uncertain).expect("uncertain");
+        let report = store.startup_cleanup().expect("cleanup");
+        assert_eq!(report.removed_entries, 1);
+        assert!(!abandoned.staging_root.exists());
+        assert!(
+            store
+                .get_activation_journal(abandoned.activation_id)
+                .expect("abandoned journal")
+                .is_none()
+        );
+        let kept = store
+            .get_activation_journal(uncertain.activation_id)
+            .expect("uncertain journal")
+            .expect("preserved");
+        assert_eq!(kept.state, ActivationState::UncertainNoReplay);
+        assert!(store.has_uncertain_side_effect().expect("uncertain marker"));
+    }
+
+    #[test]
+    fn applying_clipboard_journal_is_recorded_uncertain_and_kept() {
+        let (directory, store) = store();
+        let root = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+        let mut applying = journal_entry(root.join("applying"));
+        applying.state = ActivationState::ApplyingClipboard;
+        store.prepare_staging(&applying).expect("applying");
+        store.startup_cleanup().expect("cleanup");
+        let kept = store
+            .get_activation_journal(applying.activation_id)
+            .expect("journal")
+            .expect("preserved");
+        assert_eq!(kept.state, ActivationState::UncertainNoReplay);
+        assert!(store.has_uncertain_side_effect().expect("uncertain marker"));
     }
 
     #[test]

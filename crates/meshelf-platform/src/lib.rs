@@ -12,7 +12,10 @@ pub use activation::{
     MAX_CONTROL_REQUEST_BYTES, MAX_CONTROL_RESPONSE_BYTES, ResidentLock, acquire_resident_lock,
     listen, listen_with_control, request, signal,
 };
-pub use clipboard::{ClipboardItem, ClipboardSource, ClipboardWorker, PlatformClipboardError};
+pub use clipboard::{
+    ClipboardItem, ClipboardSource, ClipboardWorker, NativeClipboard, PlatformClipboardError,
+    write_files_on, write_text_on,
+};
 #[cfg(windows)]
 pub use filesystem::windows_verbatim_path;
 pub use filesystem::{

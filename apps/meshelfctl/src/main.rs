@@ -19,9 +19,10 @@ use meshelf_core::{
 };
 use meshelf_identity::InstallationIdentity;
 use meshelf_net::{
-    FetchActivation, FetchClipboard, FetchReceiver, OfferAnnouncementHandler, OfferFetchHandler,
-    PeerClient, ServerIdentity, TrustDecision, TrustGate, V2OfferServices,
-    bind_discovered_tailscale_std_listener, serve_v2_with_offers_and_fetch,
+    ActivationOutcome, ActivationService, FetchActivation, FetchClipboard,
+    OfferAnnouncementHandler, OfferFetchHandler, PeerClient, ServerIdentity, TrustDecision,
+    TrustGate, V2OfferServices, bind_discovered_tailscale_std_listener, select_discovered_ip,
+    select_discovered_socket, serve_v2_with_offers_and_fetch,
 };
 use meshelf_platform::{
     ClipboardItem, ClipboardSource, ClipboardWorker, acquire_resident_lock, listen_with_control,
@@ -264,8 +265,7 @@ struct HeadlessRuntime {
     state_path: PathBuf,
     identity: InstallationIdentity,
     device_name: String,
-    offer_store: Arc<RedbV2Store>,
-    state_root: PathBuf,
+    activations: Arc<ActivationService<HeadlessActivationClipboard>>,
 }
 
 impl LocalRuntime for HeadlessRuntime {
@@ -278,7 +278,7 @@ impl LocalRuntime for HeadlessRuntime {
         )?)
     }
 
-    fn activate(&self, plan: &ActivationPlan) -> Result<(), String> {
+    fn activate(&self, plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
         let state = InstallationStore::new(self.state_path.clone())
             .load_for_identity(self.identity.device_id)
             .map_err(|error| format!("could not load meshelf state: {error}"))?;
@@ -286,13 +286,7 @@ impl LocalRuntime for HeadlessRuntime {
             .peers
             .by_device_id(plan.source_device)
             .ok_or_else(|| "the offer's source device is not paired".to_owned())?;
-        let address = peer
-            .addresses
-            .iter()
-            .copied()
-            .find(|address| address.is_ipv4())
-            .or_else(|| peer.addresses.first().copied())
-            .map(|address| SocketAddr::new(address, MESHELF_PORT))
+        let address = select_discovered_socket(&peer.addresses, MESHELF_PORT)
             .ok_or_else(|| "the offer's source device has no address".to_owned())?;
         let destination = match plan.mode {
             ActivationMode::Clipboard => None,
@@ -326,14 +320,8 @@ impl LocalRuntime for HeadlessRuntime {
             ),
             expected_server_public_key: peer.public_key.clone(),
         };
-        let offer_store = self.offer_store.clone();
-        let state_root = self.state_root.clone();
-        let clipboard = if plan.mode == ActivationMode::Clipboard {
-            Some(ClipboardWorker::new().map_err(|error| error.to_string())?)
-        } else {
-            None
-        };
-        run_headless_activation(input, offer_store, clipboard, state_root)
+        let (_cancel, cancel) = watch::channel(false);
+        run_headless_activation(input, self.activations.clone(), cancel)
     }
 }
 
@@ -347,34 +335,24 @@ struct HeadlessActivationInput {
 
 fn run_headless_activation(
     input: HeadlessActivationInput,
-    offer_store: Arc<RedbV2Store>,
-    clipboard: Option<ClipboardWorker>,
-    state_root: PathBuf,
-) -> Result<(), String> {
-    let local_device = input.hello.device_id;
-    let receiver = FetchReceiver::new(
-        local_device,
-        offer_store,
-        Arc::new(HeadlessActivationClipboard(clipboard)),
-        state_root,
-    );
-    receiver
-        .startup_cleanup()
-        .map_err(|error| format!("activation cleanup is unavailable: {error}"))?;
+    service: Arc<ActivationService<HeadlessActivationClipboard>>,
+    cancel: watch::Receiver<bool>,
+) -> Result<ActivationOutcome, String> {
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("activation runtime unavailable: {error}"))?;
     let client = PeerClient::with_timeouts(Duration::from_secs(3), Duration::from_secs(5));
     runtime.block_on(async move {
-        client
-            .fetch_v2(
+        service
+            .activate(
+                &client,
                 input.address,
                 input.hello,
                 input.request,
                 input.activation,
                 &input.expected_server_public_key,
-                &receiver,
+                cancel,
             )
             .await
             .map_err(|error| error.to_string())
@@ -389,13 +367,7 @@ fn start_v2_listener(
         .last_status
         .as_ref()
         .ok_or_else(|| "Tailscale status is unavailable".to_owned())?;
-    let address = status
-        .self_node
-        .addresses
-        .iter()
-        .copied()
-        .find(|address| address.is_ipv4())
-        .or_else(|| status.self_node.addresses.first().copied())
+    let address = select_discovered_ip(&status.self_node.addresses)
         .ok_or_else(|| "Tailscale supplied no local address".to_owned())?;
     let listener = bind_discovered_tailscale_std_listener(
         SocketAddr::new(address, MESHELF_PORT),
@@ -489,12 +461,20 @@ fn run_serve(args: Vec<String>) -> Result<()> {
         )
         .with_card_store(offer_store.clone()),
     );
+    let activations = Arc::new(ActivationService::new(
+        controller.identity.device_id,
+        offer_store.clone(),
+        Arc::new(HeadlessActivationClipboard(ClipboardWorker::new().ok())),
+        data_dir.clone(),
+    ));
+    activations
+        .recover()
+        .map_err(|error| anyhow::anyhow!("activation cleanup is unavailable: {error}"))?;
     let runtime = Arc::new(HeadlessRuntime {
         state_path,
         identity: controller.identity.clone(),
         device_name: controller.device_name.clone(),
-        offer_store,
-        state_root: data_dir.clone(),
+        activations,
     });
     let control_coordinator = coordinator.clone();
     let control_runtime = runtime.clone();
@@ -661,6 +641,7 @@ fn run_activate(args: Vec<String>) -> Result<()> {
         } => println!(
             "activation {activation_id} completed for {offer_id} ({mode:?}; files {files_processed}, bytes {bytes_processed})"
         ),
+        LocalResponse::ActivationCancelled { .. } => bail!("activation cancelled"),
         LocalResponse::ActivationRefused { message } => bail!("{message}"),
         LocalResponse::Error { message } => bail!("{message}"),
         other => bail!("resident returned an unexpected response: {other:?}"),
@@ -672,4 +653,21 @@ fn usage() -> Result<()> {
     bail!(
         "usage: meshelfctl [status|refresh|clipboard-read|send|serve|announce|shelf|activate] [--peer NAME_OR_ID]\n  send requires exactly one of --clipboard, --stdin, or --text TEXT\n  announce requires exactly one of --clipboard, --text TEXT, --stdin, or --path PATH\n  activate requires OFFER_ID and optionally --save"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    fn mixed_family_peer_selects_listener_family_for_bind_and_activation() {
+        let ipv6: IpAddr = "::1".parse().expect("ipv6");
+        let ipv4: IpAddr = "127.0.0.1".parse().expect("ipv4");
+        let addresses = [ipv6, ipv4];
+        let bind = select_discovered_ip(&addresses).expect("bind");
+        let dial = select_discovered_socket(&addresses, MESHELF_PORT).expect("dial");
+        assert_eq!(bind, ipv4);
+        assert_eq!(dial.ip(), bind);
+    }
 }

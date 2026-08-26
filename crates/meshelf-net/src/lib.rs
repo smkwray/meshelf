@@ -1,9 +1,14 @@
 //! Direct protocol-2 transport for metadata announcements and user-initiated fetches.
 
+mod activation;
 mod destination;
 mod fetch_receiver;
 mod fetch_sender;
 
+pub use activation::{
+    ActivationFailCode, ActivationOutcome, ActivationRefuseCode, ActivationService,
+    MAX_CONCURRENT_ACTIVATIONS,
+};
 pub use fetch_receiver::{
     FetchActivation, FetchClipboard, FetchReceiver, OfferFetchReceiver, ReservationError,
     ReservationLedger, ReservationPermit, V2FetchReceiver,
@@ -24,10 +29,11 @@ use meshelf_core::{
 };
 use meshelf_identity::InstallationIdentity;
 use meshelf_protocol::{
-    CAP_OFFER_PULL_V2, ClientHello, FetchAdmissionCode, FetchReceiptCode, FetchRefusalCode,
-    OfferAck, OfferAckCode, OfferAnnouncement, ProtocolError, ServerHello, V2_MAX_INBOUND_HANDLERS,
-    V2_PROTOCOL_VERSION, V2Message, WireMessage, read_client_hello_async, read_frame_async,
-    read_v2_frame_async, validate_v2_message, write_frame_async, write_v2_frame_async,
+    CAP_OFFER_PULL_V2, ClientHello, FetchAbortCode, FetchAdmissionCode, FetchReceiptCode,
+    FetchRefusalCode, OfferAck, OfferAckCode, OfferAnnouncement, ProtocolError, ServerHello,
+    V2_MAX_INBOUND_HANDLERS, V2_PROTOCOL_VERSION, V2Message, WireMessage, read_client_hello_async,
+    read_frame_async, read_v2_frame_async, validate_v2_message, write_frame_async,
+    write_v2_frame_async,
 };
 use meshelf_store::RedbV2Store;
 use thiserror::Error;
@@ -57,8 +63,9 @@ mod restored_v2_tests {
         ActivationId, OfferAttemptCode, OfferDescriptor, OfferSource, OfferSourceInput,
     };
     use meshelf_protocol::{
-        ClientHello, FetchAbortCode, FetchReceipt, FetchRefusal, FetchRefusalCode, FetchRequest,
-        ManifestEntry, V2_MAX_INBOUND_HANDLERS, V2_MAX_MANIFEST_BYTES,
+        ClientHello, FetchAbortCode, FetchAdmission, FetchHeader, FetchReceipt, FetchRefusal,
+        FetchRefusalCode, FetchRequest, FileEnd, FileEntryKind, FileStart, ManifestChunk,
+        ManifestEnd, ManifestEntry, V2_MAX_INBOUND_HANDLERS, V2_MAX_MANIFEST_BYTES,
     };
     use sha2::{Digest, Sha256};
     use tokio::{
@@ -815,10 +822,7 @@ mod restored_v2_tests {
             Arc::new(NoopFetchClipboard),
             activating_root,
         );
-        receiver
-            .startup_cleanup()
-            .expect("activating peer startup cleanup");
-        PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+        let outcome = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
             .fetch_v2(
                 origin_address,
                 ClientHello::signed_v2(
@@ -834,6 +838,7 @@ mod restored_v2_tests {
             )
             .await
             .expect("activating peer fetch");
+        assert_eq!(outcome, ActivationOutcome::Completed);
 
         let activation_card = receiver
             .store()
@@ -994,11 +999,14 @@ mod restored_v2_tests {
     }
 
     #[tokio::test]
-    async fn eleventh_card_returns_capacity_with_ten_of_ten_counts() {
+    async fn eleventh_card_purges_oldest_and_survives_reopen() {
         let source_identity = meshelf_identity::InstallationIdentity::generate();
-        let (_directory, address, target_identity, shutdown_tx, server, store) =
+        let (directory, address, target_identity, shutdown_tx, server, store) =
             start_offer_server([source_identity.device_id]).await;
+        let mut ids = Vec::new();
         for index in 0..V2_MAX_LIVE_ENTRIES {
+            let offer_id = OfferId::new();
+            ids.push(offer_id);
             let ack = send_announcement(
                 address,
                 &source_identity,
@@ -1006,14 +1014,18 @@ mod restored_v2_tests {
                 text_announcement(
                     source_identity.device_id,
                     target_identity.device_id,
-                    OfferId::new(),
+                    offer_id,
                     &format!("card {index}"),
                 ),
             )
             .await
             .expect("announcement within capacity");
             assert_eq!(ack.code, OfferAckCode::Stored);
+            assert_eq!(ack.pruned_entries, 0);
+            assert_eq!(ack.live_entries, index + 1);
         }
+        let eleventh_id = OfferId::new();
+        ids.push(eleventh_id);
         let eleventh = send_announcement(
             address,
             &source_identity,
@@ -1021,17 +1033,35 @@ mod restored_v2_tests {
             text_announcement(
                 source_identity.device_id,
                 target_identity.device_id,
-                OfferId::new(),
+                eleventh_id,
                 "eleventh",
             ),
         )
         .await
-        .expect("capacity acknowledgement");
-        assert_eq!(eleventh.code, OfferAckCode::RefusedCapacity);
+        .expect("eleventh announcement");
+        assert_eq!(eleventh.code, OfferAckCode::Stored);
         assert_eq!(eleventh.live_entries, V2_MAX_LIVE_ENTRIES);
         assert_eq!(eleventh.max_live_entries, V2_MAX_LIVE_ENTRIES);
-        assert_eq!(store.read_offer_shelf().expect("read shelf").len(), 10);
+        assert_eq!(eleventh.pruned_entries, 1);
+
+        let shelf = store.read_offer_shelf().expect("read shelf");
+        assert_eq!(shelf.len(), 10);
+        let stored: HashSet<_> = shelf.iter().map(|card| card.offer_id).collect();
+        assert!(!stored.contains(&ids[0]), "card 1 must be purged");
+        assert!(stored.contains(&eleventh_id), "card 11 must be present");
+        let expected: HashSet<_> = ids.iter().skip(1).copied().collect();
+        assert_eq!(stored, expected);
+
         stop_offer_server(shutdown_tx, server).await;
+        drop(store);
+        let reopened =
+            RedbV2Store::open(directory.path().join("offers.redb")).expect("reopen store");
+        let reopened_shelf = reopened.read_offer_shelf().expect("read reopened shelf");
+        assert_eq!(reopened_shelf.len(), 10);
+        let reopened_ids: HashSet<_> = reopened_shelf.iter().map(|card| card.offer_id).collect();
+        assert_eq!(reopened_ids, expected);
+        assert!(!reopened_ids.contains(&ids[0]));
+        assert!(reopened_ids.contains(&eleventh_id));
     }
 
     #[tokio::test]
@@ -1694,6 +1724,1262 @@ mod restored_v2_tests {
         assert!(refusal.detail.is_none());
         stop_offer_server(shutdown_tx, server).await;
     }
+
+    fn insert_receiver_card(
+        store: &RedbV2Store,
+        source: DeviceId,
+        offer_id: OfferId,
+        descriptor: OfferDescriptor,
+    ) {
+        store
+            .insert_offer_card(OfferCardInput::new(
+                source,
+                offer_id,
+                descriptor,
+                CardAvailability::Available,
+            ))
+            .expect("insert receiver card");
+    }
+
+    async fn wait_until_journaled(store: &RedbV2Store, activation_id: ActivationId) {
+        for _ in 0..1_000 {
+            if store
+                .get_activation_journal(activation_id)
+                .expect("read journal")
+                .is_some()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("activation was not journaled");
+    }
+
+    async fn wait_until_exists(path: &Path) {
+        for _ in 0..1_000 {
+            if path.exists() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("path was not created: {}", path.display());
+    }
+
+    fn assert_card_state(
+        store: &RedbV2Store,
+        source: DeviceId,
+        offer_id: OfferId,
+        availability: CardAvailability,
+        attempt: OfferAttemptCode,
+    ) {
+        let card = store
+            .get_offer_card(source, offer_id)
+            .expect("read card")
+            .expect("card");
+        assert_eq!(card.availability, availability);
+        assert_eq!(
+            card.last_attempt.expect("attempt").code,
+            attempt,
+            "card attempt"
+        );
+    }
+
+    async fn typed_fetch_file(
+        mutate: impl FnOnce(&Path),
+        destination: Option<PathBuf>,
+        receiver_root: PathBuf,
+        receiver_store: Arc<RedbV2Store>,
+        clipboard: Arc<NoopFetchClipboard>,
+    ) -> (
+        ActivationOutcome,
+        tempfile::TempDir,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<(), NetError>>,
+        PathBuf,
+        DeviceId,
+        OfferId,
+        Arc<RedbV2Store>,
+    ) {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (origin_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path = source_directory.path().join("payload.txt");
+        fs::write(&path, b"body").expect("write source");
+        let offer_id = OfferId::new();
+        let descriptor = insert_file_source(&store, requester.device_id, offer_id, &path);
+        mutate(&path);
+        insert_receiver_card(&receiver_store, origin.device_id, offer_id, descriptor);
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let activation = FetchActivation::new(
+            request.request_id,
+            origin.device_id,
+            offer_id,
+            if destination.is_some() {
+                meshelf_core::ActivationMode::Save
+            } else {
+                meshelf_core::ActivationMode::Clipboard
+            },
+            destination,
+        );
+        let receiver = FetchReceiver::new(
+            requester.device_id,
+            receiver_store.clone(),
+            clipboard,
+            receiver_root,
+        );
+        let outcome = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+            .fetch_v2(
+                address,
+                ClientHello::signed_v2(
+                    requester.device_id,
+                    "REQ",
+                    request.request_id.to_string(),
+                    &requester,
+                ),
+                request,
+                activation,
+                &origin.public_key(),
+                &receiver,
+            )
+            .await
+            .expect("typed fetch");
+        (
+            outcome,
+            origin_directory,
+            shutdown_tx,
+            server,
+            path,
+            origin.device_id,
+            offer_id,
+            receiver_store,
+        )
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_deleted_source_is_refused_source_unavailable() {
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        let (outcome, _origin_dir, shutdown_tx, server, _path, source, offer_id, store) =
+            typed_fetch_file(
+                |path| fs::remove_file(path).expect("delete source"),
+                Some(receiver_root.join("received")),
+                receiver_root.clone(),
+                receiver_store,
+                Arc::new(NoopFetchClipboard),
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            ActivationOutcome::Refused(ActivationRefuseCode::SourceUnavailable)
+        );
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        assert_card_state(
+            &store,
+            source,
+            offer_id,
+            CardAvailability::SourceUnavailable,
+            OfferAttemptCode::SourceUnavailable,
+        );
+        assert_no_payload_artifacts(&receiver_root);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_changed_source_is_refused_source_changed() {
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        let (outcome, _origin_dir, shutdown_tx, server, _path, source, offer_id, store) =
+            typed_fetch_file(
+                |path| fs::write(path, b"changed body").expect("change source"),
+                Some(receiver_root.join("received")),
+                receiver_root.clone(),
+                receiver_store,
+                Arc::new(NoopFetchClipboard),
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            ActivationOutcome::Refused(ActivationRefuseCode::SourceChanged)
+        );
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        assert_card_state(
+            &store,
+            source,
+            offer_id,
+            CardAvailability::SourceChanged,
+            OfferAttemptCode::SourceChanged,
+        );
+        assert_no_payload_artifacts(&receiver_root);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_destination_unavailable_is_refused() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path = source_directory.path().join("payload.txt");
+        fs::write(&path, b"body").expect("write source");
+        let offer_id = OfferId::new();
+        let descriptor = insert_file_source(&store, requester.device_id, offer_id, &path);
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        insert_receiver_card(&receiver_store, origin.device_id, offer_id, descriptor);
+        let blocker = receiver_root.join("blocked");
+        fs::write(&blocker, b"not a directory").expect("write blocker");
+        let destination = blocker.join("received");
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let activation = FetchActivation::new(
+            request.request_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(destination),
+        );
+        let receiver = FetchReceiver::new(
+            requester.device_id,
+            receiver_store.clone(),
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+        );
+        let outcome = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+            .fetch_v2(
+                address,
+                ClientHello::signed_v2(
+                    requester.device_id,
+                    "REQ",
+                    request.request_id.to_string(),
+                    &requester,
+                ),
+                request,
+                activation,
+                &origin.public_key(),
+                &receiver,
+            )
+            .await
+            .expect("typed fetch");
+        assert_eq!(
+            outcome,
+            ActivationOutcome::Refused(ActivationRefuseCode::DestinationUnavailable)
+        );
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        assert_eq!(
+            receiver_store
+                .get_offer_card(origin.device_id, offer_id)
+                .expect("card")
+                .expect("card")
+                .last_attempt
+                .expect("attempt")
+                .code,
+            OfferAttemptCode::Failed
+        );
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_origin_abort_after_admission_preserves_source_changed() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let root = source_directory.path().join("folder");
+        fs::create_dir(&root).expect("create folder");
+        fs::write(root.join("one.txt"), vec![b'a'; 256 * 1024]).expect("write first");
+        fs::write(root.join("two.txt"), b"two").expect("write second");
+        let offer_id = OfferId::new();
+        let descriptor = insert_folder_source(&store, requester.device_id, offer_id, &root);
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        insert_receiver_card(&receiver_store, origin.device_id, offer_id, descriptor);
+        let destination = receiver_root.join("received");
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let activation_id = request.request_id;
+        let activation = FetchActivation::new(
+            activation_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(destination),
+        );
+        let receiver = FetchReceiver::new(
+            requester.device_id,
+            receiver_store.clone(),
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+        );
+        let fetch = tokio::spawn({
+            let hello = ClientHello::signed_v2(
+                requester.device_id,
+                "REQ",
+                activation_id.to_string(),
+                &requester,
+            );
+            let key = origin.public_key();
+            async move {
+                PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+                    .fetch_v2(address, hello, request, activation, &key, &receiver)
+                    .await
+            }
+        });
+        wait_until_journaled(&receiver_store, activation_id).await;
+        fs::write(root.join("two.txt"), b"changed after admission").expect("change second file");
+        let outcome = fetch.await.expect("fetch join").expect("typed fetch");
+        assert_eq!(
+            outcome,
+            ActivationOutcome::Failed(ActivationFailCode::SourceChanged)
+        );
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        assert_card_state(
+            &receiver_store,
+            origin.device_id,
+            offer_id,
+            CardAvailability::SourceChanged,
+            OfferAttemptCode::SourceChanged,
+        );
+        assert_no_payload_artifacts(&receiver_root);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    async fn speak_fetch_hello(
+        listener: TcpListener,
+        origin: meshelf_identity::InstallationIdentity,
+    ) -> (TcpStream, FetchRequest) {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let hello = read_frame_async(&mut stream).await.expect("hello");
+        let WireMessage::ClientHello(_) = hello else {
+            panic!("expected client hello");
+        };
+        let response = WireMessage::ServerHello(ServerHello::signed(
+            V2_PROTOCOL_VERSION,
+            origin.device_id,
+            "origin".to_owned(),
+            true,
+            None,
+            vec![CAP_OFFER_PULL_V2.to_owned()],
+            &origin,
+        ));
+        write_frame_async(&mut stream, &response)
+            .await
+            .expect("server hello");
+        let request = read_v2_frame_async(&mut stream).await.expect("request");
+        let V2Message::FetchRequest(request) = request else {
+            panic!("expected fetch request");
+        };
+        (stream, request)
+    }
+
+    async fn write_valid_file_header(
+        stream: &mut TcpStream,
+        request: &FetchRequest,
+        descriptor: &OfferDescriptor,
+    ) -> ManifestEntry {
+        let entry = ManifestEntry {
+            relative_path: String::new(),
+            kind: FileEntryKind::File,
+            byte_len: 3,
+        };
+        let manifest_sha256 = Sha256::digest(
+            serde_json::to_vec(std::slice::from_ref(&entry)).expect("manifest json"),
+        )
+        .to_vec();
+        let chunk = ManifestChunk::new(request.request_id, 0, vec![entry.clone()]).expect("chunk");
+        let manifest_encoded_bytes =
+            meshelf_protocol::encoded_manifest_bytes(std::slice::from_ref(&chunk))
+                .expect("manifest size") as u64;
+        write_v2_frame_async(
+            stream,
+            &V2Message::FetchHeader(FetchHeader {
+                request_id: request.request_id,
+                offer_id: request.offer_id,
+                descriptor: descriptor.clone(),
+                manifest_entries: 1,
+                manifest_encoded_bytes,
+                text_sha256: None,
+                manifest_sha256: Some(manifest_sha256.clone()),
+            }),
+        )
+        .await
+        .expect("header");
+        write_v2_frame_async(stream, &V2Message::ManifestChunk(chunk))
+            .await
+            .expect("chunk");
+        write_v2_frame_async(
+            stream,
+            &V2Message::ManifestEnd(ManifestEnd {
+                request_id: request.request_id,
+                entry_count: 1,
+                file_count: 1,
+                total_bytes: 3,
+                manifest_sha256,
+            }),
+        )
+        .await
+        .expect("manifest end");
+        entry
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_disconnect_is_failed_connection_lost() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let origin = meshelf_identity::InstallationIdentity::generate();
+        let origin_for_server = origin.clone();
+        let descriptor = OfferDescriptor::File {
+            root_name: "payload.txt".to_owned(),
+            total_bytes: 3,
+        };
+        let header_descriptor = descriptor.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, request) = speak_fetch_hello(listener, origin_for_server).await;
+            let _ = write_valid_file_header(&mut stream, &request, &header_descriptor).await;
+            let admission = read_v2_frame_async(&mut stream).await.expect("admission");
+            let V2Message::FetchAdmission(FetchAdmission { code, .. }) = admission else {
+                panic!("expected admission");
+            };
+            assert_eq!(code, meshelf_protocol::FetchAdmissionCode::Accepted);
+            write_v2_frame_async(
+                &mut stream,
+                &V2Message::FileStart(FileStart {
+                    request_id: request.request_id,
+                    entry_index: 0,
+                    byte_len: 3,
+                }),
+            )
+            .await
+            .expect("file start");
+            stream.write_all(b"a").await.expect("partial payload");
+            drop(stream);
+        });
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        let offer_id = OfferId::new();
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        insert_receiver_card(&receiver_store, origin.device_id, offer_id, descriptor);
+        let activation = FetchActivation::new(
+            request.request_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(receiver_root.join("received")),
+        );
+        let receiver = FetchReceiver::new(
+            requester.device_id,
+            receiver_store,
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+        );
+        let outcome = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+            .fetch_v2(
+                address,
+                ClientHello::signed_v2(
+                    requester.device_id,
+                    "REQ",
+                    request.request_id.to_string(),
+                    &requester,
+                ),
+                request,
+                activation,
+                &origin.public_key(),
+                &receiver,
+            )
+            .await
+            .expect("typed fetch");
+        server.await.expect("server join");
+        assert_eq!(
+            outcome,
+            ActivationOutcome::Failed(ActivationFailCode::ConnectionLost)
+        );
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        assert_no_payload_artifacts(&receiver_root);
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_verification_failure_is_failed_not_completed() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let origin = meshelf_identity::InstallationIdentity::generate();
+        let origin_for_server = origin.clone();
+        let descriptor = OfferDescriptor::File {
+            root_name: "payload.txt".to_owned(),
+            total_bytes: 3,
+        };
+        let header_descriptor = descriptor.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, request) = speak_fetch_hello(listener, origin_for_server).await;
+            let _ = write_valid_file_header(&mut stream, &request, &header_descriptor).await;
+            let _ = read_v2_frame_async(&mut stream).await.expect("admission");
+            write_v2_frame_async(
+                &mut stream,
+                &V2Message::FileStart(FileStart {
+                    request_id: request.request_id,
+                    entry_index: 0,
+                    byte_len: 3,
+                }),
+            )
+            .await
+            .expect("file start");
+            stream.write_all(b"abc").await.expect("payload");
+            write_v2_frame_async(
+                &mut stream,
+                &V2Message::FileEnd(FileEnd {
+                    request_id: request.request_id,
+                    entry_index: 0,
+                    sha256: vec![0; 32],
+                }),
+            )
+            .await
+            .expect("wrong digest");
+            let _ = read_v2_frame_async(&mut stream).await;
+        });
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        let offer_id = OfferId::new();
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        insert_receiver_card(&receiver_store, origin.device_id, offer_id, descriptor);
+        let activation = FetchActivation::new(
+            request.request_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(receiver_root.join("received")),
+        );
+        let receiver = FetchReceiver::new(
+            requester.device_id,
+            receiver_store.clone(),
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+        );
+        let outcome = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+            .fetch_v2(
+                address,
+                ClientHello::signed_v2(
+                    requester.device_id,
+                    "REQ",
+                    request.request_id.to_string(),
+                    &requester,
+                ),
+                request,
+                activation,
+                &origin.public_key(),
+                &receiver,
+            )
+            .await
+            .expect("typed fetch");
+        server.await.expect("server join");
+        assert_eq!(
+            outcome,
+            ActivationOutcome::Failed(ActivationFailCode::VerificationFailed)
+        );
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        assert_eq!(
+            receiver_store
+                .get_offer_card(origin.device_id, offer_id)
+                .expect("card")
+                .expect("card")
+                .last_attempt
+                .expect("attempt")
+                .code,
+            OfferAttemptCode::VerificationFailed
+        );
+        assert_no_payload_artifacts(&receiver_root);
+    }
+
+    #[tokio::test]
+    async fn two_live_activations_do_not_cleanup_each_other() {
+        let first = meshelf_identity::InstallationIdentity::generate();
+        let second = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([first.device_id, second.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path_a = source_directory.path().join("a.txt");
+        let path_b = source_directory.path().join("b.txt");
+        fs::write(&path_a, vec![b'a'; 64 * 1024]).expect("write a");
+        fs::write(&path_b, b"b").expect("write b");
+        let offer_a = OfferId::new();
+        let offer_b = OfferId::new();
+        let descriptor_a = insert_file_source(&store, first.device_id, offer_a, &path_a);
+        let descriptor_b = insert_file_source(&store, second.device_id, offer_b, &path_b);
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        insert_receiver_card(&receiver_store, origin.device_id, offer_a, descriptor_a);
+        insert_receiver_card(&receiver_store, origin.device_id, offer_b, descriptor_b);
+        let service = Arc::new(ActivationService::new(
+            first.device_id,
+            receiver_store.clone(),
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+        ));
+        service.recover().expect("startup recovery");
+        assert_eq!(service.recovery_runs(), 1);
+        let request_a = FetchRequest::new(offer_a, origin.device_id, first.device_id);
+        let request_b = FetchRequest::new(offer_b, origin.device_id, second.device_id);
+        let activation_a = FetchActivation::new(
+            request_a.request_id,
+            origin.device_id,
+            offer_a,
+            meshelf_core::ActivationMode::Save,
+            Some(receiver_root.join("received-a")),
+        );
+        let activation_b = FetchActivation::new(
+            request_b.request_id,
+            origin.device_id,
+            offer_b,
+            meshelf_core::ActivationMode::Save,
+            Some(receiver_root.join("received-b")),
+        );
+        let id_a = request_a.request_id;
+        let client = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT);
+        let (_cancel_a, cancel_a) = watch::channel(false);
+        let (_cancel_b, cancel_b) = watch::channel(false);
+        let service_a = service.clone();
+        let hello_a = ClientHello::signed_v2(
+            first.device_id,
+            "A",
+            request_a.request_id.to_string(),
+            &first,
+        );
+        let key = origin.public_key();
+        let fetch_a = tokio::spawn({
+            let client = client.clone();
+            async move {
+                service_a
+                    .activate(
+                        &client,
+                        address,
+                        hello_a,
+                        request_a,
+                        activation_a,
+                        &key,
+                        cancel_a,
+                    )
+                    .await
+            }
+        });
+        wait_until_journaled(&receiver_store, id_a).await;
+        let staging_a = receiver_root.join("staging").join(id_a.to_string());
+        assert!(staging_a.exists(), "A must be journaled with staging");
+        service.recover().expect("second recover is a no-op");
+        assert_eq!(service.recovery_runs(), 1);
+        assert!(
+            staging_a.exists(),
+            "B's admission path must not purge A's staging"
+        );
+        let hello_b = ClientHello::signed_v2(
+            second.device_id,
+            "B",
+            request_b.request_id.to_string(),
+            &second,
+        );
+        let outcome_b = service
+            .activate(
+                &client,
+                address,
+                hello_b,
+                request_b,
+                activation_b,
+                &key,
+                cancel_b,
+            )
+            .await
+            .expect("B fetch");
+        let outcome_a = fetch_a.await.expect("A join").expect("A fetch");
+        assert_eq!(outcome_a, ActivationOutcome::Completed);
+        assert_eq!(outcome_b, ActivationOutcome::Completed);
+        assert_eq!(service.recovery_runs(), 1);
+        assert_eq!(
+            fs::read(receiver_root.join("received-a").join("a.txt")).expect("read a"),
+            vec![b'a'; 64 * 1024]
+        );
+        assert_eq!(
+            fs::read(receiver_root.join("received-b").join("b.txt")).expect("read b"),
+            b"b"
+        );
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_after_journal_and_after_bytes_leaves_no_residue() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path = source_directory.path().join("payload.txt");
+        fs::write(&path, vec![b'x'; 512 * 1024]).expect("write source");
+        let offer_id = OfferId::new();
+        let descriptor = insert_file_source(&store, requester.device_id, offer_id, &path);
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        insert_receiver_card(&receiver_store, origin.device_id, offer_id, descriptor);
+        let service = ActivationService::new(
+            requester.device_id,
+            receiver_store.clone(),
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+        );
+        service.recover().expect("startup recovery");
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let activation_id = request.request_id;
+        let activation = FetchActivation::new(
+            activation_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(receiver_root.join("received")),
+        );
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let hello = ClientHello::signed_v2(
+            requester.device_id,
+            "REQ",
+            activation_id.to_string(),
+            &requester,
+        );
+        let key = origin.public_key();
+        let client = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT);
+        let fetch = tokio::spawn(async move {
+            service
+                .activate(
+                    &client, address, hello, request, activation, &key, cancel_rx,
+                )
+                .await
+        });
+        wait_until_journaled(&receiver_store, activation_id).await;
+        let staging = receiver_root
+            .join("staging")
+            .join(activation_id.to_string());
+        for _ in 0..1_000 {
+            if staging.join("payload").exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        cancel_tx.send(true).expect("cancel");
+        let outcome = fetch.await.expect("join").expect("typed cancel");
+        assert_eq!(outcome, ActivationOutcome::Cancelled);
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        assert!(
+            receiver_store
+                .get_activation_journal(activation_id)
+                .expect("journal")
+                .is_none()
+        );
+        assert!(!staging.exists());
+        assert_no_payload_artifacts(&receiver_root);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingClipboard;
+
+    impl meshelf_core::ClipboardSink for FailingClipboard {
+        fn set_text(&self, _text: &str) -> Result<(), meshelf_core::ClipboardError> {
+            Err(meshelf_core::ClipboardError::new(
+                "injected clipboard failure",
+            ))
+        }
+    }
+
+    impl FetchClipboard for FailingClipboard {
+        fn set_files(&self, _paths: &[PathBuf]) -> Result<(), meshelf_core::ClipboardError> {
+            Err(meshelf_core::ClipboardError::new(
+                "injected clipboard failure",
+            ))
+        }
+    }
+
+    fn fail_preallocation(_file: &std::fs::File, _length: u64) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected preallocation failure"))
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_allocation_failure_is_refused() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path = source_directory.path().join("payload.txt");
+        fs::write(&path, b"body").expect("write source");
+        let offer_id = OfferId::new();
+        let descriptor = insert_file_source(&store, requester.device_id, offer_id, &path);
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        insert_receiver_card(&receiver_store, origin.device_id, offer_id, descriptor);
+        let receiver = FetchReceiver::with_preallocator_for_test(
+            requester.device_id,
+            receiver_store.clone(),
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+            ReservationLedger::default(),
+            fail_preallocation,
+        );
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let activation = FetchActivation::new(
+            request.request_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(receiver_root.join("received")),
+        );
+        let outcome = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+            .fetch_v2(
+                address,
+                ClientHello::signed_v2(
+                    requester.device_id,
+                    "REQ",
+                    request.request_id.to_string(),
+                    &requester,
+                ),
+                request,
+                activation,
+                &origin.public_key(),
+                &receiver,
+            )
+            .await
+            .expect("typed fetch");
+        assert_eq!(
+            outcome,
+            ActivationOutcome::Refused(ActivationRefuseCode::AllocationFailed)
+        );
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        assert_no_payload_artifacts(&receiver_root);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_clipboard_failure_is_failed_not_completed() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let offer_id = OfferId::new();
+        let body = "clipboard should fail";
+        insert_text_source(&store, requester.device_id, offer_id, body);
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        insert_receiver_card(
+            &receiver_store,
+            origin.device_id,
+            offer_id,
+            OfferDescriptor::text(body).expect("descriptor"),
+        );
+        let receiver = FetchReceiver::new(
+            requester.device_id,
+            receiver_store.clone(),
+            Arc::new(FailingClipboard),
+            receiver_root.clone(),
+        );
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let activation = FetchActivation::new(
+            request.request_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Clipboard,
+            None,
+        );
+        let outcome = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+            .fetch_v2(
+                address,
+                ClientHello::signed_v2(
+                    requester.device_id,
+                    "REQ",
+                    request.request_id.to_string(),
+                    &requester,
+                ),
+                request,
+                activation,
+                &origin.public_key(),
+                &receiver,
+            )
+            .await
+            .expect("typed fetch");
+        assert_eq!(
+            outcome,
+            ActivationOutcome::Failed(ActivationFailCode::ClipboardFailed)
+        );
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        assert_eq!(
+            receiver_store
+                .get_offer_card(origin.device_id, offer_id)
+                .expect("card")
+                .expect("card")
+                .last_attempt
+                .expect("attempt")
+                .code,
+            OfferAttemptCode::ClipboardFailed
+        );
+        assert_no_payload_artifacts(&receiver_root);
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_insufficient_space_is_refused() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([requester.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path = source_directory.path().join("payload.txt");
+        fs::write(&path, b"body").expect("write source");
+        let offer_id = OfferId::new();
+        let descriptor = insert_file_source(&store, requester.device_id, offer_id, &path);
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        insert_receiver_card(&receiver_store, origin.device_id, offer_id, descriptor);
+        let destination = receiver_root.join("received");
+        fs::create_dir_all(&destination).expect("destination");
+        let ledger = ReservationLedger::default();
+        let available = meshelf_platform::available_space(&destination).expect("available");
+        let total = meshelf_platform::total_space(&destination).expect("total");
+        let key = meshelf_platform::filesystem_key(&destination).expect("key");
+        let headroom = 2_u64
+            .saturating_mul(1024 * 1024 * 1024)
+            .max((total / 20).min(16_u64 * 1024 * 1024 * 1024));
+        let payload = available.saturating_sub(headroom).saturating_sub(1024);
+        let _held = ledger
+            .reserve_with_capacity(key, available, total, payload)
+            .expect("consume capacity");
+        let receiver = FetchReceiver::with_ledger(
+            requester.device_id,
+            receiver_store,
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+            ledger,
+        );
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let activation = FetchActivation::new(
+            request.request_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(destination),
+        );
+        let outcome = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT)
+            .fetch_v2(
+                address,
+                ClientHello::signed_v2(
+                    requester.device_id,
+                    "REQ",
+                    request.request_id.to_string(),
+                    &requester,
+                ),
+                request,
+                activation,
+                &origin.public_key(),
+                &receiver,
+            )
+            .await
+            .expect("typed fetch");
+        assert_eq!(
+            outcome,
+            ActivationOutcome::Refused(ActivationRefuseCode::InsufficientSpace)
+        );
+        assert!(
+            !outcome
+                .desktop_status()
+                .to_ascii_lowercase()
+                .contains("completed")
+        );
+        stop_offer_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn second_service_cannot_cleanup_a_live_journaled_activation() {
+        let requester = meshelf_identity::InstallationIdentity::generate();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let origin = meshelf_identity::InstallationIdentity::generate();
+        let origin_for_server = origin.clone();
+        let descriptor = OfferDescriptor::File {
+            root_name: "payload.txt".to_owned(),
+            total_bytes: 3,
+        };
+        let header_descriptor = descriptor.clone();
+        let (release, mut release_rx) = watch::channel(false);
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, request) = speak_fetch_hello(listener, origin_for_server).await;
+            let _ = write_valid_file_header(&mut stream, &request, &header_descriptor).await;
+            let admission = read_v2_frame_async(&mut stream).await.expect("admission");
+            let V2Message::FetchAdmission(FetchAdmission { code, .. }) = admission else {
+                panic!("expected admission");
+            };
+            assert_eq!(code, meshelf_protocol::FetchAdmissionCode::Accepted);
+            let _ = release_rx.changed().await;
+            drop(stream);
+        });
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let store_path = receiver_root.join("offers.redb");
+        let first_store = Arc::new(RedbV2Store::open(&store_path).expect("open first store"));
+        let offer_id = OfferId::new();
+        insert_receiver_card(&first_store, origin.device_id, offer_id, descriptor);
+        let first = ActivationService::new(
+            requester.device_id,
+            first_store.clone(),
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+        );
+        let request = FetchRequest::new(offer_id, origin.device_id, requester.device_id);
+        let request_id = request.request_id;
+        let activation = FetchActivation::new(
+            request_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(receiver_root.join("received")),
+        );
+        let client = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT);
+        let (_cancel, cancel) = watch::channel(false);
+        let hello = ClientHello::signed_v2(
+            requester.device_id,
+            "REQ",
+            request_id.to_string(),
+            &requester,
+        );
+        let key = origin.public_key();
+        let fetch = tokio::spawn({
+            let first = ActivationService::new(
+                requester.device_id,
+                first_store.clone(),
+                Arc::new(NoopFetchClipboard),
+                receiver_root.clone(),
+            );
+            async move {
+                first
+                    .activate(&client, address, hello, request, activation, &key, cancel)
+                    .await
+            }
+        });
+        wait_until_journaled(&first_store, request_id).await;
+        let staging = receiver_root.join("staging").join(request_id.to_string());
+        wait_until_exists(&staging).await;
+        assert!(
+            first_store
+                .get_activation_journal(request_id)
+                .expect("journal")
+                .is_some(),
+            "live activation must be journaled through a real admission"
+        );
+        let second_store = Arc::new(RedbV2Store::open(&store_path).expect("open second store"));
+        assert_ne!(
+            Arc::as_ptr(&first_store),
+            Arc::as_ptr(&second_store),
+            "the two handles must be distinct allocations"
+        );
+        let second = ActivationService::new(
+            requester.device_id,
+            second_store.clone(),
+            Arc::new(NoopFetchClipboard),
+            receiver_root,
+        );
+        second.recover().expect("second recover");
+        assert_eq!(first.recovery_runs(), 1);
+        assert_eq!(second.recovery_runs(), 1);
+        assert!(
+            staging.exists(),
+            "a second store handle must not treat a live journal as abandoned"
+        );
+        assert!(
+            second_store
+                .get_activation_journal(request_id)
+                .expect("journal")
+                .is_some()
+        );
+        let _ = release.send(true);
+        let _ = fetch.await;
+        let _ = origin_task.await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_in_flight_activation_id_is_refused() {
+        let first = meshelf_identity::InstallationIdentity::generate();
+        let (_directory, address, origin, shutdown_tx, server, store) =
+            start_fetch_server([first.device_id]).await;
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let path = source_directory.path().join("payload.txt");
+        fs::write(&path, vec![b'x'; 64 * 1024]).expect("write source");
+        let offer_id = OfferId::new();
+        let descriptor = insert_file_source(&store, first.device_id, offer_id, &path);
+        let receiver_directory = tempfile::tempdir().expect("receiver directory");
+        let receiver_root =
+            fs::canonicalize(receiver_directory.path()).expect("canonical receiver root");
+        let receiver_store = Arc::new(
+            RedbV2Store::open(receiver_root.join("offers.redb")).expect("open receiver store"),
+        );
+        insert_receiver_card(&receiver_store, origin.device_id, offer_id, descriptor);
+        let service = ActivationService::new(
+            first.device_id,
+            receiver_store.clone(),
+            Arc::new(NoopFetchClipboard),
+            receiver_root.clone(),
+        );
+        let request = FetchRequest::new(offer_id, origin.device_id, first.device_id);
+        let request_id = request.request_id;
+        let activation = FetchActivation::new(
+            request_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(receiver_root.join("received")),
+        );
+        let duplicate = FetchActivation::new(
+            request_id,
+            origin.device_id,
+            offer_id,
+            meshelf_core::ActivationMode::Save,
+            Some(receiver_root.join("received-dup")),
+        );
+        let duplicate_request = FetchRequest {
+            request_id,
+            offer_id,
+            source_device: origin.device_id,
+            requester_device: first.device_id,
+        };
+        let client = PeerClient::with_timeouts(TEST_IO_TIMEOUT, TEST_IO_TIMEOUT);
+        let (_cancel_a, cancel_a) = watch::channel(false);
+        let (_cancel_b, cancel_b) = watch::channel(false);
+        let hello_a = ClientHello::signed_v2(first.device_id, "A", request_id.to_string(), &first);
+        let hello_b =
+            ClientHello::signed_v2(first.device_id, "B", format!("{request_id}-dup"), &first);
+        let key = origin.public_key();
+        let first_fetch = tokio::spawn({
+            let service = ActivationService::new(
+                first.device_id,
+                receiver_store.clone(),
+                Arc::new(NoopFetchClipboard),
+                receiver_root.clone(),
+            );
+            let client = client.clone();
+            async move {
+                service
+                    .activate(
+                        &client, address, hello_a, request, activation, &key, cancel_a,
+                    )
+                    .await
+            }
+        });
+        wait_until_journaled(&receiver_store, request_id).await;
+        let staging = receiver_root.join("staging").join(request_id.to_string());
+        assert!(staging.exists());
+        let duplicate_outcome = service
+            .activate(
+                &client,
+                address,
+                hello_b,
+                duplicate_request,
+                duplicate,
+                &key,
+                cancel_b,
+            )
+            .await
+            .expect("duplicate typed");
+        assert_eq!(
+            duplicate_outcome,
+            ActivationOutcome::Refused(ActivationRefuseCode::DuplicateActivation)
+        );
+        assert!(
+            staging.exists(),
+            "duplicate must not share the staging root"
+        );
+        let _ = first_fetch.await;
+        stop_offer_server(shutdown_tx, server).await;
+    }
 }
 
 impl ServerIdentity {
@@ -1910,15 +3196,6 @@ impl OfferAnnouncementHandler {
             };
             return Ok(Self::ack(offer_id, code, live_entries, 0, detail));
         }
-        if live_entries >= V2_MAX_LIVE_ENTRIES {
-            return Ok(Self::ack(
-                offer_id,
-                OfferAckCode::RefusedCapacity,
-                live_entries,
-                0,
-                Some("receiver offer-card capacity is full".to_owned()),
-            ));
-        }
         let inserted = self
             .store
             .insert_offer_card(OfferCardInput::new(
@@ -2082,7 +3359,33 @@ impl PeerClient {
         activation: FetchActivation,
         expected_server_public_key: &[u8],
         receiver: &FetchReceiver<C>,
-    ) -> Result<(), NetError>
+    ) -> Result<ActivationOutcome, NetError>
+    where
+        C: FetchClipboard,
+    {
+        self.fetch_v2_with_cancel(
+            address,
+            hello,
+            request,
+            activation,
+            expected_server_public_key,
+            receiver,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_v2_with_cancel<C>(
+        &self,
+        address: SocketAddr,
+        hello: ClientHello,
+        request: meshelf_protocol::FetchRequest,
+        activation: FetchActivation,
+        expected_server_public_key: &[u8],
+        receiver: &FetchReceiver<C>,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<ActivationOutcome, NetError>
     where
         C: FetchClipboard,
     {
@@ -2096,9 +3399,19 @@ impl PeerClient {
             ));
         }
         require_v2_client_hello(&hello, "v2 fetch")?;
-        let mut stream = timeout(self.connect_timeout, TcpStream::connect(address))
-            .await
-            .map_err(|_| NetError::Timeout("fetch v2 connect"))??;
+        let mut cancel = cancel;
+        if cancel.as_ref().is_some_and(|signal| *signal.borrow()) {
+            return Ok(ActivationOutcome::Cancelled);
+        }
+        let mut stream =
+            match connect_v2_cancellable(address, self.connect_timeout, &mut cancel).await {
+                Ok(stream) => stream,
+                Err(error) => return crate::activation::classify_activation_result(Err(error)),
+            };
+        if cancel.as_ref().is_some_and(|signal| *signal.borrow()) {
+            let _ = stream.shutdown().await;
+            return Ok(ActivationOutcome::Cancelled);
+        }
         io_timeout(
             self.io_timeout,
             write_frame_async(&mut stream, &WireMessage::ClientHello(hello)),
@@ -2120,9 +3433,24 @@ impl PeerClient {
             "write v2 fetch request",
         )
         .await?;
-        receiver
-            .receive(server.device_id, activation, &mut stream, self.io_timeout)
-            .await
+        match cancel {
+            Some(signal) => {
+                receiver
+                    .receive_with_cancel(
+                        server.device_id,
+                        activation,
+                        &mut stream,
+                        self.io_timeout,
+                        signal,
+                    )
+                    .await
+            }
+            None => {
+                receiver
+                    .receive(server.device_id, activation, &mut stream, self.io_timeout)
+                    .await
+            }
+        }
     }
 }
 
@@ -2444,6 +3772,22 @@ pub async fn bind_discovered_tailscale_address(
     )?)
 }
 
+/// Prefer IPv4 when a peer publishes both families so listener bind, announcement,
+/// desktop activation, and terminal activation dial the family the listener bound.
+#[must_use]
+pub fn select_discovered_ip(addresses: &[IpAddr]) -> Option<IpAddr> {
+    addresses
+        .iter()
+        .copied()
+        .find(IpAddr::is_ipv4)
+        .or_else(|| addresses.first().copied())
+}
+
+#[must_use]
+pub fn select_discovered_socket(addresses: &[IpAddr], port: u16) -> Option<SocketAddr> {
+    select_discovered_ip(addresses).map(|ip| SocketAddr::new(ip, port))
+}
+
 pub fn bind_discovered_tailscale_std_listener(
     address: SocketAddr,
     discovered_local_addresses: &[IpAddr],
@@ -2462,6 +3806,49 @@ pub fn bind_discovered_tailscale_std_listener(
     let listener = StdTcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+async fn connect_v2_cancellable(
+    address: SocketAddr,
+    connect_timeout: Duration,
+    cancel: &mut Option<watch::Receiver<bool>>,
+) -> Result<TcpStream, NetError> {
+    if cancel.as_ref().is_some_and(|signal| *signal.borrow()) {
+        return Err(NetError::FetchTerminal {
+            code: FetchReceiptCode::Cancelled,
+            files_processed: 0,
+            bytes_processed: 0,
+            detail: None,
+        });
+    }
+    let Some(signal) = cancel.as_mut() else {
+        return timeout(connect_timeout, TcpStream::connect(address))
+            .await
+            .map_err(|_| NetError::Timeout("fetch v2 connect"))?
+            .map_err(NetError::Io);
+    };
+    tokio::select! {
+        biased;
+        result = timeout(connect_timeout, TcpStream::connect(address)) => {
+            result
+                .map_err(|_| NetError::Timeout("fetch v2 connect"))?
+                .map_err(NetError::Io)
+        }
+        changed = signal.changed() => {
+            if changed.is_ok() && *signal.borrow() {
+                return Err(NetError::FetchTerminal {
+                    code: FetchReceiptCode::Cancelled,
+                    files_processed: 0,
+                    bytes_processed: 0,
+                    detail: None,
+                });
+            }
+            timeout(connect_timeout, TcpStream::connect(address))
+                .await
+                .map_err(|_| NetError::Timeout("fetch v2 connect"))?
+                .map_err(NetError::Io)
+        }
+    }
 }
 
 async fn io_timeout<T>(
@@ -2530,6 +3917,21 @@ pub enum NetError {
     )]
     FetchTerminal {
         code: FetchReceiptCode,
+        files_processed: u32,
+        bytes_processed: u64,
+        detail: Option<String>,
+    },
+    #[error(
+        "origin aborted fetch with {code:?} (files {files_processed}, bytes {bytes_processed}): {detail:?}"
+    )]
+    FetchAborted {
+        code: FetchAbortCode,
+        files_processed: u32,
+        bytes_processed: u64,
+        detail: Option<String>,
+    },
+    #[error("local storage failed (files {files_processed}, bytes {bytes_processed}): {detail:?}")]
+    FetchLocalIo {
         files_processed: u32,
         bytes_processed: u64,
         detail: Option<String>,
@@ -2907,5 +4309,27 @@ mod tests {
             matches!(result, Err(NetError::Rejected(reason)) if reason.contains("offer-pull-v2"))
         );
         server.await.expect("server join");
+    }
+
+    #[test]
+    fn mixed_family_peer_selects_the_listener_family_on_every_surface() {
+        let ipv6 = "::1".parse::<IpAddr>().expect("ipv6");
+        let ipv4 = "127.0.0.1".parse::<IpAddr>().expect("ipv4");
+        let peer = [ipv6, ipv4];
+        let listener = select_discovered_ip(&peer).expect("listener");
+        let announce = select_discovered_ip(&peer).expect("announce");
+        let desktop_activation = select_discovered_ip(&peer).expect("desktop");
+        let terminal_activation = select_discovered_ip(&peer).expect("terminal");
+        assert_eq!(listener, ipv4);
+        assert_eq!(announce, listener);
+        assert_eq!(desktop_activation, listener);
+        assert_eq!(terminal_activation, listener);
+        let bound = bind_discovered_tailscale_std_listener(SocketAddr::new(listener, 0), &peer)
+            .expect("bind selected family");
+        assert_eq!(bound.local_addr().expect("bound address").ip(), listener);
+        assert_eq!(
+            select_discovered_socket(&peer, 45832).expect("dial").ip(),
+            bound.local_addr().expect("bound").ip()
+        );
     }
 }

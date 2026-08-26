@@ -21,7 +21,7 @@ use std::{
 };
 
 use meshelf_identity::InstallationIdentity;
-use meshelf_net::{NetError, PeerClient};
+use meshelf_net::{NetError, PeerClient, select_discovered_ip};
 use meshelf_protocol::{
     CAP_OFFER_PULL_V2, ClientHello, OfferAck, OfferAckCode, ServerHello, V2_PROTOCOL_VERSION,
 };
@@ -175,13 +175,7 @@ pub fn announce_offer_plan(
                 let Some(peer) = peer else {
                     return AnnouncePeerOutcome::Unavailable(hostname);
                 };
-                let Some(address) = peer
-                    .addresses
-                    .iter()
-                    .copied()
-                    .find(|address| address.is_ipv4())
-                    .or_else(|| peer.addresses.first().copied())
-                else {
+                let Some(address) = select_discovered_ip(&peer.addresses) else {
                     return AnnouncePeerOutcome::Unavailable(hostname);
                 };
                 let hello = ClientHello::signed_v2(

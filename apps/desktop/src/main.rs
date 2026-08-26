@@ -29,9 +29,10 @@ use meshelf_core::{
     OfferDescriptor, OfferId, SaveDestination,
 };
 use meshelf_net::{
-    FetchActivation, FetchClipboard, FetchReceiver, OfferAnnouncementHandler, OfferFetchHandler,
-    PeerClient, ServerIdentity, TrustDecision, TrustGate, V2OfferServices,
-    bind_discovered_tailscale_std_listener, serve_v2_with_offers_and_fetch,
+    ActivationOutcome, ActivationService, FetchActivation, FetchClipboard,
+    OfferAnnouncementHandler, OfferFetchHandler, PeerClient, ServerIdentity, TrustDecision,
+    TrustGate, V2OfferServices, bind_discovered_tailscale_std_listener, select_discovered_ip,
+    select_discovered_socket, serve_v2_with_offers_and_fetch,
 };
 use meshelf_platform::{
     ClipboardItem, ClipboardSource, ClipboardWorker, acquire_resident_lock, choose_folder,
@@ -195,9 +196,8 @@ struct DesktopLocalRuntime {
     state_path: PathBuf,
     identity: meshelf_identity::InstallationIdentity,
     device_name: String,
-    offer_store: Arc<RedbV2Store>,
     clipboard: Option<ClipboardWorker>,
-    state_root: PathBuf,
+    activations: Arc<ActivationService<ActivationClipboard>>,
 }
 
 impl LocalRuntime for DesktopLocalRuntime {
@@ -210,17 +210,15 @@ impl LocalRuntime for DesktopLocalRuntime {
         )?)
     }
 
-    fn activate(&self, plan: &ActivationPlan) -> Result<(), String> {
+    fn activate(&self, plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
         let input = self
             .app_state
             .lock()
             .map_err(|_| "app state is unavailable".to_owned())
             .and_then(|state| build_activation_input(plan, &state))?;
-        let clipboard = clipboard_for_activation(plan.mode, self.clipboard.clone())?;
-        let offer_store = self.offer_store.clone();
-        let state_root = self.state_root.clone();
+        clipboard_for_activation(plan.mode, self.clipboard.clone())?;
         let (_cancel, cancel) = watch::channel(false);
-        run_activation(input, offer_store, clipboard, state_root, cancel)
+        run_activation(input, self.activations.clone(), cancel)
     }
 }
 
@@ -290,13 +288,7 @@ fn start_v2_listener(
         .last_status
         .as_ref()
         .ok_or_else(|| "Tailscale status is unavailable".to_owned())?;
-    let address = status
-        .self_node
-        .addresses
-        .iter()
-        .copied()
-        .find(|address| address.is_ipv4())
-        .or_else(|| status.self_node.addresses.first().copied())
+    let address = select_discovered_ip(&status.self_node.addresses)
         .ok_or_else(|| "Tailscale supplied no local address".to_owned())?;
     let listener = bind_discovered_tailscale_std_listener(
         SocketAddr::new(address, MESHELF_PORT),
@@ -679,11 +671,7 @@ fn build_activation_input(
         .peers
         .by_device_id(plan.source_device)
         .ok_or_else(|| "the offer's source device is not paired".to_owned())?;
-    let address = peer
-        .addresses
-        .first()
-        .copied()
-        .map(|address| SocketAddr::new(address, MESHELF_PORT))
+    let address = select_discovered_socket(&peer.addresses, MESHELF_PORT)
         .ok_or_else(|| "the offer's source device has no address".to_owned())?;
     let destination = match plan.mode {
         ActivationMode::Clipboard => None,
@@ -736,25 +724,9 @@ fn clipboard_for_activation(
 
 fn run_activation(
     input: ActivationInput,
-    offer_store: Arc<RedbV2Store>,
-    clipboard: Option<ClipboardWorker>,
-    state_root: PathBuf,
-    mut cancel: watch::Receiver<bool>,
-) -> Result<(), String> {
-    let local_device = input.hello.device_id;
-    let activation_clipboard = match clipboard {
-        Some(clipboard) => ActivationClipboard::Worker(Arc::new(clipboard)),
-        None => ActivationClipboard::Unavailable,
-    };
-    let receiver = FetchReceiver::new(
-        local_device,
-        offer_store,
-        Arc::new(activation_clipboard),
-        state_root,
-    );
-    receiver
-        .startup_cleanup()
-        .map_err(|error| format!("activation cleanup is unavailable: {error}"))?;
+    service: Arc<ActivationService<ActivationClipboard>>,
+    cancel: watch::Receiver<bool>,
+) -> Result<ActivationOutcome, String> {
     let client = PeerClient::with_timeouts(Duration::from_secs(3), Duration::from_secs(5));
     let ActivationInput {
         address,
@@ -768,23 +740,18 @@ fn run_activation(
         .build()
         .map_err(|error| format!("activation runtime unavailable: {error}"))?;
     runtime.block_on(async move {
-        tokio::select! {
-            result = client.fetch_v2(
+        service
+            .activate(
+                &client,
                 address,
                 hello,
                 request,
                 activation,
                 &expected_server_public_key,
-                &receiver,
-            ) => result.map_err(|error| error.to_string()),
-            changed = cancel.changed() => {
-                if changed.is_ok() && *cancel.borrow() {
-                    Err("activation cancelled".to_owned())
-                } else {
-                    Err("activation cancellation channel closed".to_owned())
-                }
-            }
-        }
+                cancel,
+            )
+            .await
+            .map_err(|error| error.to_string())
     })
 }
 
@@ -862,6 +829,23 @@ fn main() -> Result<()> {
             None
         }
     };
+    let activation_clipboard = match clipboard.clone() {
+        Some(worker) => ActivationClipboard::Worker(Arc::new(worker)),
+        None => ActivationClipboard::Unavailable,
+    };
+    let activations = Arc::new(ActivationService::new(
+        app_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("app state is unavailable"))?
+            .identity
+            .device_id,
+        offer_store.clone(),
+        Arc::new(activation_clipboard),
+        data_dir.clone(),
+    ));
+    activations
+        .recover()
+        .map_err(|error| anyhow::anyhow!("activation cleanup is unavailable: {error}"))?;
     let local_runtime = Arc::new(DesktopLocalRuntime {
         app_state: app_state.clone(),
         state_path: data_dir.join("state.json"),
@@ -871,9 +855,8 @@ fn main() -> Result<()> {
             .identity
             .clone(),
         device_name: device_name.clone(),
-        offer_store: offer_store.clone(),
         clipboard: clipboard.clone(),
-        state_root: data_dir.clone(),
+        activations: activations.clone(),
     });
     let window_weak = window.as_weak();
     let control_coordinator = coordinator.clone();
@@ -1028,6 +1011,7 @@ fn main() -> Result<()> {
         let app_state = app_state.clone();
         let offer_store = offer_store.clone();
         let clipboard = clipboard.clone();
+        let activations = activations.clone();
         let active_activations = active_activations.clone();
         let activation_gate = activation_gate.clone();
         let data_dir = data_dir.clone();
@@ -1056,6 +1040,7 @@ fn main() -> Result<()> {
             let app_state = app_state.clone();
             let offer_store = offer_store.clone();
             let clipboard = clipboard.clone();
+            let activations = activations.clone();
             let active_activations = active_activations.clone();
             let activation_gate = activation_gate.clone();
             let data_dir = data_dir.clone();
@@ -1098,14 +1083,10 @@ fn main() -> Result<()> {
                                 );
                                 return;
                             }
-                            let clipboard = match clipboard_for_activation(mode, clipboard.clone())
-                            {
-                                Ok(clipboard) => clipboard,
-                                Err(error) => {
-                                    window.set_status_text(error.into());
-                                    return;
-                                }
-                            };
+                            if let Err(error) = clipboard_for_activation(mode, clipboard.clone()) {
+                                window.set_status_text(error.into());
+                                return;
+                            }
                             let Some(permit) = activation_gate.try_enter() else {
                                 window.set_status_text(
                                     "Two activations are already in progress; nothing queued"
@@ -1158,15 +1139,9 @@ fn main() -> Result<()> {
                             let offer_store = offer_store.clone();
                             let active_activations = active_activations.clone();
                             let peer_names = peer_names.clone();
-                            let state_root = data_dir.clone();
+                            let _state_root = data_dir.clone();
                             thread::spawn(move || {
-                                let result = run_activation(
-                                    input,
-                                    offer_store.clone(),
-                                    clipboard,
-                                    state_root,
-                                    cancel_receiver,
-                                );
+                                let result = run_activation(input, activations, cancel_receiver);
                                 remove_active_activation(&active_activations, offer_id);
                                 drop(permit);
                                 let status_window = window_weak.clone();
@@ -1174,7 +1149,7 @@ fn main() -> Result<()> {
                                     if let Some(window) = status_window.upgrade() {
                                         window.set_status_text(
                                             result
-                                                .map(|()| "Offer activation completed".to_owned())
+                                                .map(|outcome| outcome.desktop_status())
                                                 .unwrap_or_else(|error| error)
                                                 .into(),
                                         );
@@ -1385,6 +1360,17 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use slint::platform::{Key, WindowEvent};
+
+    #[test]
+    fn mixed_family_peer_selects_listener_family_for_bind_and_activation() {
+        let ipv6 = "::1".parse().expect("ipv6");
+        let ipv4 = "127.0.0.1".parse().expect("ipv4");
+        let addresses = [ipv6, ipv4];
+        let bind = select_discovered_ip(&addresses).expect("bind");
+        let dial = select_discovered_socket(&addresses, MESHELF_PORT).expect("dial");
+        assert_eq!(bind, ipv4);
+        assert_eq!(dial.ip(), bind);
+    }
 
     #[test]
     fn operation_gate_allows_only_one_in_flight_operation() {

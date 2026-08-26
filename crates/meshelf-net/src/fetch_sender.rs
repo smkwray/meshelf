@@ -373,7 +373,7 @@ impl OfferFetchHandler {
             self.stream_text(stream, request.request_id, text, io_timeout_duration)
                 .await?;
             return self
-                .await_receipt(
+                .await_completed_receipt(
                     stream,
                     request.request_id,
                     Some(request.offer_id),
@@ -518,13 +518,26 @@ impl OfferFetchHandler {
             io_timeout_duration,
         )
         .await?;
-        self.await_receipt(
+        self.await_completed_receipt(
             stream,
             request.request_id,
             Some(request.offer_id),
             io_timeout_duration,
         )
         .await
+    }
+
+    async fn await_completed_receipt(
+        &self,
+        stream: &mut TcpStream,
+        request_id: meshelf_core::ActivationId,
+        expected_offer_id: Option<meshelf_core::OfferId>,
+        io_timeout_duration: std::time::Duration,
+    ) -> Result<(), NetError> {
+        let receipt = self
+            .await_receipt(stream, request_id, expected_offer_id, io_timeout_duration)
+            .await?;
+        require_completed_receipt(&receipt)
     }
 
     async fn stream_text(
@@ -665,8 +678,10 @@ impl OfferFetchHandler {
             io_timeout_duration,
         )
         .await?;
-        self.await_receipt(stream, request_id, Some(offer_id), io_timeout_duration)
-            .await
+        let _receipt = self
+            .await_receipt(stream, request_id, Some(offer_id), io_timeout_duration)
+            .await?;
+        Ok(())
     }
 
     async fn await_receipt(
@@ -675,7 +690,7 @@ impl OfferFetchHandler {
         request_id: meshelf_core::ActivationId,
         expected_offer_id: Option<meshelf_core::OfferId>,
         io_timeout_duration: std::time::Duration,
-    ) -> Result<(), NetError> {
+    ) -> Result<FetchReceipt, NetError> {
         let response = io_timeout(
             io_timeout_duration,
             meshelf_protocol::read_v2_frame_async(stream),
@@ -686,7 +701,8 @@ impl OfferFetchHandler {
         let V2Message::FetchReceipt(receipt) = response else {
             return Err(NetError::UnexpectedMessage("expected fetch receipt"));
         };
-        validate_receipt(&receipt, request_id, expected_offer_id)
+        validate_receipt_identity(&receipt, request_id, expected_offer_id)?;
+        Ok(receipt)
     }
 
     async fn write_control(
@@ -753,7 +769,7 @@ enum FileStreamFailure {
     Io(NetError),
 }
 
-fn validate_receipt(
+fn validate_receipt_identity(
     receipt: &FetchReceipt,
     request_id: meshelf_core::ActivationId,
     expected_offer_id: Option<meshelf_core::OfferId>,
@@ -770,6 +786,10 @@ fn validate_receipt(
             "fetch receipt offer ID does not match".to_owned(),
         ));
     }
+    Ok(())
+}
+
+fn require_completed_receipt(receipt: &FetchReceipt) -> Result<(), NetError> {
     if receipt.code == meshelf_protocol::FetchReceiptCode::Completed {
         Ok(())
     } else {

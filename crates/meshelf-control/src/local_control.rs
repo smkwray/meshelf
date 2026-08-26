@@ -8,6 +8,8 @@ use meshelf_core::{
 };
 use serde::{Deserialize, Serialize};
 
+use meshelf_net::ActivationOutcome;
+
 use crate::{
     coordinator::{ActivationPlan, Coordinator, OfferPlan, PeerAnnouncement},
     offer_source::OfferInput,
@@ -82,7 +84,7 @@ pub enum LocalResponse {
 /// fetch worker.
 pub trait LocalRuntime: Send + Sync + 'static {
     fn announce(&self, plan: &OfferPlan) -> Result<String, String>;
-    fn activate(&self, plan: &ActivationPlan) -> Result<(), String>;
+    fn activate(&self, plan: &ActivationPlan) -> Result<ActivationOutcome, String>;
 }
 
 #[derive(Debug, Default)]
@@ -93,8 +95,8 @@ impl LocalRuntime for NoopRuntime {
         Ok(String::new())
     }
 
-    fn activate(&self, _plan: &ActivationPlan) -> Result<(), String> {
-        Ok(())
+    fn activate(&self, _plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
+        Ok(ActivationOutcome::Completed)
     }
 }
 
@@ -201,7 +203,7 @@ pub fn dispatch_with_runtime(
         LocalRequest::ActivateOffer { offer_id, mode } => {
             match coordinator.plan_activation(offer_id, mode) {
                 Ok(plan) => match runtime.activate(&plan) {
-                    Ok(()) => {
+                    Ok(ActivationOutcome::Completed) => {
                         let (files_processed, bytes_processed) =
                             descriptor_counts(&plan.descriptor);
                         LocalResponse::ActivationCompleted {
@@ -212,6 +214,12 @@ pub fn dispatch_with_runtime(
                             bytes_processed,
                         }
                     }
+                    Ok(ActivationOutcome::Cancelled) => LocalResponse::ActivationCancelled {
+                        activation_id: plan.activation_id,
+                    },
+                    Ok(outcome) => LocalResponse::ActivationRefused {
+                        message: outcome.desktop_status(),
+                    },
                     Err(message) => LocalResponse::ActivationRefused { message },
                 },
                 Err(message) => LocalResponse::ActivationRefused { message },
@@ -277,9 +285,9 @@ mod tests {
             Ok(String::new())
         }
 
-        fn activate(&self, _plan: &ActivationPlan) -> Result<(), String> {
+        fn activate(&self, _plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
             self.activations.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(ActivationOutcome::Completed)
         }
     }
 
@@ -290,11 +298,10 @@ mod tests {
             unreachable!("clipboard failure runtime does not announce")
         }
 
-        fn activate(&self, _plan: &ActivationPlan) -> Result<(), String> {
-            Err(
-                "fetch ended with ClipboardFailed (files 0, bytes 440): verification mismatch"
-                    .to_owned(),
-            )
+        fn activate(&self, _plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
+            Ok(ActivationOutcome::Failed(
+                meshelf_net::ActivationFailCode::ClipboardFailed,
+            ))
         }
     }
 
@@ -408,7 +415,7 @@ mod tests {
             )
         }
 
-        fn activate(&self, _plan: &ActivationPlan) -> Result<(), String> {
+        fn activate(&self, _plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
             unreachable!("partial announce runtime does not activate")
         }
     }
@@ -492,8 +499,7 @@ mod tests {
         assert!(matches!(
             response,
             LocalResponse::ActivationRefused { message }
-                if message.contains("ClipboardFailed")
-                    && message.contains("files 0, bytes 440")
+                if message.contains("clipboard failed") && !message.contains("completed")
         ));
     }
 

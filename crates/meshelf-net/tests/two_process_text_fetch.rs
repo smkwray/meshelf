@@ -15,8 +15,8 @@ use meshelf_core::{
 };
 use meshelf_identity::InstallationIdentity;
 use meshelf_net::{
-    ExactDeviceAllowList, FetchActivation, FetchClipboard, FetchReceiver, OfferAnnouncementHandler,
-    OfferFetchHandler, PeerClient, ServerIdentity, V2OfferServices,
+    ActivationService, ExactDeviceAllowList, FetchActivation, FetchClipboard,
+    OfferAnnouncementHandler, OfferFetchHandler, PeerClient, ServerIdentity, V2OfferServices,
     bind_discovered_tailscale_address, serve_v2_with_offers_and_fetch,
 };
 use meshelf_protocol::{ClientHello, FetchRequest};
@@ -127,15 +127,12 @@ fn two_process_text_fetch_delivers_exact_bytes() {
         ))
         .expect("insert announced card");
     let clipboard = Arc::new(RecordingClipboard::default());
-    let receiver = FetchReceiver::new(
+    let service = ActivationService::new(
         requester.device_id,
         receiver_store,
         clipboard.clone(),
         receiver_root,
     );
-    receiver
-        .startup_cleanup()
-        .expect("receiver startup cleanup");
     let request = FetchRequest::new(offer_id, ready.device_id, requester.device_id);
     let activation = FetchActivation::new(
         request.request_id,
@@ -150,8 +147,11 @@ fn two_process_text_fetch_delivers_exact_bytes() {
         .build()
         .expect("requester runtime")
         .block_on(async {
-            PeerClient::with_timeouts(Duration::from_secs(3), Duration::from_secs(5))
-                .fetch_v2(
+            let client = PeerClient::with_timeouts(Duration::from_secs(3), Duration::from_secs(5));
+            let (_cancel, cancel) = watch::channel(false);
+            let outcome = service
+                .activate(
+                    &client,
                     address,
                     ClientHello::signed_v2(
                         requester.device_id,
@@ -162,10 +162,11 @@ fn two_process_text_fetch_delivers_exact_bytes() {
                     request,
                     activation,
                     &ready.public_key,
-                    &receiver,
+                    cancel,
                 )
                 .await
                 .expect("two-process text fetch");
+            assert_eq!(outcome, meshelf_net::ActivationOutcome::Completed);
         });
 
     assert_eq!(

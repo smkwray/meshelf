@@ -62,6 +62,15 @@ pub enum ActivationState {
     UncertainNoReplay,
 }
 
+impl ActivationState {
+    /// A recorded clipboard side effect may already have occurred. Startup
+    /// cleanup must preserve this journal row so a later activation cannot replay.
+    #[must_use]
+    pub const fn is_uncertain_side_effect(self) -> bool {
+        matches!(self, Self::UncertainNoReplay | Self::ApplyingClipboard)
+    }
+}
+
 /// The receiver-local side effect selected by an explicit activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

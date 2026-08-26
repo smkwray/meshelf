@@ -7,7 +7,7 @@ use meshelf_core::StoreError;
 use redb::TableDefinition;
 
 mod v2;
-pub use v2::RedbV2Store;
+pub use v2::{RedbV2Store, store_identity};
 
 pub(crate) const RECEIVE_LEDGER: TableDefinition<&str, &[u8]> =
     TableDefinition::new("receive_ledger_v1");
