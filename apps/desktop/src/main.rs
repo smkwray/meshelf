@@ -39,7 +39,7 @@ use meshelf_protocol::{ClientHello, FetchRequest};
 use meshelf_store::RedbReceiveStore;
 use meshelf_store::RedbV2Store;
 use meshelf_tailscale::InstallationStore;
-use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::{
     runtime::{Builder, Runtime},
     sync::watch,
@@ -108,6 +108,22 @@ impl OperationGate {
             .map(|_| OperationPermit {
                 busy: self.busy.clone(),
             })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryRefreshTrigger {
+    Launch,
+    Explicit,
+    BeforeUserOperation,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DiscoveryEventLoop;
+
+impl DiscoveryEventLoop {
+    fn dispatch(self, _trigger: DiscoveryRefreshTrigger, refresh: impl FnOnce() -> bool) -> bool {
+        refresh()
     }
 }
 
@@ -543,12 +559,12 @@ fn raise_window(window: &MainWindow) {
 }
 
 fn refresh_in_background(
-    window_weak: slint::Weak<MainWindow>,
     app_state: Arc<Mutex<Controller>>,
     peer_names: Arc<Mutex<HashMap<DeviceId, String>>>,
     server: Arc<Mutex<Option<ServerHandle>>>,
     receive_store: Arc<RedbReceiveStore>,
     gate: OperationGate,
+    on_complete: impl FnOnce(Result<PeerView, String>) + Send + 'static,
 ) -> bool {
     let Some(permit) = gate.try_enter() else {
         return false;
@@ -571,18 +587,10 @@ fn refresh_in_background(
                         *slot = Some(listener);
                     }
                 }
-                Ok(Some(view))
+                Ok(view)
             });
         drop(permit);
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window_weak.upgrade() {
-                match result {
-                    Ok(Some(view)) => apply_peer_view(&window, view),
-                    Ok(None) => {}
-                    Err(error) => apply_refresh_error(&window, error),
-                }
-            }
-        });
+        let _ = slint::invoke_from_event_loop(move || on_complete(result));
     });
     true
 }
@@ -842,6 +850,7 @@ fn main() -> Result<()> {
     let activation_gate = ActivationGate::default();
     let active_activations: ActiveActivations = Arc::new(Mutex::new(HashMap::new()));
     let refresh_gate = OperationGate::default();
+    let discovery_events = DiscoveryEventLoop;
 
     let settings = settings_for_surface(&coordinator).map_err(|error| anyhow::anyhow!(error))?;
     window.set_destination_text(destination_label(&settings.save_destination).into());
@@ -850,7 +859,11 @@ fn main() -> Result<()> {
         let window_weak = window.as_weak();
         let clipboard = clipboard.clone();
         let app_state = app_state.clone();
+        let peer_names = peer_names.clone();
+        let server = server.clone();
+        let receive_store = receive_store.clone();
         let send_gate = send_gate.clone();
+        let refresh_gate = refresh_gate.clone();
         window.on_paste_and_send(move || {
             let Some(window) = window_weak.upgrade() else {
                 return;
@@ -863,34 +876,76 @@ fn main() -> Result<()> {
                 window.set_status_text("A mesh send is already in progress".into());
                 return;
             };
-            window.set_status_text("Sending clipboard item to the mesh…".into());
-            let window_weak = window_weak.clone();
-            let app_state = app_state.clone();
-            thread::spawn(move || {
-                let result = clipboard
-                    .read_item()
-                    .map_err(|error| format!("Could not read clipboard: {error}"))
-                    .and_then(|item| {
-                        let state = app_state
-                            .lock()
-                            .map_err(|_| "app state is unavailable".to_owned())?;
-                        match item {
-                            ClipboardItem::Text(text) => {
-                                if text.trim().is_empty() {
-                                    return Err("Clipboard contains no text to send".to_owned());
+            window.set_status_text("Checking mesh reachability…".into());
+            let completion_window = window_weak.clone();
+            let action_window = window_weak.clone();
+            let action_app_state = app_state.clone();
+            let action_clipboard = clipboard.clone();
+            let started =
+                discovery_events.dispatch(DiscoveryRefreshTrigger::BeforeUserOperation, || {
+                    refresh_in_background(
+                        app_state.clone(),
+                        peer_names.clone(),
+                        server.clone(),
+                        receive_store.clone(),
+                        refresh_gate.clone(),
+                        move |refresh_result| {
+                            let Some(window) = completion_window.upgrade() else {
+                                drop(permit);
+                                return;
+                            };
+                            let view = match refresh_result {
+                                Ok(view) => view,
+                                Err(error) => {
+                                    drop(permit);
+                                    apply_refresh_error(&window, error);
+                                    return;
                                 }
-                                state.send_to_mesh(&text).map(|report| report.status())
-                            }
-                            ClipboardItem::Files(paths) => state.send_paths_to_mesh(&paths),
-                        }
-                    });
-                drop(permit);
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(window) = window_weak.upgrade() {
-                        window.set_status_text(result.unwrap_or_else(|error| error).into());
-                    }
+                            };
+                            apply_peer_view(&window, view);
+                            window.set_status_text("Sending clipboard item to the mesh…".into());
+                            let status_window = action_window;
+                            let app_state = action_app_state;
+                            thread::spawn(move || {
+                                let result = action_clipboard
+                                    .read_item()
+                                    .map_err(|error| format!("Could not read clipboard: {error}"))
+                                    .and_then(|item| {
+                                        let state = app_state
+                                            .lock()
+                                            .map_err(|_| "app state is unavailable".to_owned())?;
+                                        match item {
+                                            ClipboardItem::Text(text) => {
+                                                if text.trim().is_empty() {
+                                                    return Err(
+                                                        "Clipboard contains no text to send"
+                                                            .to_owned(),
+                                                    );
+                                                }
+                                                state
+                                                    .send_to_mesh(&text)
+                                                    .map(|report| report.status())
+                                            }
+                                            ClipboardItem::Files(paths) => {
+                                                state.send_paths_to_mesh(&paths)
+                                            }
+                                        }
+                                    });
+                                drop(permit);
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(window) = status_window.upgrade() {
+                                        window.set_status_text(
+                                            result.unwrap_or_else(|error| error).into(),
+                                        );
+                                    }
+                                });
+                            });
+                        },
+                    )
                 });
-            });
+            if !started {
+                window.set_status_text("Mesh refresh is already in progress".into());
+            }
         });
     }
 
@@ -904,6 +959,9 @@ fn main() -> Result<()> {
         let activation_gate = activation_gate.clone();
         let data_dir = data_dir.clone();
         let peer_names = peer_names.clone();
+        let server = server.clone();
+        let receive_store = receive_store.clone();
+        let refresh_gate = refresh_gate.clone();
         window.on_activate_offer(move |offer_id_text, mode_text| {
             let Some(window) = window_weak.upgrade() else {
                 return;
@@ -920,106 +978,149 @@ fn main() -> Result<()> {
                     return;
                 }
             };
-            let plan = match coordinator.plan_activation(offer_id, mode) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    window.set_status_text(error.into());
-                    return;
-                }
-            };
-            if active_activations
-                .lock()
-                .map(|active| active.contains_key(&offer_id))
-                .unwrap_or(true)
-            {
-                window.set_status_text("This offer is already activating; nothing queued".into());
-                return;
-            }
-            let clipboard = match clipboard_for_activation(mode, clipboard.clone()) {
-                Ok(clipboard) => clipboard,
-                Err(error) => {
-                    window.set_status_text(error.into());
-                    return;
-                }
-            };
-            let Some(permit) = activation_gate.try_enter() else {
-                window.set_status_text(
-                    "Two activations are already in progress; nothing queued".into(),
-                );
-                return;
-            };
-            let input = match app_state
-                .lock()
-                .map_err(|_| "app state is unavailable".to_owned())
-                .and_then(|state| build_activation_input(&plan, &state))
-            {
-                Ok(input) => input,
-                Err(error) => {
-                    drop(permit);
-                    window.set_status_text(error.into());
-                    return;
-                }
-            };
-            let (cancel, cancel_receiver) = watch::channel(false);
-            if !register_active_activation(
-                &active_activations,
-                offer_id,
-                ActiveActivation {
-                    cancel,
-                    progress: "Pulling…".to_owned(),
-                },
-            ) {
-                drop(permit);
-                window.set_status_text("This offer is already activating; nothing queued".into());
-                return;
-            }
-            window.set_status_text(
-                if mode == ActivationMode::Save {
-                    "Pulling offer to the configured destination…"
-                } else {
-                    "Pulling offer to the clipboard…"
-                }
-                .into(),
-            );
-            refresh_shelf_in_background(
-                window_weak.clone(),
-                offer_store.clone(),
-                peer_names.clone(),
-                active_activations.clone(),
-            );
-            let window_weak = window_weak.clone();
+            window.set_status_text("Checking mesh reachability…".into());
+            let completion_window = window_weak.clone();
+            let coordinator = coordinator.clone();
+            let app_state = app_state.clone();
             let offer_store = offer_store.clone();
+            let clipboard = clipboard.clone();
             let active_activations = active_activations.clone();
+            let activation_gate = activation_gate.clone();
+            let data_dir = data_dir.clone();
             let peer_names = peer_names.clone();
-            let state_root = data_dir.clone();
-            thread::spawn(move || {
-                let result = run_activation(
-                    input,
-                    offer_store.clone(),
-                    clipboard,
-                    state_root,
-                    cancel_receiver,
-                );
-                remove_active_activation(&active_activations, offer_id);
-                drop(permit);
-                let status_window = window_weak.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(window) = status_window.upgrade() {
-                        window.set_status_text(
-                            result
-                                .map(|()| "Offer activation completed".to_owned())
-                                .unwrap_or_else(|error| error)
+            let action_window = window_weak.clone();
+            let started =
+                discovery_events.dispatch(DiscoveryRefreshTrigger::BeforeUserOperation, || {
+                    refresh_in_background(
+                        app_state.clone(),
+                        peer_names.clone(),
+                        server.clone(),
+                        receive_store.clone(),
+                        refresh_gate.clone(),
+                        move |refresh_result| {
+                            let Some(window) = completion_window.upgrade() else {
+                                return;
+                            };
+                            let view = match refresh_result {
+                                Ok(view) => view,
+                                Err(error) => {
+                                    apply_refresh_error(&window, error);
+                                    return;
+                                }
+                            };
+                            apply_peer_view(&window, view);
+                            let plan = match coordinator.plan_activation(offer_id, mode) {
+                                Ok(plan) => plan,
+                                Err(error) => {
+                                    window.set_status_text(error.into());
+                                    return;
+                                }
+                            };
+                            if active_activations
+                                .lock()
+                                .map(|active| active.contains_key(&offer_id))
+                                .unwrap_or(true)
+                            {
+                                window.set_status_text(
+                                    "This offer is already activating; nothing queued".into(),
+                                );
+                                return;
+                            }
+                            let clipboard = match clipboard_for_activation(mode, clipboard.clone())
+                            {
+                                Ok(clipboard) => clipboard,
+                                Err(error) => {
+                                    window.set_status_text(error.into());
+                                    return;
+                                }
+                            };
+                            let Some(permit) = activation_gate.try_enter() else {
+                                window.set_status_text(
+                                    "Two activations are already in progress; nothing queued"
+                                        .into(),
+                                );
+                                return;
+                            };
+                            let input = match app_state
+                                .lock()
+                                .map_err(|_| "app state is unavailable".to_owned())
+                                .and_then(|state| build_activation_input(&plan, &state))
+                            {
+                                Ok(input) => input,
+                                Err(error) => {
+                                    drop(permit);
+                                    window.set_status_text(error.into());
+                                    return;
+                                }
+                            };
+                            let (cancel, cancel_receiver) = watch::channel(false);
+                            if !register_active_activation(
+                                &active_activations,
+                                offer_id,
+                                ActiveActivation {
+                                    cancel,
+                                    progress: "Pulling…".to_owned(),
+                                },
+                            ) {
+                                drop(permit);
+                                window.set_status_text(
+                                    "This offer is already activating; nothing queued".into(),
+                                );
+                                return;
+                            }
+                            window.set_status_text(
+                                if mode == ActivationMode::Save {
+                                    "Pulling offer to the configured destination…"
+                                } else {
+                                    "Pulling offer to the clipboard…"
+                                }
                                 .into(),
-                        );
-                    }
+                            );
+                            refresh_shelf_in_background(
+                                action_window.clone(),
+                                offer_store.clone(),
+                                peer_names.clone(),
+                                active_activations.clone(),
+                            );
+                            let window_weak = action_window;
+                            let offer_store = offer_store.clone();
+                            let active_activations = active_activations.clone();
+                            let peer_names = peer_names.clone();
+                            let state_root = data_dir.clone();
+                            thread::spawn(move || {
+                                let result = run_activation(
+                                    input,
+                                    offer_store.clone(),
+                                    clipboard,
+                                    state_root,
+                                    cancel_receiver,
+                                );
+                                remove_active_activation(&active_activations, offer_id);
+                                drop(permit);
+                                let status_window = window_weak.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(window) = status_window.upgrade() {
+                                        window.set_status_text(
+                                            result
+                                                .map(|()| "Offer activation completed".to_owned())
+                                                .unwrap_or_else(|error| error)
+                                                .into(),
+                                        );
+                                    }
+                                });
+                                refresh_shelf_in_background(
+                                    window_weak,
+                                    offer_store,
+                                    peer_names,
+                                    active_activations,
+                                );
+                            });
+                        },
+                    )
                 });
-                refresh_shelf_in_background(
-                    window_weak,
-                    offer_store,
-                    peer_names,
-                    active_activations,
-                );
-            });
+            if !started {
+                window.set_status_text("Mesh refresh is already in progress".into());
+            }
         });
     }
 
@@ -1052,14 +1153,26 @@ fn main() -> Result<()> {
             let Some(window) = window_weak.upgrade() else {
                 return;
             };
-            let started = refresh_in_background(
-                window_weak.clone(),
-                app_state.clone(),
-                peer_names.clone(),
-                server.clone(),
-                receive_store.clone(),
-                refresh_gate.clone(),
-            );
+            let started = discovery_events.dispatch(DiscoveryRefreshTrigger::Explicit, || {
+                refresh_in_background(
+                    app_state.clone(),
+                    peer_names.clone(),
+                    server.clone(),
+                    receive_store.clone(),
+                    refresh_gate.clone(),
+                    {
+                        let window_weak = window_weak.clone();
+                        move |result| {
+                            if let Some(window) = window_weak.upgrade() {
+                                match result {
+                                    Ok(view) => apply_peer_view(&window, view),
+                                    Err(error) => apply_refresh_error(&window, error),
+                                }
+                            }
+                        }
+                    },
+                )
+            });
             window.set_status_text(
                 if started {
                     "Refreshing mesh devices…"
@@ -1154,26 +1267,6 @@ fn main() -> Result<()> {
         let _ = slint::quit_event_loop();
     });
 
-    let mesh_timer = Timer::default();
-    {
-        let window_weak = window.as_weak();
-        let app_state = app_state.clone();
-        let peer_names = peer_names.clone();
-        let server = server.clone();
-        let receive_store = receive_store.clone();
-        let refresh_gate = refresh_gate.clone();
-        mesh_timer.start(TimerMode::Repeated, Duration::from_secs(8), move || {
-            refresh_in_background(
-                window_weak.clone(),
-                app_state.clone(),
-                peer_names.clone(),
-                server.clone(),
-                receive_store.clone(),
-                refresh_gate.clone(),
-            );
-        });
-    }
-
     window.show()?;
     tray.show()?;
     let shelf_changes = coordinator.shelf_changes().subscribe();
@@ -1199,14 +1292,26 @@ fn main() -> Result<()> {
         peer_names.clone(),
         active_activations.clone(),
     );
-    refresh_in_background(
-        window.as_weak(),
-        app_state,
-        peer_names,
-        server,
-        receive_store,
-        refresh_gate,
-    );
+    discovery_events.dispatch(DiscoveryRefreshTrigger::Launch, || {
+        refresh_in_background(
+            app_state,
+            peer_names,
+            server,
+            receive_store,
+            refresh_gate,
+            {
+                let window_weak = window.as_weak();
+                move |result| {
+                    if let Some(window) = window_weak.upgrade() {
+                        match result {
+                            Ok(view) => apply_peer_view(&window, view),
+                            Err(error) => apply_refresh_error(&window, error),
+                        }
+                    }
+                }
+            },
+        )
+    });
     slint::run_event_loop()?;
     Ok(())
 }
@@ -1223,6 +1328,62 @@ mod tests {
         assert!(gate.try_enter().is_none());
         drop(first);
         assert!(gate.try_enter().is_some());
+    }
+
+    #[test]
+    fn discovery_has_no_repeating_timer() {
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let observed = refreshes.clone();
+        assert!(
+            DiscoveryEventLoop.dispatch(DiscoveryRefreshTrigger::Launch, move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        );
+
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn launch_refreshes_reachability_once() {
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let observed = refreshes.clone();
+        assert!(
+            DiscoveryEventLoop.dispatch(DiscoveryRefreshTrigger::Launch, move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        );
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn explicit_refresh_updates_reachability() {
+        let reachability = Arc::new(Mutex::new("stale".to_owned()));
+        let observed = reachability.clone();
+        assert!(
+            DiscoveryEventLoop.dispatch(DiscoveryRefreshTrigger::Explicit, move || {
+                *observed.lock().expect("reachability state") = "BZOT".to_owned();
+                true
+            })
+        );
+        assert_eq!(*reachability.lock().expect("reachability state"), "BZOT");
+    }
+
+    #[test]
+    fn user_operation_refreshes_reachability_before_acting() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let observed = order.clone();
+        assert!(DiscoveryEventLoop.dispatch(
+            DiscoveryRefreshTrigger::BeforeUserOperation,
+            move || {
+                observed.lock().expect("event order").push("refresh");
+                true
+            },
+        ));
+        order.lock().expect("event order").push("act");
+        assert_eq!(*order.lock().expect("event order"), ["refresh", "act"]);
     }
 
     #[test]
