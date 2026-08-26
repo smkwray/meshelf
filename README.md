@@ -1,57 +1,56 @@
 # meshelf
 
-**meshelf** is a small, symmetric, peer-to-peer clipboard courier and lightweight shared shelf for devices already connected through Tailscale.
+meshelf is a small, symmetric, peer-to-peer offer shelf for devices connected through Tailscale.
+There is no controller, server, primary, leader, canonical store, or mandatory relay.
 
-The primary interaction is deliberately minimal:
+The current production composition speaks protocol 2 only:
 
 ```text
-sender: open meshelf -> press Cmd/Ctrl+V once
-receiver: open meshelf -> click an item or press Cmd/Ctrl+1–5
+sender:   focus meshelf -> press Cmd/Ctrl+V once
+receiver: open the shelf -> activate a card or press Cmd/Ctrl+1–5
 ```
 
-No machine is a controller, server, primary, leader, or canonical store. Every installation has the same role. A normal copy operation never causes network activity. Only an explicit meshelf action reads or sends clipboard content.
+The sender stores text captured at the explicit paste and announces bounded metadata to its paired
+peers. File and folder offers store a canonical path and metadata commitment, never a sender payload
+copy. Every receiver may store a metadata card; payload bytes move only when that receiver activates
+the card and pulls them directly from the origin. A failed direct operation is not queued or resumed.
 
-This repository is an **agent-ready implementation seed**, not a production release. It contains the locked product contract, architecture, protocol/state-machine foundations, a cross-platform UI shell, on-demand Tailscale discovery of untrusted meshelf candidates, platform adapters, local simulation, bounded work orders, test plan, release scaffolding, and audit materials needed for local agents to continue implementation without reopening settled architecture.
+The shelf retains ten live entries per device; the eleventh purges the oldest and there is no
+time-based expiry. Text cards show a bounded 256-byte UTF-8 preview. File/folder cards can activate
+to the local native clipboard or to Downloads/the configured absolute save destination. The status
+line reports peers that answered the latest reachability probe, not every paired device.
 
-## Locked v1 behavior
+Clipboard reads are explicit only: an active-window control or a foreground command the user typed.
+Copy events, idle polling, discovery timers, network heartbeats, global hotkeys, notifications, and
+start-at-login are not part of the contract.
 
-- Windows, macOS, and desktop Linux.
-- Same binary role on every device.
-- Tailscale provides reachability; meshelf does not create another VPN.
-- Plain Unicode text plus direct file/folder transfer from native Finder/Explorer file copies or an existing textual path.
-- Cmd/Ctrl+V in the focused meshelf window reads the clipboard once and fans the item out to every paired online peer.
-- Received items are stored on the local shelf and never replace the receiver clipboard automatically.
-- Clicking a card or pressing Cmd/Ctrl+1–5 explicitly copies that shelf item on the receiving device.
-- Offline failure is visible and is never replayed later.
-- Message IDs make retries duplicate-safe.
-- The main window may be closed while a tray/menu-bar process remains available.
-- No automatic clipboard watcher, periodic clipboard polling, remote command execution, rich text, or images.
-- File/folder senders and receivers must be online together; transfer is streamed directly and is not queued.
+This is a private functional candidate, not a production release. The cutover source/tests are at
+`3002cb7` and the current runtime evidence is BMST/macOS. BZOT/Windows was unreachable, so no
+Windows or cross-platform verification is claimed.
 
 ## Start here
 
-1. Read [`START_HERE.md`](START_HERE.md).
-2. Read [`AGENTS.md`](AGENTS.md); its invariants are binding.
-3. Read [`docs/00_PRODUCT_CONTRACT.md`](docs/00_PRODUCT_CONTRACT.md) and [`docs/01_ARCHITECTURE.md`](docs/01_ARCHITECTURE.md).
-4. Read [`docs/05_TEST_PLAN.md`](docs/05_TEST_PLAN.md) before changing code; in a synced development workspace, also inspect the private `do/state.md` note.
-5. Use one bounded work order from [`prompts/work-orders/`](prompts/work-orders/).
+1. Read [`AGENTS.md`](AGENTS.md) and [`START_HERE.md`](START_HERE.md).
+2. Read the current product, architecture, protocol, security, and test documents in [`docs/`](docs/).
+3. Read the private [`do/state.md`](do/state.md) in a synced development workspace.
+4. Use one bounded work order from [`prompts/work-orders/`](prompts/work-orders/).
 
 ## Repository map
 
 ```text
-apps/desktop/          Slint desktop UI and tray shell
-crates/meshelf-core/   Domain model, policy, idempotent receive state machine
-crates/meshelf-net/    One-shot peer listener/client and trust-gate abstraction
-crates/meshelf-platform/ Explicit clipboard adapter
-crates/meshelf-protocol/ Framing and versioned wire messages
-crates/meshelf-store/  redb-backed receive ledger
-crates/meshelf-tailscale/ Tailscale status discovery adapter
-tools/meshelf-sim/     Loopback two-peer simulation
-config/                Example local configuration and Tailscale policy
-docs/                  Binding design, security, protocol, and test documents
-prompts/                Launch prompt and bounded agent work orders
-scripts/                Bootstrap, validation, and source-package helpers
-do/                     Private local state, audit dispatches, and operator notes (not committed)
+apps/desktop/             Slint desktop UI and tray shell
+apps/meshelfctl/          Headless resident and explicit CLI operations
+crates/meshelf-core/      Domain, offer, activation, and destination semantics
+crates/meshelf-control/   Offer planning, local control, and composition
+crates/meshelf-net/       Protocol-2 announcement/fetch transport
+crates/meshelf-platform/  Clipboard and filesystem adapters
+crates/meshelf-protocol/  Version-2 messages and bounded framing
+crates/meshelf-store/     redb v2 offer/card/activation storage
+crates/meshelf-tailscale/ On-demand discovery and peer state
+tools/meshelf-sim/        Local simulation
+config/                   Example state shape and Tailscale policy
+docs/                     Product, architecture, security, protocol, and gate documents
+scripts/                  Bootstrap, validation, packaging, and source-archive helpers
 ```
 
 ## Build commands
@@ -64,10 +63,7 @@ macOS/Linux:
 ./scripts/dev.sh
 ```
 
-On macOS, `./scripts/package-macos.sh --install` creates and registers
-`~/Applications/meshelf.app`, making the app available to Raycast and `open -a meshelf`.
-
-Windows PowerShell or Command Prompt:
+Windows:
 
 ```bat
 scripts\bootstrap.bat
@@ -75,42 +71,16 @@ scripts\check.bat
 scripts\dev.bat
 ```
 
-The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may require the native packages listed in [`docs/06_BUILD_AND_RELEASE.md`](docs/06_BUILD_AND_RELEASE.md).
+The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may require the native
+packages listed in [`docs/06_BUILD_AND_RELEASE.md`](docs/06_BUILD_AND_RELEASE.md).
 
-## What is already seeded
+## Current implementation boundary
 
-- Versioned text envelope and receipt types.
-- 1 MiB text policy and validation.
-- At-most-once clipboard application state machine.
-- Durable receive-ledger interface and redb implementation.
-- Length-prefixed JSON wire codec.
-- Direct one-message TCP client/listener with timeouts.
-- Bounded direct file/folder streaming with manifests, free-space admission, SHA-256 verification,
-  partial staging, atomic finalization, and no-overwrite naming.
-- Native file-list clipboard reads and writes: copy in Finder/Explorer, paste once into Meshelf,
-  then activate the received card to paste the actual file from that device's clipboard.
-- Deny-by-default trust gate.
-- Tailscale `status --json` parser and binary locator.
-- On-demand Tailscale peer probes and a listener bound only to a discovered Tailscale address.
-- Protected per-installation Ed25519 identity, signed hellos, and durable peer-key bindings.
-- Signed Meshelf peers on the same Tailscale network pair automatically during discovery; private
-  builds also recover automatically after an app reinstall on the same Tailscale node.
-- Cross-platform explicit clipboard adapter using `arboard`.
-- Window-local explicit send controls; meshelf does not register global hotkeys.
-- `meshelfctl` equivalents for status/refresh, clipboard read, and mesh-wide text/stdin/clipboard
-  sends.
-- High-contrast black-and-white tray icon wiring, rounded application artwork, Windows
-  executable icon resources, and a private macOS application-bundle path.
-- Slint 1.17 desktop window and system-tray shell.
-- Loopback simulation and unit-test scaffolding.
-- CI, packaging scripts, source manifest, and agent/audit handoffs.
+The source includes bounded text and native file/folder offers, signed protocol-2 hellos, Tailscale-
+only listener binding, metadata announcements, receiver-initiated fetch, descriptor/manifest/hash
+validation, atomic no-replace publication, startup migration/cleanup, explicit clipboard/save
+activation, and local simulation/tests.
 
-## Deliberately unfinished
-
-The app is in functional private testing, not a hardened public release. The largest open items are
-interrupted-transfer resume/cleanup, notifications/start-at-login, signing/notarization, Linux
-packaging, and a final security hardening pass. Automatic pairing
-currently treats a valid signed Meshelf installation on the owner's Tailscale network as eligible;
-tightening that policy is intentionally deferred until the core workflow is settled.
-
-See the private `do/state.md` note in a synced development workspace for the exact boundary.
+The private candidate still needs permitted-host listener proof, Windows platform proof, and final
+security/package release evidence. Do not infer those from a local green source gate or from the
+BMST host.
