@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">meshelf</string>
+    <string name="seed_title">meshelf Android ABI seed</string>
+    <string name="seed_boundary">Text clipboard actions are explicit. Networking, trust, file/folder transfer, background availability, signing, and distribution are intentionally unavailable.</string>
+    <string name="editor_hint">Text for an explicit local clipboard smoke test</string>
+    <string name="check_native">Check Rust ABI</string>
+    <string name="read_clipboard">Read clipboard once</string>
+    <string name="write_clipboard">Write editor to clipboard once</string>
+    <string name="initial_status">No build or device validation is implied by this source seed.</string>
+</resources>

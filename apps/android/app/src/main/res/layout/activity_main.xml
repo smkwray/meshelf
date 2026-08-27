@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/seed_title"
+            android:textAppearance="?android:attr/textAppearanceLarge"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/seed_boundary" />
+
+        <EditText
+            android:id="@+id/editor"
+            android:layout_width="match_parent"
+            android:layout_height="160dp"
+            android:layout_marginTop="16dp"
+            android:gravity="top|start"
+            android:hint="@string/editor_hint"
+            android:inputType="textMultiLine|textNoSuggestions"
+            android:maxLength="1048576" />
+
+        <Button
+            android:id="@+id/check_native"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/check_native" />
+
+        <Button
+            android:id="@+id/read_clipboard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/read_clipboard" />
+
+        <Button
+            android:id="@+id/write_clipboard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/write_clipboard" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/initial_status"
+            android:textIsSelectable="true" />
+    </LinearLayout>
+</ScrollView>

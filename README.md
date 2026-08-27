@@ -39,6 +39,7 @@ remain open. Do not use this candidate for sensitive material; see `SECURITY.md`
 
 ```text
 apps/desktop/             Slint desktop UI and tray shell
+apps/android/             Native Android shell (currently ABI-only seed)
 apps/meshelfctl/          Headless resident and explicit CLI operations
 crates/meshelf-core/      Domain, offer, activation, and destination semantics
 crates/meshelf-control/   Offer planning, local control, and composition
@@ -47,6 +48,7 @@ crates/meshelf-platform/  Clipboard and filesystem adapters
 crates/meshelf-protocol/  Version-2 messages and bounded framing
 crates/meshelf-store/     redb v2 offer/card/activation storage
 crates/meshelf-tailscale/ On-demand discovery and peer state
+crates/meshelf-android-bridge/  Android JNI ABI bridge (currently ABI-only)
 tools/meshelf-sim/        Local simulation
 config/                   Example state shape and Tailscale policy
 scripts/                  Bootstrap, validation, packaging, and source-archive helpers
@@ -70,8 +72,8 @@ scripts\check.bat
 scripts\dev.bat
 ```
 
-The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may require the native
-packages listed in [`docs/06_BUILD_AND_RELEASE.md`](docs/06_BUILD_AND_RELEASE.md).
+The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may require additional
+native packages from the platform package manager.
 
 ## Current implementation boundary
 
@@ -79,6 +81,10 @@ The source includes bounded text and native file/folder offers, signed protocol-
 only listener binding, metadata announcements, receiver-initiated fetch, descriptor/manifest/hash
 validation, atomic no-replace publication, startup migration/cleanup, explicit clipboard/save
 activation, and local simulation/tests.
+
+The Android tree is currently an ABI-only seed: it proves the Rust/JNI build boundary and exposes
+explicit platform-adapter placeholders, but it has no network session, background service, mobile
+file transfer, APK, signing, or device-tested claim.
 
 The private candidate still needs the complete native failure and recovery proof, broader security
 and release review, Linux evidence, and mobile-device work. Do not infer those from a local green
