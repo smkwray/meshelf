@@ -28,10 +28,12 @@ Clipboard reads are explicit only: an active-window control or a foreground comm
 Copy events, idle polling, discovery timers, network heartbeats, global hotkeys, notifications, and
 start-at-login are not part of the contract.
 
-This is a private functional candidate, not a production release. The current source gates pass on
-BMST/macOS and BZOT/Windows, and the repaired two-device smoke path has been exercised. Full native
+This is an early functional candidate, not a production-ready release. The local source gates pass,
+and the repaired two-device smoke path has been exercised on macOS and Windows. Full native
 failure-mode proof, recovery/resource hardening, Linux, security/release, and mobile-device proofs
-remain open. Do not use this candidate for sensitive material; see `SECURITY.md`.
+remain open. No trusted signed or notarized release artifacts are provided; any candidate build must
+be treated as unsigned/ad-hoc and used only with those limitations understood. Do not use this
+candidate for sensitive material; see `SECURITY.md`.
 
 ## Start here
 
@@ -90,6 +92,6 @@ The Android tree is currently an ABI-only seed: it proves the Rust/JNI build bou
 explicit platform-adapter placeholders, but it has no network session, background service, mobile
 file transfer, APK, signing, or device-tested claim.
 
-The private candidate still needs the complete native failure and recovery proof, broader security
-and release review, Linux evidence, and mobile-device work. Do not infer those from a local green
-source gate or from one successful smoke transfer.
+The candidate still needs the complete native failure and recovery proof, broader security and release
+review, Linux evidence, and mobile-device work. Do not infer those from a local green source gate or
+from one successful smoke transfer.

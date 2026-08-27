@@ -1,0 +1,6 @@
+This is an unsigned or ad-hoc-signed meshelf candidate build.
+
+It is not notarized, Authenticode-signed, or approved as a trusted distribution.
+Use it only as an owner-supervised functional candidate and do not use it for
+passwords, recovery codes, private keys, health data, financial information,
+or confidential work material.

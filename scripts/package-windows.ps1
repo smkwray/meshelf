@@ -50,9 +50,8 @@ New-Item -ItemType Directory -Path $stage | Out-Null
 $desktop = Join-Path $repo "target\release\meshelf-desktop.exe"
 $ctl = Join-Path $repo "target\release\meshelfctl.exe"
 Copy-Item -LiteralPath $desktop, $ctl -Destination $stage
-Copy-Item -LiteralPath (Join-Path $repo "README.md"), (Join-Path $repo "LICENSE.md"), (Join-Path $repo "THIRD_PARTY_NOTICES.md") -Destination $stage
+Copy-Item -LiteralPath (Join-Path $repo "README.md"), (Join-Path $repo "LICENSE.md"), (Join-Path $repo "THIRD_PARTY_NOTICES.md"), (Join-Path $repo "UNSIGNED_CANDIDATE_BUILD.txt") -Destination $stage
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install-windows.ps1"), (Join-Path $PSScriptRoot "uninstall-windows.ps1") -Destination $stage
-Set-Content -LiteralPath (Join-Path $stage "UNSIGNED_PRIVATE_BUILD.txt") -Encoding ascii -Value "This is an unsigned private development build. It is not approved for routine clipboard use."
 
 Add-Type -AssemblyName System.Drawing
 $icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $stage "meshelf-desktop.exe"))

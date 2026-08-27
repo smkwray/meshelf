@@ -52,6 +52,7 @@ mkdir -p "$macos" "$resources"
 cp target/release/meshelf-desktop "$macos/meshelf"
 cp target/release/meshelfctl "$macos/meshelfctl"
 cp assets/meshelf.icns "$resources/meshelf.icns"
+cp UNSIGNED_CANDIDATE_BUILD.txt "$resources/UNSIGNED_CANDIDATE_BUILD.txt"
 
 cat > "$contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

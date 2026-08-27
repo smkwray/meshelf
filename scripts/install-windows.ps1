@@ -22,7 +22,7 @@ foreach ($name in @(
     "README.md",
     "LICENSE.md",
     "THIRD_PARTY_NOTICES.md",
-    "UNSIGNED_PRIVATE_BUILD.txt",
+    "UNSIGNED_CANDIDATE_BUILD.txt",
     "SHA256SUMS.txt",
     "install-windows.ps1",
     "uninstall-windows.ps1"

@@ -1,6 +1,7 @@
 # Start here
 
-This repository is a private development candidate. It is not a completed binary distribution.
+This repository is an early public-source candidate. It is not a completed or trusted binary
+distribution.
 
 ## The non-negotiable architecture
 
@@ -40,7 +41,7 @@ cargo run -p meshelf-desktop
 
 ## Expected first-run state
 
-The desktop shell is intentionally conservative. It renders the window, tray, draft editor, status surfaces, explicit local clipboard-read/send actions, refresh, and on-demand Tailscale discovery. `meshelfctl` supports the same operational actions without the UI. There are no global hotkeys, clipboard watchers, or ambient reads. Valid signed Meshelf installations on the same Tailscale network pair automatically on refresh; there is no separate SSH trust action. The complete native failure/recovery proof, release hardening, and mobile work remain open. Do not “make it work” by changing the trust gate to allow all tailnet nodes.
+The desktop shell is intentionally conservative. It renders the window, tray, draft editor, status surfaces, explicit local clipboard-read/send actions, refresh, and on-demand Tailscale discovery. `meshelfctl` supports the same operational actions without the UI. There are no global hotkeys, clipboard watchers, or ambient reads. Valid signed Meshelf installations on the same Tailscale network pair automatically on refresh; there is no separate SSH trust action. The complete native failure/recovery proof, release hardening, and mobile work remain open. Binary candidates are unsigned or ad-hoc signed and are not trusted-distribution releases. Do not “make it work” by changing the trust gate to allow all tailnet nodes.
 
 ## Recommended local agent sequence
 
