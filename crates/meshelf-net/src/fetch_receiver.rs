@@ -1617,6 +1617,17 @@ where
         Ok(Some(final_path))
     }
 
+    fn mark_clipboard_application(
+        &self,
+        activation: &FetchActivation,
+    ) -> Result<(), SideEffectFailure> {
+        self.store
+            .update_activation_state(activation.request_id, ActivationState::ApplyingClipboard)
+            .map_err(|error| {
+                SideEffectFailure::Terminal(NetError::FetchServiceOwned(error.to_string()))
+            })
+    }
+
     async fn apply_side_effect(
         &self,
         activation: &FetchActivation,
@@ -1624,11 +1635,6 @@ where
         text: Option<&str>,
         published: Option<&Path>,
     ) -> Result<(), SideEffectFailure> {
-        self.store
-            .update_activation_state(activation.request_id, ActivationState::ApplyingClipboard)
-            .map_err(|error| {
-                SideEffectFailure::Terminal(NetError::FetchServiceOwned(error.to_string()))
-            })?;
         match (descriptor, activation.mode, published) {
             (OfferDescriptor::Text { .. }, ActivationMode::Clipboard, None) => {
                 let text = text.ok_or_else(|| {
@@ -1636,6 +1642,7 @@ where
                         "text payload was not retained".to_owned(),
                     ))
                 })?;
+                self.mark_clipboard_application(activation)?;
                 self.clipboard.set_text(text).map_err(|error| {
                     if error.is_uncertain() {
                         self.uncertain_clipboard.store(true, Ordering::Release);
@@ -1649,6 +1656,7 @@ where
                 )))
             }
             (_, ActivationMode::Clipboard, Some(path)) => {
+                self.mark_clipboard_application(activation)?;
                 let candidate = ClipboardCacheRecord {
                     activation_id: activation.request_id,
                     state: ClipboardCacheState::InFlight,
@@ -3140,6 +3148,56 @@ mod tests {
                 .as_slice(),
             [text]
         );
+    }
+
+    #[tokio::test]
+    async fn save_side_effect_does_not_enter_clipboard_uncertainty() {
+        let fixture = ReceiverFixture::new();
+        let activation =
+            fixture.file_activation(ActivationMode::Save, Some(fixture.destination.clone()));
+        let staging_root = fixture
+            .state_root
+            .join("staging")
+            .join(activation.activation.request_id.to_string());
+        fixture
+            .store
+            .journal_activation(&ActivationJournalEntry {
+                activation_id: activation.activation.request_id,
+                source_device: activation.activation.source_device,
+                offer_id: activation.activation.offer_id,
+                mode: ActivationMode::Save,
+                staging_root,
+                state: ActivationState::Publishing,
+                reserved_entries: 1,
+                reserved_bytes: 3,
+            })
+            .expect("journal save activation");
+
+        fixture
+            .receiver()
+            .apply_side_effect(
+                &activation.activation,
+                &activation.descriptor,
+                None,
+                Some(&fixture.destination.join("payload.txt")),
+            )
+            .await
+            .expect("save side effect");
+
+        let journal = fixture
+            .store
+            .get_activation_journal(activation.activation.request_id)
+            .expect("read save journal")
+            .expect("save journal remains");
+        assert_eq!(journal.state, ActivationState::Publishing);
+        assert!(
+            !fixture
+                .store
+                .has_uncertain_side_effect()
+                .expect("read uncertainty state")
+        );
+        assert_eq!(*fixture.clipboard.file_calls.lock().expect("file calls"), 0);
+        assert_eq!(*fixture.clipboard.text_calls.lock().expect("text calls"), 0);
     }
 
     #[tokio::test]
