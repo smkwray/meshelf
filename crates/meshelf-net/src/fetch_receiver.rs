@@ -77,6 +77,7 @@ pub trait FetchClipboard: ClipboardSink {
     fn set_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError>;
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl FetchClipboard for meshelf_platform::ClipboardWorker {
     fn set_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
         meshelf_platform::ClipboardWorker::set_files(self, paths).map_err(ClipboardError::from)

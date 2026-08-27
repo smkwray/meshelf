@@ -7,10 +7,26 @@ rust-version.workspace = true
 license-file.workspace = true
 
 [dependencies]
-arboard.workspace = true
 dirs.workspace = true
 fs2.workspace = true
 meshelf-core = { path = "../meshelf-core" }
-rfd.workspace = true
-renamore.workspace = true
 thiserror.workspace = true
+
+# Clipboard and native dialogs are desktop-only.  The filesystem and local-control
+# primitives in this crate remain available to the portable network/store crates on
+# Android and iOS; those clients provide their own native adapters.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+arboard.workspace = true
+renamore.workspace = true
+rfd.workspace = true
+
+# renamore's default capability probe invokes the native C compiler. iOS has the
+# same Darwin primitive as macOS, so use the crate's declared-supported path without
+# probing the SDK during a Rust check. Android must not fall back to a check-then-
+# rename: until an Android-safe atomic publication path is added, file/folder saves
+# fail explicitly with Unsupported.
+[target.'cfg(target_os = "ios")'.dependencies]
+renamore = { workspace = true, features = ["always-supported"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+renamore = { workspace = true, features = ["always-fallback"] }
