@@ -1,5 +1,9 @@
 # meshelf
 
+<p align="center">
+  <img src="assets/meshelf-256.png" alt="meshelf logo" width="160">
+</p>
+
 meshelf is a small, symmetric, peer-to-peer offer shelf for devices connected through Tailscale.
 There is no controller, server, primary, leader, canonical store, or mandatory relay.
 
