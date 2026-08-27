@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-candidate.2 — 2026-08-27
+
+- Kept save-mode finalization uncertainty separate from clipboard uncertainty, so a save failure
+  cannot incorrectly block later clipboard activations.
+- Added regression coverage for save recovery and save finalization failures.
+- Rebuilt the unsigned/ad-hoc desktop candidate packages from this corrected tip.
+
 ## 0.1.0-candidate.1 — 2026-08-27
 
 - Published the source under the MIT License as an early functional candidate.

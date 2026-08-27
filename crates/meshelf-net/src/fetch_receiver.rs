@@ -1793,7 +1793,9 @@ where
             self.cleanup_blocked.store(true, Ordering::Release);
             return Err(error);
         }
-        self.uncertain_clipboard.store(true, Ordering::Release);
+        if activation.mode == ActivationMode::Clipboard {
+            self.uncertain_clipboard.store(true, Ordering::Release);
+        }
         self.finish_terminal(
             stream,
             FetchReceiptCode::UncertainNoReplay,
@@ -3198,6 +3200,88 @@ mod tests {
         );
         assert_eq!(*fixture.clipboard.file_calls.lock().expect("file calls"), 0);
         assert_eq!(*fixture.clipboard.text_calls.lock().expect("text calls"), 0);
+    }
+
+    #[tokio::test]
+    async fn save_finalization_uncertainty_does_not_block_clipboard() {
+        let fixture = ReceiverFixture::new();
+        let activation =
+            fixture.file_activation(ActivationMode::Save, Some(fixture.destination.clone()));
+        let staging_root = fixture
+            .state_root
+            .join("staging")
+            .join(activation.activation.request_id.to_string());
+        fixture
+            .store
+            .journal_activation(&ActivationJournalEntry {
+                activation_id: activation.activation.request_id,
+                source_device: activation.activation.source_device,
+                offer_id: activation.activation.offer_id,
+                mode: ActivationMode::Save,
+                staging_root,
+                state: ActivationState::Publishing,
+                reserved_entries: 1,
+                reserved_bytes: 3,
+            })
+            .expect("journal save activation");
+        let plan = ReceivePlan {
+            content_kind: ContentKind::File,
+            total_bytes: 3,
+            file_count: 1,
+            entries: Vec::new(),
+            manifest_end: None,
+            manifest_encoded_bytes: 0,
+            manifest_sha256: None,
+            text: None,
+            staged_files: Vec::new(),
+        };
+
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind uncertainty test listener");
+        let address = listener.local_addr().expect("uncertainty test address");
+        let receiver = fixture.receiver();
+        let task_receiver = receiver.clone();
+        let task_activation = activation.activation.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept uncertainty test");
+            task_receiver
+                .finish_uncertain(
+                    &mut stream,
+                    &task_activation,
+                    &plan,
+                    1,
+                    3,
+                    "save bookkeeping failed".to_owned(),
+                    TEST_IO_TIMEOUT,
+                )
+                .await
+        });
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect uncertainty test");
+        let message = timeout(TEST_IO_TIMEOUT, read_v2_frame_async(&mut client))
+            .await
+            .expect("uncertainty receipt timeout")
+            .expect("uncertainty receipt");
+        let V2Message::FetchReceipt(receipt) = message else {
+            panic!("expected uncertainty receipt");
+        };
+        assert_eq!(receipt.code, FetchReceiptCode::UncertainNoReplay);
+        assert!(matches!(
+            server.await.expect("uncertainty task"),
+            Err(NetError::FetchTerminal {
+                code: FetchReceiptCode::UncertainNoReplay,
+                ..
+            })
+        ));
+        assert!(!receiver.uncertain_clipboard.load(Ordering::Acquire));
+        assert!(
+            !fixture
+                .store
+                .has_uncertain_side_effect()
+                .expect("clipboard uncertainty marker")
+        );
     }
 
     #[tokio::test]

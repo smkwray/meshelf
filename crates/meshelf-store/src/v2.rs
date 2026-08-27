@@ -13,10 +13,10 @@ use std::{
 };
 
 use meshelf_core::{
-    ActivationId, ActivationJournalEntry, CleanupReport, ClipboardCacheRecord, ClipboardCacheState,
-    MigrationReport, OfferCardInput, OfferCardInsert, OfferCardRecord, OfferEligibilityUpdate,
-    OfferSourceInput, OfferSourceInsert, OfferSourceRecord, OfferSourceStore, StoreError,
-    V2_MAX_LIVE_ENTRIES,
+    ActivationId, ActivationJournalEntry, ActivationMode, CleanupReport, ClipboardCacheRecord,
+    ClipboardCacheState, MigrationReport, OfferCardInput, OfferCardInsert, OfferCardRecord,
+    OfferEligibilityUpdate, OfferSourceInput, OfferSourceInsert, OfferSourceRecord,
+    OfferSourceStore, StoreError, V2_MAX_LIVE_ENTRIES,
 };
 use meshelf_platform::{ensure_directory_tree, reject_reparse_point, remove_owned_tree};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -602,13 +602,11 @@ impl RedbV2Store {
     }
 
     pub fn has_uncertain_side_effect(&self) -> Result<bool, StoreError> {
-        Ok(self
-            .activation_journal_entries()?
-            .iter()
-            .any(|entry| entry.state.is_uncertain_side_effect())
-            || self
-                .get_clipboard_cache(ClipboardCacheState::InFlight)?
-                .is_some())
+        Ok(self.activation_journal_entries()?.iter().any(|entry| {
+            entry.mode == ActivationMode::Clipboard && entry.state.is_uncertain_side_effect()
+        }) || self
+            .get_clipboard_cache(ClipboardCacheState::InFlight)?
+            .is_some())
     }
 
     pub fn set_clipboard_cache(&self, record: &ClipboardCacheRecord) -> Result<(), StoreError> {
@@ -1389,6 +1387,7 @@ mod tests {
         let root = fs::canonicalize(directory.path()).expect("canonical temporary directory");
         let abandoned = journal_entry(root.join("abandoned"));
         let mut uncertain = journal_entry(root.join("uncertain"));
+        uncertain.mode = ActivationMode::Clipboard;
         uncertain.state = ActivationState::UncertainNoReplay;
         store.prepare_staging(&abandoned).expect("abandoned");
         store.prepare_staging(&uncertain).expect("uncertain");
@@ -1414,6 +1413,7 @@ mod tests {
         let (directory, store) = store();
         let root = fs::canonicalize(directory.path()).expect("canonical temporary directory");
         let mut applying = journal_entry(root.join("applying"));
+        applying.mode = ActivationMode::Clipboard;
         applying.state = ActivationState::ApplyingClipboard;
         store.prepare_staging(&applying).expect("applying");
         store.startup_cleanup().expect("cleanup");
@@ -1423,6 +1423,20 @@ mod tests {
             .expect("preserved");
         assert_eq!(kept.state, ActivationState::UncertainNoReplay);
         assert!(store.has_uncertain_side_effect().expect("uncertain marker"));
+    }
+
+    #[test]
+    fn save_uncertainty_does_not_mark_clipboard_uncertain() {
+        let (directory, store) = store();
+        let root = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+        let mut uncertain = journal_entry(root.join("save-uncertain"));
+        uncertain.state = ActivationState::UncertainNoReplay;
+        store.prepare_staging(&uncertain).expect("save uncertain");
+        assert!(
+            !store
+                .has_uncertain_side_effect()
+                .expect("clipboard uncertainty marker")
+        );
     }
 
     #[test]
