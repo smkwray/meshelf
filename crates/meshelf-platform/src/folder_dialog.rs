@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use meshelf_core::SaveDestination;
 
 /// Open the native folder picker. The dialog is reached only from an explicit settings action.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn choose_folder() -> Option<PathBuf> {
     rfd::FileDialog::new().pick_folder()
 }

@@ -4,20 +4,17 @@
 //! object and performs a read or write only in response to an explicit command.
 
 mod activation;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod clipboard;
 mod filesystem;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod folder_dialog;
 
 pub use activation::{
     MAX_CONTROL_REQUEST_BYTES, MAX_CONTROL_RESPONSE_BYTES, ResidentLock, acquire_resident_lock,
     listen, listen_with_control, request, signal,
 };
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use clipboard::{
-    ClipboardItem, ClipboardSource, ClipboardWorker, NativeClipboard, PlatformClipboardError,
-    write_files_on, write_text_on,
+    ClipboardItem, ClipboardSource, NativeClipboard, PlatformClipboardError, write_files_on,
+    write_text_on,
 };
 #[cfg(windows)]
 pub use filesystem::windows_verbatim_path;
@@ -28,7 +25,11 @@ pub use filesystem::{
     total_space,
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub use folder_dialog::{choose_folder, resolve_save_destination};
+pub use folder_dialog::choose_folder;
+pub use folder_dialog::resolve_save_destination;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub use clipboard::ClipboardWorker;
 
 pub trait Notifier: Send + Sync + 'static {
     fn received_clipboard(&self, source_name: &str) -> Result<(), String>;

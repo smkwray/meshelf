@@ -12,9 +12,9 @@ fs2.workspace = true
 meshelf-core = { path = "../meshelf-core" }
 thiserror.workspace = true
 
-# Clipboard and native dialogs are desktop-only.  The filesystem and local-control
-# primitives in this crate remain available to the portable network/store crates on
-# Android and iOS; those clients provide their own native adapters.
+# The concrete clipboard and native dialog backends are desktop-only. The shared
+# clipboard contract, filesystem, and local-control primitives remain available to
+# portable network/store clients on Android and iOS.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 arboard.workspace = true
 renamore.workspace = true

@@ -1,5 +1,10 @@
+use std::path::PathBuf;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use std::path::Path;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::{
-    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
@@ -7,7 +12,9 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use meshelf_core::{ClipboardError, ClipboardSink};
+use meshelf_core::ClipboardError;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use meshelf_core::ClipboardSink;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +124,7 @@ pub trait NativeClipboard {
     fn get_file_list(&mut self) -> Result<Vec<PathBuf>, String>;
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl NativeClipboard for arboard::Clipboard {
     fn set_text(&mut self, text: &str) -> Result<(), String> {
         arboard::Clipboard::set_text(self, text).map_err(|error| error.to_string())
@@ -141,6 +149,7 @@ impl NativeClipboard for arboard::Clipboard {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 enum ClipboardCommand {
     Read(Sender<Result<ClipboardItem, String>>),
     Write(String, Sender<Result<(), NativeWriteError>>),
@@ -148,12 +157,14 @@ enum ClipboardCommand {
     Shutdown,
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Debug)]
 struct ClipboardWorkerInner {
     commands: SyncSender<ClipboardCommand>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl Drop for ClipboardWorkerInner {
     fn drop(&mut self) {
         let _ = self.commands.send(ClipboardCommand::Shutdown);
@@ -169,11 +180,13 @@ impl Drop for ClipboardWorkerInner {
 ///
 /// Keeping the native clipboard object alive on one thread avoids concurrent access on Windows
 /// and preserves clipboard ownership semantics used by Linux backends.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Debug, Clone)]
 pub struct ClipboardWorker {
     inner: Arc<ClipboardWorkerInner>,
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl ClipboardWorker {
     pub fn new() -> Result<Self, PlatformClipboardError> {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
@@ -254,12 +267,14 @@ impl ClipboardWorker {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl ClipboardSource for ClipboardWorker {
     fn read_item(&self) -> Result<ClipboardItem, PlatformClipboardError> {
         self.request(ClipboardCommand::Read)
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl ClipboardSink for ClipboardWorker {
     fn set_text(&self, text: &str) -> Result<(), ClipboardError> {
         let (response_tx, response_rx) = mpsc::channel();
@@ -384,6 +399,7 @@ fn write_files_on_native(
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn handle_command(clipboard: &mut impl NativeClipboard, command: ClipboardCommand) -> bool {
     match command {
         ClipboardCommand::Read(response) => {
@@ -406,6 +422,7 @@ fn handle_command(clipboard: &mut impl NativeClipboard, command: ClipboardComman
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn clipboard_thread(
     commands: Receiver<ClipboardCommand>,
     ready: mpsc::SyncSender<Result<(), String>>,
@@ -500,24 +517,14 @@ mod tests {
     }
 
     fn send_write(clipboard: &mut ScriptedClipboard, text: &str) -> Result<(), NativeWriteError> {
-        let (response_tx, response_rx) = mpsc::channel();
-        assert!(!handle_command(
-            clipboard,
-            ClipboardCommand::Write(text.to_owned(), response_tx)
-        ));
-        response_rx.recv().expect("worker response")
+        write_text_on_native(clipboard, text)
     }
 
     fn send_write_files(
         clipboard: &mut ScriptedClipboard,
         paths: Vec<PathBuf>,
     ) -> Result<(), NativeWriteError> {
-        let (response_tx, response_rx) = mpsc::channel();
-        assert!(!handle_command(
-            clipboard,
-            ClipboardCommand::WriteFiles(paths, response_tx)
-        ));
-        response_rx.recv().expect("worker response")
+        write_files_on_native(clipboard, &paths)
     }
 
     #[test]
