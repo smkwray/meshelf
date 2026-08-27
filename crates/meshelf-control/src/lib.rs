@@ -257,7 +257,15 @@ impl Controller {
     }
 
     pub fn refresh(&mut self) -> Result<PeerView, String> {
-        self.reachable_peers.clear();
+        self.refresh_discovery()?;
+        self.refresh_reachability()
+    }
+
+    /// Refresh Tailscale's local status and persist the current addresses without probing peers.
+    ///
+    /// The desktop listener uses this shorter phase so it can accept announcements while the
+    /// slower reachability pass is still running.
+    pub fn refresh_discovery(&mut self) -> Result<(), String> {
         let discovery = self
             .discovery
             .as_ref()
@@ -273,7 +281,16 @@ impl Controller {
             })
             .map_err(|error| format!("could not save meshelf state: {error}"))?;
         self.selected_device = None;
+        self.last_status = Some(status);
+        Ok(())
+    }
 
+    pub fn refresh_reachability(&mut self) -> Result<PeerView, String> {
+        self.reachable_peers.clear();
+        let status = self
+            .last_status
+            .clone()
+            .ok_or_else(|| "Tailscale discovery has not completed; refresh and retry".to_owned())?;
         let runtime = operation_runtime("probe")?;
         let probe = self.probe.clone();
         let candidates = runtime.block_on(async {
@@ -314,7 +331,6 @@ impl Controller {
         for (node, server) in candidates {
             self.accept_discovered(node, server)?;
         }
-        self.last_status = Some(status);
         Ok(self.view())
     }
 
@@ -647,6 +663,41 @@ mod restored_control_tests {
             .expect("external peer remains paired");
         assert_eq!(paired.hostname, "BZOT");
         assert_eq!(paired.public_key, peer_identity.public_key());
+    }
+
+    #[test]
+    fn discovery_phase_records_local_status_before_reachability_probes() {
+        let (_directory, mut controller) = test_controller();
+        let peer_identity = InstallationIdentity::generate();
+        let peer_address = IpAddr::V4(Ipv4Addr::new(100, 90, 118, 120));
+        pair_test_peer_with_identity(
+            &mut controller,
+            "BZOT",
+            "node-bzot",
+            Some(peer_address),
+            &peer_identity,
+        );
+        configure_fake_refresh(
+            &mut controller,
+            test_tail_status(vec![test_tail_node("node-bzot", "BZOT", peer_address)]),
+            HashMap::new(),
+        );
+
+        controller
+            .refresh_discovery()
+            .expect("discovery phase succeeds");
+
+        assert!(controller.last_status.is_some());
+        assert!(controller.reachable_peers.is_empty());
+        assert_eq!(
+            controller
+                .installation
+                .peers
+                .by_device_id(peer_identity.device_id)
+                .expect("paired peer remains available")
+                .addresses,
+            vec![peer_address]
+        );
     }
 
     #[test]

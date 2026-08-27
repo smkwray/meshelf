@@ -118,6 +118,7 @@ export component MainWindow inherits Window {
     in property <string> default-peer: "Not configured";
     in property <bool> default-peer-online: false;
     in property <string> paste-shortcut: "Ctrl+V";
+    in property <string> refresh-shortcut: "Ctrl+R";
     in property <string> shelf-shortcut-help: "click or Ctrl+1–5 to copy";
     in property <[ShelfRow]> shelf-items: [];
     in-out property <string> status-text: "Open meshelf, then paste once to send";
@@ -142,6 +143,10 @@ export component MainWindow inherits Window {
             if (!event.repeat && (event.modifiers.control || event.modifiers.meta)) {
                 if (event.text == "v") {
                     root.paste-and-send();
+                    return accept;
+                }
+                if (event.text == "r" || event.text == "R") {
+                    root.refresh-peers();
                     return accept;
                 }
                 if (event.text == "1" && root.shelf-items.length > 0 && root.shelf-items[0].can-activate) {
@@ -214,7 +219,6 @@ export component MainWindow inherits Window {
             }
             Button {
                 text: "Paste  " + root.paste-shortcut;
-                enabled: root.default-peer-online;
                 clicked => { root.paste-and-send(); }
             }
         }
@@ -277,7 +281,7 @@ export component MainWindow inherits Window {
             }
             Rectangle { horizontal-stretch: 1; }
             Button {
-                text: "Refresh";
+                text: "Refresh  " + root.refresh-shortcut;
                 clicked => { root.refresh-peers(); }
             }
         }

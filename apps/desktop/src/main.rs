@@ -30,9 +30,9 @@ use meshelf_core::{
 };
 use meshelf_net::{
     ActivationOutcome, ActivationService, FetchActivation, FetchClipboard,
-    OfferAnnouncementHandler, OfferFetchHandler, PeerClient, ServerIdentity, TrustDecision,
-    TrustGate, V2OfferServices, bind_discovered_tailscale_std_listener, select_discovered_ip,
-    select_discovered_socket, serve_v2_with_offers_and_fetch,
+    OfferAnnouncementHandler, OfferCardStore, OfferFetchHandler, PeerClient, ServerIdentity,
+    TrustDecision, TrustGate, V2OfferServices, bind_discovered_tailscale_std_listener,
+    select_discovered_ip, select_discovered_socket, serve_v2_with_offers_and_fetch,
 };
 use meshelf_platform::{
     ClipboardItem, ClipboardSource, ClipboardWorker, acquire_resident_lock, choose_folder,
@@ -283,6 +283,7 @@ impl Drop for ServerHandle {
 fn start_v2_listener(
     state: &Controller,
     offer_store: Arc<RedbV2Store>,
+    card_store: Arc<dyn OfferCardStore>,
 ) -> Result<ServerHandle, String> {
     let status = state
         .last_status
@@ -295,7 +296,7 @@ fn start_v2_listener(
         &status.self_node.addresses,
     )
     .map_err(|error| format!("could not bind Tailscale listener: {error}"))?;
-    let offer_receiver = Arc::new(OfferAnnouncementHandler::new(offer_store.clone()));
+    let offer_receiver = Arc::new(OfferAnnouncementHandler::new(card_store));
     let fetch_sender = Arc::new(OfferFetchHandler::new(
         state.installation.device_id,
         offer_store,
@@ -525,6 +526,16 @@ fn paste_shortcut() -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
+fn refresh_shortcut() -> &'static str {
+    "⌘R"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn refresh_shortcut() -> &'static str {
+    "Ctrl+R"
+}
+
+#[cfg(target_os = "macos")]
 fn shelf_shortcut_help() -> &'static str {
     "click or ⌘1–5 to pull · ⌥1–5 to save files"
 }
@@ -580,6 +591,7 @@ fn refresh_in_background(
     peer_names: Arc<Mutex<HashMap<DeviceId, String>>>,
     server: Arc<Mutex<Option<ServerHandle>>>,
     offer_store: Arc<RedbV2Store>,
+    card_store: Arc<dyn OfferCardStore>,
     gate: OperationGate,
     on_complete: impl FnOnce(Result<PeerView, String>) + Send + 'static,
 ) -> bool {
@@ -591,20 +603,21 @@ fn refresh_in_background(
             .lock()
             .map_err(|_| "app state is unavailable".to_owned())
             .and_then(|mut state| {
-                let view = state.refresh()?;
+                state.refresh_discovery()?;
                 if let Ok(mut names) = peer_names.lock() {
                     *names = capture_peer_names(&state);
                 }
                 let needs_server = server.lock().map(|slot| slot.is_none()).unwrap_or(false);
                 if needs_server {
-                    let listener = start_v2_listener(&state, offer_store.clone())?;
+                    let listener =
+                        start_v2_listener(&state, offer_store.clone(), card_store.clone())?;
                     if let Ok(mut slot) = server.lock()
                         && slot.is_none()
                     {
                         *slot = Some(listener);
                     }
                 }
-                Ok(view)
+                state.refresh_reachability()
             });
         drop(permit);
         let _ = slint::invoke_from_event_loop(move || on_complete(result));
@@ -766,6 +779,7 @@ fn main() -> Result<()> {
     let window = MainWindow::new()?;
     let tray = MeshelfTray::new()?;
     window.set_paste_shortcut(paste_shortcut().into());
+    window.set_refresh_shortcut(refresh_shortcut().into());
     window.set_shelf_shortcut_help(shelf_shortcut_help().into());
     let device_name = std::env::var("MESHELF_DEVICE_NAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -813,6 +827,9 @@ fn main() -> Result<()> {
             .with_card_store(offer_store.clone()),
         )
     };
+    let card_store = coordinator
+        .card_store()
+        .ok_or_else(|| anyhow::anyhow!("v2 offer-card store is not configured"))?;
     let (device_name, initial_peer_names) = {
         let state = app_state.lock().expect("app state mutex");
         (state.device_name.clone(), capture_peer_names(&state))
@@ -893,14 +910,9 @@ fn main() -> Result<()> {
     {
         let window_weak = window.as_weak();
         let clipboard = clipboard.clone();
-        let app_state = app_state.clone();
         let coordinator = coordinator.clone();
         let local_runtime = local_runtime.clone();
-        let peer_names = peer_names.clone();
-        let server = server.clone();
-        let offer_store = offer_store.clone();
         let send_gate = send_gate.clone();
-        let refresh_gate = refresh_gate.clone();
         window.on_paste_and_send(move || {
             let Some(window) = window_weak.upgrade() else {
                 return;
@@ -913,95 +925,48 @@ fn main() -> Result<()> {
                 window.set_status_text("A mesh send is already in progress".into());
                 return;
             };
-            window.set_status_text("Checking mesh reachability…".into());
-            let completion_window = window_weak.clone();
-            let action_window = window_weak.clone();
+            window.set_status_text("Sending clipboard item to the mesh…".into());
+            let status_window = window_weak.clone();
             let action_clipboard = clipboard.clone();
-            let coordinator_for_refresh = coordinator.clone();
-            let runtime_for_refresh = local_runtime.clone();
-            let app_state_for_refresh = app_state.clone();
-            let peer_names_for_refresh = peer_names.clone();
-            let server_for_refresh = server.clone();
-            let offer_store_for_refresh = offer_store.clone();
-            let refresh_gate_for_refresh = refresh_gate.clone();
-            let started = discovery_events.dispatch(
-                DiscoveryRefreshTrigger::BeforeUserOperation,
-                move || {
-                    let coordinator = coordinator_for_refresh;
-                    let local_runtime = runtime_for_refresh;
-                    refresh_in_background(
-                        app_state_for_refresh,
-                        peer_names_for_refresh,
-                        server_for_refresh,
-                        offer_store_for_refresh,
-                        refresh_gate_for_refresh,
-                        move |refresh_result| {
-                            let Some(window) = completion_window.upgrade() else {
-                                drop(permit);
-                                return;
-                            };
-                            let view = match refresh_result {
-                                Ok(view) => view,
-                                Err(error) => {
-                                    drop(permit);
-                                    apply_refresh_error(&window, error);
-                                    return;
-                                }
-                            };
-                            apply_peer_view(&window, view);
-                            window.set_status_text("Sending clipboard item to the mesh…".into());
-                            let status_window = action_window;
-                            thread::spawn(move || {
-                                let result = action_clipboard
-                                    .read_item()
-                                    .map_err(|error| format!("Could not read clipboard: {error}"))
-                                    .and_then(|item| match item {
-                                        ClipboardItem::Text(text) => {
-                                            if text.trim().is_empty() {
-                                                return Err(
-                                                    "Clipboard contains no text to send".to_owned()
-                                                );
-                                            }
-                                            create_and_announce(
-                                                &coordinator,
-                                                local_runtime.as_ref(),
-                                                OfferInput::Text(text),
-                                            )
-                                        }
-                                        ClipboardItem::Files(paths) => {
-                                            if paths.is_empty() {
-                                                return Err(
-                                                    "Clipboard contains no files or folders"
-                                                        .to_owned(),
-                                                );
-                                            }
-                                            let mut statuses = Vec::new();
-                                            for path in paths {
-                                                statuses.push(create_and_announce(
-                                                    &coordinator,
-                                                    local_runtime.as_ref(),
-                                                    OfferInput::Path(path),
-                                                )?);
-                                            }
-                                            Ok(statuses.join("; "))
-                                        }
-                                    });
-                                drop(permit);
-                                let _ = slint::invoke_from_event_loop(move || {
-                                    if let Some(window) = status_window.upgrade() {
-                                        window.set_status_text(
-                                            result.unwrap_or_else(|error| error).into(),
-                                        );
-                                    }
-                                });
-                            });
-                        },
-                    )
-                },
-            );
-            if !started {
-                window.set_status_text("Mesh refresh is already in progress".into());
-            }
+            let coordinator = coordinator.clone();
+            let local_runtime = local_runtime.clone();
+            thread::spawn(move || {
+                let result = action_clipboard
+                    .read_item()
+                    .map_err(|error| format!("Could not read clipboard: {error}"))
+                    .and_then(|item| match item {
+                        ClipboardItem::Text(text) => {
+                            if text.trim().is_empty() {
+                                return Err("Clipboard contains no text to send".to_owned());
+                            }
+                            create_and_announce(
+                                &coordinator,
+                                local_runtime.as_ref(),
+                                OfferInput::Text(text),
+                            )
+                        }
+                        ClipboardItem::Files(paths) => {
+                            if paths.is_empty() {
+                                return Err("Clipboard contains no files or folders".to_owned());
+                            }
+                            let mut statuses = Vec::new();
+                            for path in paths {
+                                statuses.push(create_and_announce(
+                                    &coordinator,
+                                    local_runtime.as_ref(),
+                                    OfferInput::Path(path),
+                                )?);
+                            }
+                            Ok(statuses.join("; "))
+                        }
+                    });
+                drop(permit);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = status_window.upgrade() {
+                        window.set_status_text(result.unwrap_or_else(|error| error).into());
+                    }
+                });
+            });
         });
     }
 
@@ -1018,6 +983,7 @@ fn main() -> Result<()> {
         let peer_names = peer_names.clone();
         let server = server.clone();
         let refresh_gate = refresh_gate.clone();
+        let card_store = card_store.clone();
         window.on_activate_offer(move |offer_id_text, mode_text| {
             let Some(window) = window_weak.upgrade() else {
                 return;
@@ -1053,6 +1019,7 @@ fn main() -> Result<()> {
                         peer_names.clone(),
                         server.clone(),
                         offer_store.clone(),
+                        card_store.clone(),
                         refresh_gate.clone(),
                         move |refresh_result| {
                             let Some(window) = completion_window.upgrade() else {
@@ -1196,16 +1163,25 @@ fn main() -> Result<()> {
         let server = server.clone();
         let offer_store_for_refresh = offer_store.clone();
         let refresh_gate = refresh_gate.clone();
+        let card_store = card_store.clone();
+        let active_activations = active_activations.clone();
         window.on_refresh_peers(move || {
             let Some(window) = window_weak.upgrade() else {
                 return;
             };
+            refresh_shelf_in_background(
+                window_weak.clone(),
+                offer_store_for_refresh.clone(),
+                peer_names.clone(),
+                active_activations.clone(),
+            );
             let started = discovery_events.dispatch(DiscoveryRefreshTrigger::Explicit, || {
                 refresh_in_background(
                     app_state.clone(),
                     peer_names.clone(),
                     server.clone(),
                     offer_store_for_refresh.clone(),
+                    card_store.clone(),
                     refresh_gate.clone(),
                     {
                         let window_weak = window_weak.clone();
@@ -1340,17 +1316,25 @@ fn main() -> Result<()> {
         active_activations.clone(),
     );
     discovery_events.dispatch(DiscoveryRefreshTrigger::Launch, || {
-        refresh_in_background(app_state, peer_names, server, offer_store, refresh_gate, {
-            let window_weak = window.as_weak();
-            move |result| {
-                if let Some(window) = window_weak.upgrade() {
-                    match result {
-                        Ok(view) => apply_peer_view(&window, view),
-                        Err(error) => apply_refresh_error(&window, error),
+        refresh_in_background(
+            app_state,
+            peer_names,
+            server,
+            offer_store,
+            card_store,
+            refresh_gate,
+            {
+                let window_weak = window.as_weak();
+                move |result| {
+                    if let Some(window) = window_weak.upgrade() {
+                        match result {
+                            Ok(view) => apply_peer_view(&window, view),
+                            Err(error) => apply_refresh_error(&window, error),
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
     });
     slint::run_event_loop()?;
     Ok(())
@@ -1359,7 +1343,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slint::platform::{Key, WindowEvent};
+    use slint::{
+        Model,
+        platform::{Key, WindowEvent},
+    };
 
     #[test]
     fn mixed_family_peer_selects_listener_family_for_bind_and_activation() {
@@ -1766,6 +1753,24 @@ mod tests {
     }
 
     #[test]
+    fn refresh_shortcut_routes_once_and_uses_the_platform_label() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().expect("test window");
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let observed = refreshes.clone();
+        window.on_refresh_peers(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        window.set_refresh_shortcut(refresh_shortcut().into());
+        dispatch_shortcut(&window, Key::Control, "r", false);
+        dispatch_shortcut(&window, Key::Control, "r", true);
+        dispatch_shortcut(&window, Key::Meta, "r", false);
+        dispatch_shortcut(&window, Key::Meta, "r", true);
+        assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(window.get_refresh_shortcut().as_str(), refresh_shortcut());
+    }
+
+    #[test]
     fn third_activation_shows_busy_and_queues_nothing() {
         let gate = ActivationGate::default();
         let first = gate.try_enter().expect("first activation starts");
@@ -1912,7 +1917,7 @@ mod tests {
             InstallationStore::new(directory.path().join("state.json")),
             store.clone(),
         )
-        .with_card_store(store);
+        .with_card_store(store.clone());
         let subscriber = coordinator.shelf_changes().subscribe();
         let handler = meshelf_net::OfferAnnouncementHandler::new(
             coordinator.card_store().expect("card store"),
@@ -1924,6 +1929,7 @@ mod tests {
             1,
             OfferDescriptor::text("announced metadata").expect("descriptor"),
         );
+        let offer_id = announcement.offer_id;
 
         let ack = handler
             .handle_sync(source.device_id, target.device_id, announcement)
@@ -1931,5 +1937,17 @@ mod tests {
 
         assert_eq!(ack.code, meshelf_protocol::OfferAckCode::Stored);
         assert!(subscriber.recv_timeout(Duration::from_millis(50)).is_ok());
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().expect("test window");
+        let peer_names = Mutex::new(HashMap::new());
+        let active: ActiveActivations = Arc::new(Mutex::new(HashMap::new()));
+        let snapshot = load_shelf_snapshot(&store, &peer_names, &active).expect("shelf snapshot");
+        apply_shelf_snapshot(&window, snapshot);
+        let row = window
+            .get_shelf_items()
+            .row_data(0)
+            .expect("announced shelf row");
+        assert_eq!(row.offer_id.as_str(), offer_id.to_string());
     }
 }
