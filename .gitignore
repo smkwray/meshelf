@@ -15,9 +15,19 @@ Cargo.lock.tmp
 do/
 CLAUDE.md
 AGENTS.md
+/.claude/
+/CODEX.md
+/GEMINI.md
+/.github/copilot-instructions.md
+/handoffs/
+/prompts/
 
 # Internal docs not for the repo
 docs/
+
+# Generated source-seed manifests and provenance; keep them local to the
+# development workspace unless a release artifact explicitly requires them.
+/manifests/
 
 # Environment
 .env

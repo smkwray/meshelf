@@ -1,5 +1,7 @@
 # Contributing
 
-This is currently a private, agent-assisted project. All changes must follow `AGENTS.md` and a bounded work order.
+This is currently a private development project. Keep changes narrow and preserve the
+peer-to-peer, explicit-action, and deny-by-default security boundaries described in `README.md`.
 
-Use small commits, preserve exact test receipts, and avoid drive-by dependency or formatting churn. Cross-lane changes require an integrator handoff.
+Use small commits, run the platform-appropriate check command, and avoid drive-by dependency or
+formatting churn. Add a focused regression test for behavior changes.

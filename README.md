@@ -24,16 +24,16 @@ Clipboard reads are explicit only: an active-window control or a foreground comm
 Copy events, idle polling, discovery timers, network heartbeats, global hotkeys, notifications, and
 start-at-login are not part of the contract.
 
-This is a private functional candidate, not a production release. The cutover source/tests are at
-`3002cb7` and the current runtime evidence is BMST/macOS. BZOT/Windows was unreachable, so no
-Windows or cross-platform verification is claimed.
+This is a private functional candidate, not a production release. The current source gates pass on
+BMST/macOS and BZOT/Windows, and the repaired two-device smoke path has been exercised. Full native
+failure-mode proof, recovery/resource hardening, Linux, security/release, and mobile-device proofs
+remain open. Do not use this candidate for sensitive material; see `SECURITY.md`.
 
 ## Start here
 
-1. Read [`AGENTS.md`](AGENTS.md) and [`START_HERE.md`](START_HERE.md).
-2. Read the current product, architecture, protocol, security, and test documents in [`docs/`](docs/).
-3. Read the private [`do/state.md`](do/state.md) in a synced development workspace.
-4. Use one bounded work order from [`prompts/work-orders/`](prompts/work-orders/).
+1. Read [`START_HERE.md`](START_HERE.md), [`SECURITY.md`](SECURITY.md), and [`CONTRIBUTING.md`](CONTRIBUTING.md).
+2. Read the crate source and tests for the area you intend to change.
+3. Run the platform-appropriate bootstrap and check command before submitting a change.
 
 ## Repository map
 
@@ -49,7 +49,6 @@ crates/meshelf-store/     redb v2 offer/card/activation storage
 crates/meshelf-tailscale/ On-demand discovery and peer state
 tools/meshelf-sim/        Local simulation
 config/                   Example state shape and Tailscale policy
-docs/                     Product, architecture, security, protocol, and gate documents
 scripts/                  Bootstrap, validation, packaging, and source-archive helpers
 ```
 
@@ -81,6 +80,6 @@ only listener binding, metadata announcements, receiver-initiated fetch, descrip
 validation, atomic no-replace publication, startup migration/cleanup, explicit clipboard/save
 activation, and local simulation/tests.
 
-The private candidate still needs permitted-host listener proof, Windows platform proof, and final
-security/package release evidence. Do not infer those from a local green source gate or from the
-BMST host.
+The private candidate still needs the complete native failure and recovery proof, broader security
+and release review, Linux evidence, and mobile-device work. Do not infer those from a local green
+source gate or from one successful smoke transfer.
