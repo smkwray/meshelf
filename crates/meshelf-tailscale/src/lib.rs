@@ -8,10 +8,12 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{self, Read, Write},
     net::IpAddr,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use atomic_write_file::AtomicWriteFile;
@@ -20,6 +22,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 const MAX_STATUS_JSON_BYTES: usize = 8 * 1024 * 1024;
+const STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailNode {
@@ -379,10 +382,8 @@ impl PeerDiscovery for CliPeerDiscovery {
     fn refresh(&self) -> Result<TailStatus, DiscoveryError> {
         let mut command = Command::new(&self.binary);
         hide_console(&mut command);
-        let output = command
-            .args(["status", "--json"])
-            .output()
-            .map_err(DiscoveryError::Launch)?;
+        command.args(["status", "--json"]);
+        let output = output_with_timeout(command, STATUS_COMMAND_TIMEOUT)?;
         if !output.status.success() {
             return Err(DiscoveryError::NonZeroExit {
                 code: output.status.code(),
@@ -397,6 +398,64 @@ impl PeerDiscovery for CliPeerDiscovery {
         }
         parse_status_json(&output.stdout)
     }
+}
+
+fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, DiscoveryError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(DiscoveryError::Launch)?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        DiscoveryError::Launch(io::Error::other("Tailscale stdout was not piped"))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        DiscoveryError::Launch(io::Error::other("Tailscale stderr was not piped"))
+    })?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_STATUS_JSON_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.take(4097).read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(DiscoveryError::Timeout {
+                    milliseconds: timeout.as_millis() as u64,
+                });
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(DiscoveryError::Launch(error));
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| DiscoveryError::Launch(io::Error::other("Tailscale stdout reader panicked")))?
+        .map_err(DiscoveryError::Launch)?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| DiscoveryError::Launch(io::Error::other("Tailscale stderr reader panicked")))?
+        .map_err(DiscoveryError::Launch)?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(windows)]
@@ -417,6 +476,8 @@ pub enum DiscoveryError {
     Launch(#[source] std::io::Error),
     #[error("Tailscale status failed with exit code {code:?}: {stderr}")]
     NonZeroExit { code: Option<i32>, stderr: String },
+    #[error("Tailscale status did not finish within {milliseconds} ms")]
+    Timeout { milliseconds: u64 },
     #[error("Tailscale status output is {bytes} bytes; maximum is {maximum}")]
     OutputTooLarge { bytes: usize, maximum: usize },
     #[error("invalid Tailscale status JSON: {0}")]
@@ -680,6 +741,36 @@ mod tests {
     #[test]
     fn native_gui_launch_locations_include_apple_silicon_homebrew() {
         assert!(known_binary_locations().contains(&PathBuf::from("/opt/homebrew/bin/tailscale")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_command_has_a_finite_deadline() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 2"]);
+        let started = Instant::now();
+        let error = output_with_timeout(command, Duration::from_millis(50))
+            .expect_err("a hung status command must time out");
+        assert!(matches!(
+            error,
+            DiscoveryError::Timeout { milliseconds: 50 }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn status_command_has_a_finite_deadline() {
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 2"]);
+        let started = Instant::now();
+        let error = output_with_timeout(command, Duration::from_millis(50))
+            .expect_err("a hung status command must time out");
+        assert!(matches!(
+            error,
+            DiscoveryError::Timeout { milliseconds: 50 }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

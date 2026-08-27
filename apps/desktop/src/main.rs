@@ -87,6 +87,7 @@ impl TrustGate for FileBackedTrustGate {
 }
 
 struct ServerHandle {
+    address: SocketAddr,
     shutdown: watch::Sender<bool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -280,6 +281,17 @@ impl Drop for ServerHandle {
     }
 }
 
+impl ServerHandle {
+    fn needs_restart(&self, address: SocketAddr) -> bool {
+        self.address != address
+            || self
+                .worker
+                .as_ref()
+                .map(JoinHandle::is_finished)
+                .unwrap_or(true)
+    }
+}
+
 fn start_v2_listener(
     state: &Controller,
     offer_store: Arc<RedbV2Store>,
@@ -339,6 +351,7 @@ fn start_v2_listener(
         })
         .map_err(|error| format!("could not start Tailscale v2 listener: {error}"))?;
     Ok(ServerHandle {
+        address: SocketAddr::new(address, MESHELF_PORT),
         shutdown,
         worker: Some(worker),
     })
@@ -607,7 +620,25 @@ fn refresh_in_background(
                 if let Ok(mut names) = peer_names.lock() {
                     *names = capture_peer_names(&state);
                 }
-                let needs_server = server.lock().map(|slot| slot.is_none()).unwrap_or(false);
+                let discovered_address = state
+                    .last_status
+                    .as_ref()
+                    .and_then(|status| select_discovered_ip(&status.self_node.addresses))
+                    .map(|address| SocketAddr::new(address, MESHELF_PORT));
+                let needs_server = server
+                    .lock()
+                    .map(|mut slot| {
+                        let stale = slot
+                            .as_ref()
+                            .zip(discovered_address)
+                            .map(|(handle, address)| handle.needs_restart(address))
+                            .unwrap_or(false);
+                        if stale {
+                            slot.take();
+                        }
+                        slot.is_none()
+                    })
+                    .unwrap_or(true);
                 if needs_server {
                     let listener =
                         start_v2_listener(&state, offer_store.clone(), card_store.clone())?;
@@ -1366,6 +1397,37 @@ mod tests {
         assert!(gate.try_enter().is_none());
         drop(first);
         assert!(gate.try_enter().is_some());
+    }
+
+    #[test]
+    fn listener_handle_detects_exit_and_address_change() {
+        let (shutdown, _shutdown_receiver) = watch::channel(false);
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            release_receiver.recv().expect("release listener");
+        });
+        let address = SocketAddr::new("100.71.19.72".parse().expect("address"), MESHELF_PORT);
+        let other_address =
+            SocketAddr::new("100.90.118.120".parse().expect("address"), MESHELF_PORT);
+        let handle = ServerHandle {
+            address,
+            shutdown,
+            worker: Some(worker),
+        };
+
+        assert!(!handle.needs_restart(address));
+        assert!(handle.needs_restart(other_address));
+        release_sender.send(()).expect("stop listener");
+        while !handle
+            .worker
+            .as_ref()
+            .expect("listener worker")
+            .is_finished()
+        {
+            thread::yield_now();
+        }
+        assert!(handle.needs_restart(address));
+        drop(handle);
     }
 
     #[test]

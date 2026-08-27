@@ -616,4 +616,33 @@ mod tests {
         assert!(clipboard_error.message().contains("file list write failed"));
         assert!(clipboard.files.is_empty());
     }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn full_clipboard_queue_is_definite_before_native_write() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        commands
+            .send(ClipboardCommand::Shutdown)
+            .expect("fill clipboard queue");
+        let (release_sender, release_receiver) = mpsc::channel();
+        let worker_thread = std::thread::spawn(move || {
+            release_receiver.recv().expect("release worker");
+            let _ = receiver.recv();
+        });
+        let worker = ClipboardWorker {
+            inner: Arc::new(ClipboardWorkerInner {
+                commands,
+                worker: Mutex::new(Some(worker_thread)),
+            }),
+        };
+
+        let error = worker
+            .set_text("must not reach the native backend")
+            .expect_err("a full queue must refuse immediately");
+        assert!(!error.is_uncertain());
+        assert!(error.message().contains("already queued"));
+
+        release_sender.send(()).expect("release queued command");
+        drop(worker);
+    }
 }
