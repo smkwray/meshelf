@@ -645,4 +645,31 @@ mod tests {
         release_sender.send(()).expect("release queued command");
         drop(worker);
     }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn unavailable_clipboard_worker_is_a_definite_error() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let (closed_sender, closed_receiver) = mpsc::channel();
+        let worker_thread = std::thread::spawn(move || {
+            drop(receiver);
+            closed_sender.send(()).expect("report closed worker");
+        });
+        closed_receiver
+            .recv()
+            .expect("worker must close its command channel");
+
+        let worker = ClipboardWorker {
+            inner: Arc::new(ClipboardWorkerInner {
+                commands,
+                worker: Mutex::new(Some(worker_thread)),
+            }),
+        };
+
+        let error = worker
+            .set_text("must not reach an unavailable worker")
+            .expect_err("an unavailable worker must refuse immediately");
+        assert!(!error.is_uncertain());
+        assert!(error.message().contains("worker is unavailable"));
+    }
 }
