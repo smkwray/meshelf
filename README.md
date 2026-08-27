@@ -35,6 +35,13 @@ remain open. No trusted signed or notarized release artifacts are provided; any 
 be treated as unsigned/ad-hoc and used only with those limitations understood. Do not use this
 candidate for sensitive material; see `SECURITY.md`.
 
+## Candidate releases
+
+The [candidate releases](https://github.com/smkwray/meshelf/releases) currently provide an Apple-
+silicon macOS ZIP and a Windows x64 ZIP. The macOS bundle is ad-hoc signed; the Windows executable
+is unsigned. Neither artifact is notarized or Authenticode-signed, and both are owner-supervised
+functional candidates rather than trusted distributions. Linux and mobile binaries are not provided.
+
 ## Start here
 
 1. Read [`START_HERE.md`](START_HERE.md), [`SECURITY.md`](SECURITY.md), and [`CONTRIBUTING.md`](CONTRIBUTING.md).
