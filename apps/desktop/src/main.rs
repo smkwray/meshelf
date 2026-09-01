@@ -18,7 +18,8 @@ use std::process::Command;
 
 use anyhow::Result;
 use meshelf_control::{
-    ActivationPlan, Controller, MESHELF_PORT, PeerView, announce_offer_plan,
+    ActivationPlan, AnnouncePeerState, AnnouncePeerUpdate, Controller, MESHELF_PORT,
+    MeshSendReport, PeerView, announce_offer_plan, announce_offer_plan_with_progress,
     coordinator::{Coordinator, OfferPlan},
     local_control::{self, LocalRuntime},
     offer_source::OfferInput,
@@ -201,6 +202,22 @@ struct DesktopLocalRuntime {
     activations: Arc<ActivationService<ActivationClipboard>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerIndicatorState {
+    Reachable,
+    Pending,
+    Stored,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+struct PeerIndicatorEntry {
+    name: String,
+    state: PeerIndicatorState,
+}
+
+type PeerIndicatorStates = Arc<Mutex<HashMap<DeviceId, PeerIndicatorEntry>>>;
+
 impl LocalRuntime for DesktopLocalRuntime {
     fn announce(&self, plan: &OfferPlan) -> Result<String, String> {
         report_announce_outcome(announce_offer_plan(
@@ -220,6 +237,22 @@ impl LocalRuntime for DesktopLocalRuntime {
         clipboard_for_activation(plan.mode, self.clipboard.clone())?;
         let (_cancel, cancel) = watch::channel(false);
         run_activation(input, self.activations.clone(), cancel)
+    }
+}
+
+impl DesktopLocalRuntime {
+    fn announce_with_progress(
+        &self,
+        plan: &OfferPlan,
+        on_update: Arc<dyn Fn(AnnouncePeerUpdate) + Send + Sync>,
+    ) -> Result<MeshSendReport, String> {
+        announce_offer_plan_with_progress(
+            &self.state_path,
+            &self.identity,
+            &self.device_name,
+            plan,
+            on_update,
+        )
     }
 }
 
@@ -357,27 +390,110 @@ fn start_v2_listener(
     })
 }
 
-fn apply_peer_view(window: &MainWindow, view: PeerView) {
-    window.set_default_peer(view.name.into());
-    window.set_default_peer_online(view.online);
-    window.set_status_text(view.status.into());
+fn render_peer_indicators(window: &MainWindow, states: &PeerIndicatorStates) {
+    let Ok(states) = states.lock() else {
+        return;
+    };
+    let mut entries = states.values().cloned().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|entry| entry.name.to_ascii_lowercase());
+    let indicators = entries
+        .into_iter()
+        .map(|entry| PeerIndicator {
+            name: entry.name.into(),
+            state: match entry.state {
+                PeerIndicatorState::Pending => "pending",
+                PeerIndicatorState::Reachable | PeerIndicatorState::Stored => "online",
+                PeerIndicatorState::Unavailable => "offline",
+            }
+            .into(),
+        })
+        .collect::<Vec<_>>();
+    window.set_peer_indicators(ModelRc::new(VecModel::from(indicators)));
+}
+
+fn apply_peer_view(window: &MainWindow, states: &PeerIndicatorStates, view: PeerView) {
+    if let Ok(mut states) = states.lock() {
+        states.retain(|_, entry| entry.state == PeerIndicatorState::Pending);
+        for peer in view.peer_statuses {
+            if states.contains_key(&peer.device_id) {
+                continue;
+            }
+            states.insert(
+                peer.device_id,
+                PeerIndicatorEntry {
+                    name: peer.name,
+                    state: if peer.reachable {
+                        PeerIndicatorState::Reachable
+                    } else {
+                        PeerIndicatorState::Unavailable
+                    },
+                },
+            );
+        }
+    }
+    render_peer_indicators(window, states);
+    window.set_status_text("".into());
     window.set_reachable_names(view.reachable_names.into());
 }
 
-fn apply_refresh_error(window: &MainWindow, error: String) {
+fn apply_refresh_error(window: &MainWindow, states: &PeerIndicatorStates, error: String) {
+    if let Ok(mut states) = states.lock() {
+        states.clear();
+    }
+    render_peer_indicators(window, states);
     window.set_reachable_names("Reachability unavailable".into());
     window.set_status_text(error.into());
 }
 
-fn create_and_announce(
+fn apply_announce_update(
+    window: &MainWindow,
+    states: &PeerIndicatorStates,
+    update: AnnouncePeerUpdate,
+) {
+    let state = match update.state {
+        AnnouncePeerState::Pending => states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&update.device_id).map(|entry| entry.state))
+            .filter(|state| *state == PeerIndicatorState::Unavailable)
+            .unwrap_or(PeerIndicatorState::Pending),
+        AnnouncePeerState::Stored => PeerIndicatorState::Stored,
+        AnnouncePeerState::Unavailable | AnnouncePeerState::VersionMismatch => {
+            PeerIndicatorState::Unavailable
+        }
+    };
+    if let Ok(mut states) = states.lock() {
+        states.insert(
+            update.device_id,
+            PeerIndicatorEntry {
+                name: update.hostname,
+                state,
+            },
+        );
+    }
+    render_peer_indicators(window, states);
+}
+
+fn create_and_announce_with_progress(
     coordinator: &Coordinator,
-    runtime: &dyn LocalRuntime,
+    runtime: &DesktopLocalRuntime,
     input: OfferInput,
-) -> Result<String, String> {
+    on_update: Arc<dyn Fn(AnnouncePeerUpdate) + Send + Sync>,
+) -> Result<MeshSendReport, String> {
     let Some(plan) = coordinator.create_offer(input)? else {
         return Err("no other meshelf device is paired".to_owned());
     };
-    runtime.announce(&plan)
+    runtime.announce_with_progress(&plan, on_update)
+}
+
+fn announce_succeeded(report: MeshSendReport) -> Result<Option<String>, String> {
+    if report.stored_on.is_empty() {
+        Err(report.status())
+    } else if report.version_mismatch.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(report.version_mismatch.join("; ")))
+    }
 }
 
 fn load_shelf_snapshot(
@@ -866,7 +982,6 @@ fn main() -> Result<()> {
         (state.device_name.clone(), capture_peer_names(&state))
     };
     let peer_names = Arc::new(Mutex::new(initial_peer_names));
-    window.set_device_name(device_name.clone().into());
     tray.set_tooltip_text(format!("meshelf — {device_name}").into());
     window.set_status_text("Finding meshelf devices on Tailscale…".into());
 
@@ -933,6 +1048,7 @@ fn main() -> Result<()> {
     let activation_gate = ActivationGate::default();
     let active_activations: ActiveActivations = Arc::new(Mutex::new(HashMap::new()));
     let refresh_gate = OperationGate::default();
+    let peer_indicator_states: PeerIndicatorStates = Arc::new(Mutex::new(HashMap::new()));
     let discovery_events = DiscoveryEventLoop;
 
     let settings = settings_for_surface(&coordinator).map_err(|error| anyhow::anyhow!(error))?;
@@ -944,6 +1060,7 @@ fn main() -> Result<()> {
         let coordinator = coordinator.clone();
         let local_runtime = local_runtime.clone();
         let send_gate = send_gate.clone();
+        let peer_indicator_states = peer_indicator_states.clone();
         window.on_paste_and_send(move || {
             let Some(window) = window_weak.upgrade() else {
                 return;
@@ -956,12 +1073,25 @@ fn main() -> Result<()> {
                 window.set_status_text("A mesh send is already in progress".into());
                 return;
             };
-            window.set_status_text("Sending clipboard item to the mesh…".into());
             let status_window = window_weak.clone();
             let action_clipboard = clipboard.clone();
             let coordinator = coordinator.clone();
             let local_runtime = local_runtime.clone();
+            let peer_indicator_states = peer_indicator_states.clone();
             thread::spawn(move || {
+                let on_update: Arc<dyn Fn(AnnouncePeerUpdate) + Send + Sync> = {
+                    let window_weak = status_window.clone();
+                    let peer_indicator_states = peer_indicator_states.clone();
+                    Arc::new(move |update| {
+                        let window_weak = window_weak.clone();
+                        let peer_indicator_states = peer_indicator_states.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(window) = window_weak.upgrade() {
+                                apply_announce_update(&window, &peer_indicator_states, update);
+                            }
+                        });
+                    })
+                };
                 let result = action_clipboard
                     .read_item()
                     .map_err(|error| format!("Could not read clipboard: {error}"))
@@ -970,31 +1100,42 @@ fn main() -> Result<()> {
                             if text.trim().is_empty() {
                                 return Err("Clipboard contains no text to send".to_owned());
                             }
-                            create_and_announce(
+                            create_and_announce_with_progress(
                                 &coordinator,
                                 local_runtime.as_ref(),
                                 OfferInput::Text(text),
+                                on_update.clone(),
                             )
+                            .and_then(announce_succeeded)
                         }
                         ClipboardItem::Files(paths) => {
                             if paths.is_empty() {
                                 return Err("Clipboard contains no files or folders".to_owned());
                             }
-                            let mut statuses = Vec::new();
+                            let mut warning = None;
                             for path in paths {
-                                statuses.push(create_and_announce(
+                                if let Some(message) = create_and_announce_with_progress(
                                     &coordinator,
                                     local_runtime.as_ref(),
                                     OfferInput::Path(path),
-                                )?);
+                                    on_update.clone(),
+                                )
+                                .and_then(announce_succeeded)?
+                                {
+                                    warning = Some(message);
+                                }
                             }
-                            Ok(statuses.join("; "))
+                            Ok(warning)
                         }
                     });
                 drop(permit);
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(window) = status_window.upgrade() {
-                        window.set_status_text(result.unwrap_or_else(|error| error).into());
+                        let status = match result {
+                            Ok(Some(message)) | Err(message) => message,
+                            Ok(None) => String::new(),
+                        };
+                        window.set_status_text(status.into());
                     }
                 });
             });
@@ -1012,6 +1153,7 @@ fn main() -> Result<()> {
         let activation_gate = activation_gate.clone();
         let data_dir = data_dir.clone();
         let peer_names = peer_names.clone();
+        let peer_indicator_states = peer_indicator_states.clone();
         let server = server.clone();
         let refresh_gate = refresh_gate.clone();
         let card_store = card_store.clone();
@@ -1043,15 +1185,21 @@ fn main() -> Result<()> {
             let data_dir = data_dir.clone();
             let peer_names = peer_names.clone();
             let action_window = window_weak.clone();
-            let started =
-                discovery_events.dispatch(DiscoveryRefreshTrigger::BeforeUserOperation, || {
+            let peer_indicator_states_for_refresh = peer_indicator_states.clone();
+            let server_for_refresh = server.clone();
+            let card_store_for_refresh = card_store.clone();
+            let refresh_gate_for_refresh = refresh_gate.clone();
+            let started = discovery_events.dispatch(
+                DiscoveryRefreshTrigger::BeforeUserOperation,
+                move || {
+                    let peer_indicator_states = peer_indicator_states_for_refresh.clone();
                     refresh_in_background(
                         app_state.clone(),
                         peer_names.clone(),
-                        server.clone(),
+                        server_for_refresh.clone(),
                         offer_store.clone(),
-                        card_store.clone(),
-                        refresh_gate.clone(),
+                        card_store_for_refresh.clone(),
+                        refresh_gate_for_refresh.clone(),
                         move |refresh_result| {
                             let Some(window) = completion_window.upgrade() else {
                                 return;
@@ -1059,11 +1207,11 @@ fn main() -> Result<()> {
                             let view = match refresh_result {
                                 Ok(view) => view,
                                 Err(error) => {
-                                    apply_refresh_error(&window, error);
+                                    apply_refresh_error(&window, &peer_indicator_states, error);
                                     return;
                                 }
                             };
-                            apply_peer_view(&window, view);
+                            apply_peer_view(&window, &peer_indicator_states, view);
                             let plan = match coordinator.plan_activation(offer_id, mode) {
                                 Ok(plan) => plan,
                                 Err(error) => {
@@ -1162,7 +1310,8 @@ fn main() -> Result<()> {
                             });
                         },
                     )
-                });
+                },
+            );
             if !started {
                 window.set_status_text("Mesh refresh is already in progress".into());
             }
@@ -1196,6 +1345,7 @@ fn main() -> Result<()> {
         let refresh_gate = refresh_gate.clone();
         let card_store = card_store.clone();
         let active_activations = active_activations.clone();
+        let peer_indicator_states = peer_indicator_states.clone();
         window.on_refresh_peers(move || {
             let Some(window) = window_weak.upgrade() else {
                 return;
@@ -1206,21 +1356,34 @@ fn main() -> Result<()> {
                 peer_names.clone(),
                 active_activations.clone(),
             );
-            let started = discovery_events.dispatch(DiscoveryRefreshTrigger::Explicit, || {
+            let peer_indicator_states_for_refresh = peer_indicator_states.clone();
+            let app_state_for_refresh = app_state.clone();
+            let peer_names_for_refresh = peer_names.clone();
+            let server_for_refresh = server.clone();
+            let offer_store_for_refresh = offer_store_for_refresh.clone();
+            let card_store_for_refresh = card_store.clone();
+            let refresh_gate_for_refresh = refresh_gate.clone();
+            let window_weak_for_refresh = window_weak.clone();
+            let started = discovery_events.dispatch(DiscoveryRefreshTrigger::Explicit, move || {
+                let peer_indicator_states = peer_indicator_states_for_refresh.clone();
                 refresh_in_background(
-                    app_state.clone(),
-                    peer_names.clone(),
-                    server.clone(),
-                    offer_store_for_refresh.clone(),
-                    card_store.clone(),
-                    refresh_gate.clone(),
+                    app_state_for_refresh,
+                    peer_names_for_refresh,
+                    server_for_refresh,
+                    offer_store_for_refresh,
+                    card_store_for_refresh,
+                    refresh_gate_for_refresh,
                     {
-                        let window_weak = window_weak.clone();
+                        let window_weak = window_weak_for_refresh.clone();
                         move |result| {
                             if let Some(window) = window_weak.upgrade() {
                                 match result {
-                                    Ok(view) => apply_peer_view(&window, view),
-                                    Err(error) => apply_refresh_error(&window, error),
+                                    Ok(view) => {
+                                        apply_peer_view(&window, &peer_indicator_states, view)
+                                    }
+                                    Err(error) => {
+                                        apply_refresh_error(&window, &peer_indicator_states, error)
+                                    }
                                 }
                             }
                         }
@@ -1356,11 +1519,14 @@ fn main() -> Result<()> {
             refresh_gate,
             {
                 let window_weak = window.as_weak();
+                let peer_indicator_states = peer_indicator_states.clone();
                 move |result| {
                     if let Some(window) = window_weak.upgrade() {
                         match result {
-                            Ok(view) => apply_peer_view(&window, view),
-                            Err(error) => apply_refresh_error(&window, error),
+                            Ok(view) => apply_peer_view(&window, &peer_indicator_states, view),
+                            Err(error) => {
+                                apply_refresh_error(&window, &peer_indicator_states, error)
+                            }
                         }
                     }
                 }
@@ -1490,38 +1656,153 @@ mod tests {
     fn generated_ui_status_tooltip_uses_reachable_list() {
         i_slint_backend_testing::init_no_event_loop();
         let window = MainWindow::new().expect("test window");
+        let states = Arc::new(Mutex::new(HashMap::new()));
         apply_peer_view(
             &window,
+            &states,
             PeerView {
                 name: "BZOT".to_owned(),
                 online: true,
                 status: "2 devices reachable · paste text or copied files".to_owned(),
                 reachable_names: "BMBA\nBZOT".to_owned(),
+                peer_statuses: vec![
+                    meshelf_control::PeerStatus {
+                        device_id: DeviceId::new(),
+                        name: "BMBA".to_owned(),
+                        reachable: true,
+                    },
+                    meshelf_control::PeerStatus {
+                        device_id: DeviceId::new(),
+                        name: "BZOT".to_owned(),
+                        reachable: true,
+                    },
+                ],
             },
         );
 
         assert_eq!(window.get_reachable_names().as_str(), "BMBA\nBZOT");
+        let indicators = window.get_peer_indicators();
+        assert_eq!(indicators.row_count(), 2);
+        assert_eq!(
+            indicators.row_data(0).expect("first peer").name.as_str(),
+            "BMBA"
+        );
+        assert_eq!(
+            indicators.row_data(0).expect("first peer").state.as_str(),
+            "online"
+        );
     }
 
     #[test]
     fn failed_refresh_does_not_leave_stale_reachable_names() {
         i_slint_backend_testing::init_no_event_loop();
         let window = MainWindow::new().expect("test window");
+        let states = Arc::new(Mutex::new(HashMap::new()));
         apply_peer_view(
             &window,
+            &states,
             PeerView {
                 name: "BZOT".to_owned(),
                 online: true,
                 status: "1 device reachable · paste text or copied files".to_owned(),
                 reachable_names: "BZOT".to_owned(),
+                peer_statuses: vec![meshelf_control::PeerStatus {
+                    device_id: DeviceId::new(),
+                    name: "BZOT".to_owned(),
+                    reachable: true,
+                }],
             },
         );
 
-        apply_refresh_error(&window, "Refresh failed".to_owned());
+        apply_refresh_error(&window, &states, "Refresh failed".to_owned());
 
         assert_eq!(
             window.get_reachable_names().as_str(),
             "Reachability unavailable"
+        );
+        assert_eq!(window.get_peer_indicators().row_count(), 0);
+    }
+
+    #[test]
+    fn peer_indicators_are_compact_and_follow_announce_outcomes() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().expect("test window");
+        let bzot = DeviceId::new();
+        let bmba = DeviceId::new();
+        let states = Arc::new(Mutex::new(HashMap::from([
+            (
+                bzot,
+                PeerIndicatorEntry {
+                    name: "BZOT".to_owned(),
+                    state: PeerIndicatorState::Reachable,
+                },
+            ),
+            (
+                bmba,
+                PeerIndicatorEntry {
+                    name: "BMBA".to_owned(),
+                    state: PeerIndicatorState::Unavailable,
+                },
+            ),
+        ])));
+
+        render_peer_indicators(&window, &states);
+        assert_eq!(window.get_peer_indicators().row_count(), 2);
+        assert_eq!(
+            window
+                .get_peer_indicators()
+                .row_data(0)
+                .expect("first peer")
+                .name
+                .as_str(),
+            "BMBA"
+        );
+        assert_eq!(
+            window
+                .get_peer_indicators()
+                .row_data(0)
+                .expect("first peer")
+                .state
+                .as_str(),
+            "offline"
+        );
+
+        apply_announce_update(
+            &window,
+            &states,
+            AnnouncePeerUpdate {
+                device_id: bzot,
+                hostname: "BZOT".to_owned(),
+                state: AnnouncePeerState::Pending,
+            },
+        );
+        assert_eq!(
+            window
+                .get_peer_indicators()
+                .row_data(1)
+                .expect("second peer")
+                .state
+                .as_str(),
+            "pending"
+        );
+
+        apply_announce_update(
+            &window,
+            &states,
+            AnnouncePeerUpdate {
+                device_id: bzot,
+                hostname: "BZOT".to_owned(),
+                state: AnnouncePeerState::Stored,
+            },
+        );
+        assert_eq!(
+            window
+                .get_peer_indicators()
+                .row_data(1)
+                .expect("second peer")
+                .state
+                .as_str(),
+            "online"
         );
     }
 

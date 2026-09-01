@@ -20,6 +20,7 @@ use std::{
     time::Duration,
 };
 
+use meshelf_core::DeviceId;
 use meshelf_identity::InstallationIdentity;
 use meshelf_net::{NetError, PeerClient, select_discovered_ip};
 use meshelf_protocol::{
@@ -53,11 +54,19 @@ fn operation_runtime(label: &str) -> Result<tokio::runtime::Runtime, String> {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerStatus {
+    pub device_id: DeviceId,
+    pub name: String,
+    pub reachable: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerView {
     pub name: String,
     pub online: bool,
     pub status: String,
     pub reachable_names: String,
+    pub peer_statuses: Vec<PeerStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +74,21 @@ pub struct MeshSendReport {
     pub stored_on: Vec<String>,
     pub unavailable: Vec<String>,
     pub version_mismatch: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnouncePeerState {
+    Pending,
+    Stored,
+    Unavailable,
+    VersionMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnouncePeerUpdate {
+    pub device_id: DeviceId,
+    pub hostname: String,
+    pub state: AnnouncePeerState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +177,19 @@ pub fn announce_offer_plan(
     device_name: &str,
     plan: &OfferPlan,
 ) -> Result<MeshSendReport, String> {
+    announce_offer_plan_with_progress(state_path, identity, device_name, plan, Arc::new(|_| {}))
+}
+
+/// Fan out one durable v2 offer plan while reporting each peer's announcement state. A failed
+/// direct connection is reported immediately; it is never queued for a later clipboard
+/// application.
+pub fn announce_offer_plan_with_progress(
+    state_path: &Path,
+    identity: &InstallationIdentity,
+    device_name: &str,
+    plan: &OfferPlan,
+    on_update: Arc<dyn Fn(AnnouncePeerUpdate) + Send + Sync>,
+) -> Result<MeshSendReport, String> {
     let state = InstallationStore::new(state_path.to_owned())
         .load_for_identity(identity.device_id)
         .map_err(|error| format!("could not load meshelf state: {error}"))?;
@@ -164,37 +201,53 @@ pub fn announce_offer_plan(
     runtime.block_on(async move {
         let mut tasks = JoinSet::new();
         for item in announcements {
+            on_update(AnnouncePeerUpdate {
+                device_id: item.device_id,
+                hostname: item.hostname.clone(),
+                state: AnnouncePeerState::Pending,
+            });
             let identity = identity.clone();
             let device_name = device_name.clone();
             let peer = peers
                 .iter()
                 .find(|peer| peer.device_id == item.device_id)
                 .cloned();
+            let on_update = on_update.clone();
             tasks.spawn(async move {
                 let hostname = item.hostname;
-                let Some(peer) = peer else {
-                    return AnnouncePeerOutcome::Unavailable(hostname);
+                let outcome = match peer {
+                    None => AnnouncePeerOutcome::Unavailable(hostname.clone()),
+                    Some(peer) => match select_discovered_ip(&peer.addresses) {
+                        None => AnnouncePeerOutcome::Unavailable(hostname.clone()),
+                        Some(address) => classify_announce_result(
+                            hostname.clone(),
+                            PeerClient::default()
+                                .announce_offer_v2(
+                                    SocketAddr::new(address, MESHELF_PORT),
+                                    ClientHello::signed_v2(
+                                        identity.device_id,
+                                        device_name,
+                                        item.announcement.offer_id.to_string(),
+                                        &identity,
+                                    ),
+                                    item.announcement,
+                                    &peer.public_key,
+                                )
+                                .await,
+                        ),
+                    },
                 };
-                let Some(address) = select_discovered_ip(&peer.addresses) else {
-                    return AnnouncePeerOutcome::Unavailable(hostname);
+                let state = match &outcome {
+                    AnnouncePeerOutcome::Stored(_) => AnnouncePeerState::Stored,
+                    AnnouncePeerOutcome::Unavailable(_) => AnnouncePeerState::Unavailable,
+                    AnnouncePeerOutcome::VersionMismatch(_) => AnnouncePeerState::VersionMismatch,
                 };
-                let hello = ClientHello::signed_v2(
-                    identity.device_id,
-                    device_name,
-                    item.announcement.offer_id.to_string(),
-                    &identity,
-                );
-                classify_announce_result(
+                on_update(AnnouncePeerUpdate {
+                    device_id: item.device_id,
                     hostname,
-                    PeerClient::default()
-                        .announce_offer_v2(
-                            SocketAddr::new(address, MESHELF_PORT),
-                            hello,
-                            item.announcement,
-                            &peer.public_key,
-                        )
-                        .await,
-                )
+                    state,
+                });
+                outcome
             });
         }
         let mut report = MeshSendReport {
@@ -390,6 +443,18 @@ impl Controller {
     pub fn view(&self) -> PeerView {
         let names = self.reachable_paired_names();
         let checked = self.last_status.is_some();
+        let mut peer_statuses = self
+            .installation
+            .peers
+            .peers()
+            .iter()
+            .map(|peer| PeerStatus {
+                device_id: peer.device_id,
+                name: peer.hostname.clone(),
+                reachable: self.reachable_peers.contains_key(&peer.device_id),
+            })
+            .collect::<Vec<_>>();
+        peer_statuses.sort_unstable_by_key(|peer| peer.name.to_ascii_lowercase());
         let status = if !checked {
             "Reachability not checked yet · refresh to find meshelf devices".to_owned()
         } else if names.is_empty() && self.installation.peers.peers().is_empty() {
@@ -422,6 +487,7 @@ impl Controller {
             online: !names.is_empty(),
             status,
             reachable_names,
+            peer_statuses,
         }
     }
 
@@ -718,6 +784,69 @@ mod restored_control_tests {
             "1 device reachable · paste text or copied files"
         );
         assert_eq!(view.reachable_names, "BZOT");
+        assert_eq!(
+            view.peer_statuses
+                .iter()
+                .map(|peer| (peer.name.as_str(), peer.reachable))
+                .collect::<Vec<_>>(),
+            [("BMBA", false), ("BZOT", true)]
+        );
+    }
+
+    #[test]
+    fn announce_progress_reports_pending_then_unavailable() {
+        let (_directory, mut controller) = test_controller();
+        let peer_identity = InstallationIdentity::generate();
+        let peer_id = pair_test_peer_with_identity(
+            &mut controller,
+            "BMBA",
+            "node-bmba",
+            None,
+            &peer_identity,
+        );
+        controller
+            .installation
+            .save(&controller.state_path)
+            .expect("save test state");
+        let descriptor =
+            meshelf_core::OfferDescriptor::text("announce progress").expect("text descriptor");
+        let offer_id = meshelf_core::OfferId::new();
+        let plan = OfferPlan {
+            offer_id,
+            descriptor: descriptor.clone(),
+            announcements: vec![PeerAnnouncement {
+                device_id: peer_id,
+                hostname: "BMBA".to_owned(),
+                announcement: meshelf_protocol::OfferAnnouncement::new(
+                    offer_id,
+                    controller.identity.device_id,
+                    peer_id,
+                    1,
+                    descriptor,
+                ),
+            }],
+        };
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = updates.clone();
+        let report = announce_offer_plan_with_progress(
+            &controller.state_path,
+            &controller.identity,
+            "BMST",
+            &plan,
+            Arc::new(move |update| {
+                observed.lock().expect("progress updates").push(update);
+            }),
+        )
+        .expect("announce report");
+
+        assert!(report.stored_on.is_empty());
+        assert_eq!(report.unavailable, ["BMBA"]);
+        let updates = updates.lock().expect("progress updates");
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].device_id, peer_id);
+        assert_eq!(updates[0].state, AnnouncePeerState::Pending);
+        assert_eq!(updates[1].device_id, peer_id);
+        assert_eq!(updates[1].state, AnnouncePeerState::Unavailable);
     }
 
     #[test]

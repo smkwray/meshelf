@@ -25,6 +25,11 @@ export struct ShelfRow {
     save-shortcut: string,
 }
 
+export struct PeerIndicator {
+    name: string,
+    state: string,
+}
+
 component ShelfCard inherits Rectangle {
     in property <ShelfRow> item-data;
     callback activated();
@@ -114,13 +119,11 @@ export component MainWindow inherits Window {
     background: #111418;
     forward-focus: keyboard;
 
-    in property <string> device-name: "This device";
-    in property <string> default-peer: "Not configured";
-    in property <bool> default-peer-online: false;
     in property <string> paste-shortcut: "Ctrl+V";
     in property <string> refresh-shortcut: "Ctrl+R";
     in property <string> shelf-shortcut-help: "click or Ctrl+1–5 to copy";
     in property <[ShelfRow]> shelf-items: [];
+    in property <[PeerIndicator]> peer-indicators: [];
     in-out property <string> status-text: "Open meshelf, then paste once to send";
     in property <string> reachable-names: "Reachability not checked yet";
     in property <string> destination-text: "Downloads";
@@ -210,12 +213,29 @@ export component MainWindow inherits Window {
                 font-weight: 700;
                 vertical-alignment: center;
             }
-            Rectangle { horizontal-stretch: 1; }
-            Text {
-                text: root.default-peer-online ? "● mesh ready" : "○ finding mesh";
-                color: root.default-peer-online ? #76d69a : #9da5af;
-                font-size: 11px;
-                vertical-alignment: center;
+            Rectangle {
+                horizontal-stretch: 1;
+                clip: true;
+                background: transparent;
+                HorizontalBox {
+                    spacing: 7px;
+                    alignment: end;
+                    for peer in root.peer-indicators: Text {
+                        text: (peer.state == "offline" ? "○ " : "● ") + peer.name;
+                        color: peer.state == "pending"
+                            ? #78aaff
+                            : peer.state == "offline" ? #7d8995 : #76d69a;
+                        font-size: 10px;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+                }
+                Tooltip {
+                    Text {
+                        text: root.reachable-names;
+                        color: #eef1f4;
+                    }
+                }
             }
             Button {
                 text: "Paste  " + root.paste-shortcut;
@@ -249,7 +269,7 @@ export component MainWindow inherits Window {
             }
         }
 
-        Rectangle {
+        if root.status-text != "": Rectangle {
             height: 30px;
             border-radius: 5px;
             background: #182025;
@@ -262,12 +282,6 @@ export component MainWindow inherits Window {
                 font-size: 10px;
                 overflow: elide;
                 vertical-alignment: center;
-            }
-            Tooltip {
-                Text {
-                    text: root.reachable-names;
-                    color: #eef1f4;
-                }
             }
         }
 
