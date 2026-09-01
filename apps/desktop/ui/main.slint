@@ -28,6 +28,7 @@ export struct ShelfRow {
 export struct PeerIndicator {
     name: string,
     state: string,
+    display-width: length,
 }
 
 component ShelfCard inherits Rectangle {
@@ -124,14 +125,18 @@ export component MainWindow inherits Window {
     in property <string> shelf-shortcut-help: "click or Ctrl+1–5 to copy";
     in property <[ShelfRow]> shelf-items: [];
     in property <[PeerIndicator]> peer-indicators: [];
+    in-out property <length> peer-indicator-width: 0px;
+    in property <string> peer-overflow: "";
+    in property <length> peer-overflow-width: 0px;
+    in property <string> peer-overflow-names: "";
     in-out property <string> status-text: "Open meshelf, then paste once to send";
-    in property <string> reachable-names: "Reachability not checked yet";
     in property <string> destination-text: "Downloads";
 
     callback paste-and-send();
     callback activate-offer(string, string);
     callback cancel-activation(string);
     callback refresh-peers();
+    callback peer-indicator-width-changed(length);
     callback choose-folder();
     callback reset-destination();
 
@@ -221,6 +226,7 @@ export component MainWindow inherits Window {
                     spacing: 7px;
                     alignment: end;
                     for peer in root.peer-indicators: Text {
+                        width: peer.display-width;
                         text: (peer.state == "offline" ? "○ " : "● ") + peer.name;
                         color: peer.state == "pending"
                             ? #78aaff
@@ -229,12 +235,24 @@ export component MainWindow inherits Window {
                         overflow: elide;
                         vertical-alignment: center;
                     }
+                    if root.peer-overflow != "": Text {
+                        width: root.peer-overflow-width;
+                        text: root.peer-overflow;
+                        color: #7d8995;
+                        font-size: 10px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
-                Tooltip {
+                if root.peer-overflow != "": Tooltip {
                     Text {
-                        text: root.reachable-names;
+                        text: root.peer-overflow-names;
                         color: #eef1f4;
                     }
+                }
+                changed width => {
+                    root.peer-indicator-width = self.width;
+                    root.peer-indicator-width-changed(self.width);
                 }
             }
             Button {

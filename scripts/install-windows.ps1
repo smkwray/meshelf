@@ -59,7 +59,12 @@ if (-not ($pathEntries | Where-Object { [string]::Equals($_.TrimEnd('\'), $Insta
 }
 
 if ($Launch) {
-    Start-Process -FilePath $desktopExe
+    $sessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    if ($sessionId -eq 0) {
+        Write-Warning "Skipping GUI launch from non-interactive Windows Session 0; launch meshelf from its shortcut."
+    } else {
+        Start-Process -FilePath $desktopExe -WorkingDirectory $InstallDirectory
+    }
 }
 
 Write-Output "Installed meshelf for the current user at $InstallDirectory"

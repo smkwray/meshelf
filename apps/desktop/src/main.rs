@@ -390,25 +390,98 @@ fn start_v2_listener(
     })
 }
 
+fn peer_indicator_priority(state: PeerIndicatorState) -> u8 {
+    match state {
+        PeerIndicatorState::Reachable
+        | PeerIndicatorState::Pending
+        | PeerIndicatorState::Stored => 0,
+        PeerIndicatorState::Unavailable => 1,
+    }
+}
+
+fn peer_indicator_display_width(name: &str) -> f32 {
+    // Keep a little slack around the 10px UI font so the measured layout does not clip
+    // device names at the same width at which it decides they fit.
+    18.0 + name.chars().count() as f32 * 6.5
+}
+
 fn render_peer_indicators(window: &MainWindow, states: &PeerIndicatorStates) {
     let Ok(states) = states.lock() else {
         return;
     };
     let mut entries = states.values().cloned().collect::<Vec<_>>();
-    entries.sort_unstable_by_key(|entry| entry.name.to_ascii_lowercase());
+    entries.sort_unstable_by(|left, right| {
+        peer_indicator_priority(left.state)
+            .cmp(&peer_indicator_priority(right.state))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
+    let available_width = window.get_peer_indicator_width();
+    let total_width = entries
+        .iter()
+        .map(|entry| peer_indicator_display_width(&entry.name))
+        .sum::<f32>()
+        + 7.0 * entries.len().saturating_sub(1) as f32;
+    let visible_count =
+        if entries.is_empty() || available_width <= 0.0 || total_width <= available_width {
+            entries.len()
+        } else {
+            let mut used = 0.0;
+            let mut count = 0;
+            for candidate in 0..entries.len() {
+                if candidate > 0 {
+                    used += peer_indicator_display_width(&entries[candidate - 1].name);
+                    if candidate > 1 {
+                        used += 7.0;
+                    }
+                }
+                let hidden_count = entries.len() - candidate;
+                let overflow_width = 18.0 + (hidden_count.to_string().len() as f32 * 6.5);
+                let overflow_separator = if candidate == 0 { 0.0 } else { 7.0 };
+                if used + overflow_separator + overflow_width <= available_width {
+                    count = candidate;
+                }
+            }
+            count
+        };
+    let hidden = &entries[visible_count..];
+    let overflow_width = if hidden.is_empty() {
+        0.0
+    } else {
+        18.0 + (hidden.len().to_string().len() as f32 * 6.5)
+    };
     let indicators = entries
-        .into_iter()
+        .iter()
+        .take(visible_count)
         .map(|entry| PeerIndicator {
-            name: entry.name.into(),
+            name: entry.name.clone().into(),
             state: match entry.state {
                 PeerIndicatorState::Pending => "pending",
                 PeerIndicatorState::Reachable | PeerIndicatorState::Stored => "online",
                 PeerIndicatorState::Unavailable => "offline",
             }
             .into(),
+            display_width: peer_indicator_display_width(&entry.name),
         })
         .collect::<Vec<_>>();
     window.set_peer_indicators(ModelRc::new(VecModel::from(indicators)));
+    window.set_peer_overflow(if hidden.is_empty() {
+        "".into()
+    } else {
+        format!("+{}", hidden.len()).into()
+    });
+    window.set_peer_overflow_width(overflow_width);
+    window.set_peer_overflow_names(
+        hidden
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into(),
+    );
 }
 
 fn apply_peer_view(window: &MainWindow, states: &PeerIndicatorStates, view: PeerView) {
@@ -433,7 +506,6 @@ fn apply_peer_view(window: &MainWindow, states: &PeerIndicatorStates, view: Peer
     }
     render_peer_indicators(window, states);
     window.set_status_text("".into());
-    window.set_reachable_names(view.reachable_names.into());
 }
 
 fn apply_refresh_error(window: &MainWindow, states: &PeerIndicatorStates, error: String) {
@@ -441,7 +513,6 @@ fn apply_refresh_error(window: &MainWindow, states: &PeerIndicatorStates, error:
         states.clear();
     }
     render_peer_indicators(window, states);
-    window.set_reachable_names("Reachability unavailable".into());
     window.set_status_text(error.into());
 }
 
@@ -1051,6 +1122,16 @@ fn main() -> Result<()> {
     let peer_indicator_states: PeerIndicatorStates = Arc::new(Mutex::new(HashMap::new()));
     let discovery_events = DiscoveryEventLoop;
 
+    {
+        let window_weak = window.as_weak();
+        let peer_indicator_states = peer_indicator_states.clone();
+        window.on_peer_indicator_width_changed(move |_| {
+            if let Some(window) = window_weak.upgrade() {
+                render_peer_indicators(&window, &peer_indicator_states);
+            }
+        });
+    }
+
     let settings = settings_for_surface(&coordinator).map_err(|error| anyhow::anyhow!(error))?;
     window.set_destination_text(destination_label(&settings.save_destination).into());
 
@@ -1653,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_ui_status_tooltip_uses_reachable_list() {
+    fn generated_ui_peer_indicators_have_no_overflow_hint_when_they_fit() {
         i_slint_backend_testing::init_no_event_loop();
         let window = MainWindow::new().expect("test window");
         let states = Arc::new(Mutex::new(HashMap::new()));
@@ -1680,9 +1761,9 @@ mod tests {
             },
         );
 
-        assert_eq!(window.get_reachable_names().as_str(), "BMBA\nBZOT");
         let indicators = window.get_peer_indicators();
         assert_eq!(indicators.row_count(), 2);
+        assert_eq!(window.get_peer_overflow().as_str(), "");
         assert_eq!(
             indicators.row_data(0).expect("first peer").name.as_str(),
             "BMBA"
@@ -1694,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_refresh_does_not_leave_stale_reachable_names() {
+    fn failed_refresh_does_not_leave_stale_peer_overflow() {
         i_slint_backend_testing::init_no_event_loop();
         let window = MainWindow::new().expect("test window");
         let states = Arc::new(Mutex::new(HashMap::new()));
@@ -1716,10 +1797,7 @@ mod tests {
 
         apply_refresh_error(&window, &states, "Refresh failed".to_owned());
 
-        assert_eq!(
-            window.get_reachable_names().as_str(),
-            "Reachability unavailable"
-        );
+        assert_eq!(window.get_peer_overflow().as_str(), "");
         assert_eq!(window.get_peer_indicators().row_count(), 0);
     }
 
@@ -1755,7 +1833,7 @@ mod tests {
                 .expect("first peer")
                 .name
                 .as_str(),
-            "BMBA"
+            "BZOT"
         );
         assert_eq!(
             window
@@ -1764,7 +1842,7 @@ mod tests {
                 .expect("first peer")
                 .state
                 .as_str(),
-            "offline"
+            "online"
         );
 
         apply_announce_update(
@@ -1779,8 +1857,8 @@ mod tests {
         assert_eq!(
             window
                 .get_peer_indicators()
-                .row_data(1)
-                .expect("second peer")
+                .row_data(0)
+                .expect("online peer")
                 .state
                 .as_str(),
             "pending"
@@ -1798,12 +1876,48 @@ mod tests {
         assert_eq!(
             window
                 .get_peer_indicators()
-                .row_data(1)
-                .expect("second peer")
+                .row_data(0)
+                .expect("online peer")
                 .state
                 .as_str(),
             "online"
         );
+    }
+
+    #[test]
+    fn peer_indicator_overflow_hides_offline_peers_and_reports_them() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().expect("test window");
+        let bzot = DeviceId::new();
+        let bmba = DeviceId::new();
+        let states = Arc::new(Mutex::new(HashMap::from([
+            (
+                bzot,
+                PeerIndicatorEntry {
+                    name: "BZOT".to_owned(),
+                    state: PeerIndicatorState::Reachable,
+                },
+            ),
+            (
+                bmba,
+                PeerIndicatorEntry {
+                    name: "BMBA".to_owned(),
+                    state: PeerIndicatorState::Unavailable,
+                },
+            ),
+        ])));
+
+        window.set_peer_indicator_width(76.0);
+        render_peer_indicators(&window, &states);
+
+        let indicators = window.get_peer_indicators();
+        assert_eq!(indicators.row_count(), 1);
+        assert_eq!(
+            indicators.row_data(0).expect("online peer").name.as_str(),
+            "BZOT"
+        );
+        assert_eq!(window.get_peer_overflow().as_str(), "+1");
+        assert_eq!(window.get_peer_overflow_names().as_str(), "BMBA");
     }
 
     fn test_card(descriptor: OfferDescriptor, availability: CardAvailability) -> OfferCardRecord {
