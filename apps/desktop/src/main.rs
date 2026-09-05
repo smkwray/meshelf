@@ -775,6 +775,136 @@ fn capture_peer_names(state: &Controller) -> HashMap<DeviceId, String> {
         .collect()
 }
 
+#[derive(Debug, Default)]
+struct DoubleClickDetector {
+    last_click: Option<std::time::Instant>,
+}
+
+impl DoubleClickDetector {
+    fn register_click(&mut self, now: std::time::Instant, threshold: Duration) -> bool {
+        let is_double = if let Some(prev) = self.last_click {
+            now.duration_since(prev) <= threshold
+        } else {
+            false
+        };
+        if is_double {
+            self.last_click = None;
+            true
+        } else {
+            self.last_click = Some(now);
+            false
+        }
+    }
+}
+
+fn double_click_interval() -> Duration {
+    #[cfg(target_os = "windows")]
+    {
+        let ms = unsafe { GetDoubleClickTime() };
+        if ms > 0 {
+            return Duration::from_millis(ms as u64);
+        }
+    }
+    Duration::from_millis(500)
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
+    fn SetForegroundWindow(hwnd: isize) -> i32;
+    fn BringWindowToTop(hwnd: isize) -> i32;
+    fn SetFocus(hwnd: isize) -> isize;
+    fn GetForegroundWindow() -> isize;
+    fn GetWindowThreadProcessId(hwnd: isize, process_id: *mut u32) -> u32;
+    fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: i32) -> i32;
+    fn IsIconic(hwnd: isize) -> i32;
+    fn EnumWindows(
+        lp_enum_func: Option<unsafe extern "system" fn(isize, isize) -> i32>,
+        l_param: isize,
+    ) -> i32;
+    fn GetWindowTextW(hwnd: isize, lp_string: *mut u16, n_max_count: i32) -> i32;
+    fn GetDoubleClickTime() -> u32;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThreadId() -> u32;
+}
+
+#[cfg(target_os = "windows")]
+fn find_main_hwnd_fallback() -> Option<isize> {
+    unsafe extern "system" fn enum_proc(hwnd: isize, lparam: isize) -> i32 {
+        let state = unsafe { &mut *(lparam as *mut (u32, Option<isize>)) };
+        let mut proc_id = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut proc_id);
+        }
+        if proc_id == state.0 {
+            let mut title_buf = [0u16; 64];
+            let len =
+                unsafe { GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32) };
+            if len > 0 {
+                let title = String::from_utf16_lossy(&title_buf[..len as usize]);
+                if title == "meshelf" {
+                    state.1 = Some(hwnd);
+                    return 0;
+                }
+            }
+        }
+        1
+    }
+
+    let pid = std::process::id();
+    let mut state = (pid, None::<isize>);
+    unsafe {
+        EnumWindows(Some(enum_proc), &mut state as *mut _ as isize);
+    }
+    state.1
+}
+
+#[cfg(target_os = "windows")]
+fn get_window_hwnd(window: &MainWindow) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    if let Ok(handle) = window.window().window_handle().window_handle()
+        && let RawWindowHandle::Win32(win32_handle) = handle.as_raw()
+    {
+        return Some(win32_handle.hwnd.get());
+    }
+    find_main_hwnd_fallback()
+}
+
+#[cfg(target_os = "windows")]
+fn focus_window_windows(hwnd: isize) {
+    const SW_RESTORE: i32 = 9;
+    const SW_SHOW: i32 = 5;
+
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+        }
+
+        let fg_hwnd = GetForegroundWindow();
+        let fg_thread = GetWindowThreadProcessId(fg_hwnd, std::ptr::null_mut());
+        let current_thread = GetCurrentThreadId();
+
+        if fg_thread != 0 && fg_thread != current_thread {
+            AttachThreadInput(current_thread, fg_thread, 1);
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+            AttachThreadInput(current_thread, fg_thread, 0);
+        } else {
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+        }
+    }
+}
+
 fn raise_window(window: &MainWindow) {
     window.window().set_minimized(false);
     let _ = window.show();
@@ -783,6 +913,12 @@ fn raise_window(window: &MainWindow) {
         let _ = Command::new("/usr/bin/open")
             .args(["-a", "meshelf"])
             .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(hwnd) = get_window_hwnd(window) {
+            focus_window_windows(hwnd);
+        }
     }
 }
 
@@ -1533,6 +1669,23 @@ fn main() -> Result<()> {
                     }
                 });
             });
+        });
+    }
+
+    let tray_click_detector = Arc::new(Mutex::new(DoubleClickDetector::default()));
+    {
+        let window_weak = window.as_weak();
+        let detector = tray_click_detector.clone();
+        tray.on_tray_clicked(move || {
+            let now = std::time::Instant::now();
+            let threshold = double_click_interval();
+            let is_double = detector
+                .lock()
+                .map(|mut d| d.register_click(now, threshold))
+                .unwrap_or(false);
+            if is_double && let Some(window) = window_weak.upgrade() {
+                raise_window(&window);
+            }
         });
     }
 
@@ -2406,5 +2559,32 @@ mod tests {
             .row_data(0)
             .expect("announced shelf row");
         assert_eq!(row.offer_id.as_str(), offer_id.to_string());
+    }
+
+    #[test]
+    fn double_click_detector_requires_two_clicks_within_threshold() {
+        let mut detector = DoubleClickDetector::default();
+        let threshold = Duration::from_millis(500);
+        let start = std::time::Instant::now();
+
+        // First click
+        assert!(!detector.register_click(start, threshold));
+
+        // Click outside threshold
+        let late = start + Duration::from_millis(600);
+        assert!(!detector.register_click(late, threshold));
+
+        // Click within threshold of the previous click
+        let quick = late + Duration::from_millis(200);
+        assert!(detector.register_click(quick, threshold));
+
+        // Immediate subsequent click does not re-trigger without a new pair
+        let third = quick + Duration::from_millis(100);
+        assert!(!detector.register_click(third, threshold));
+    }
+
+    #[test]
+    fn double_click_interval_is_non_zero() {
+        assert!(double_click_interval() > Duration::ZERO);
     }
 }

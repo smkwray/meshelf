@@ -373,6 +373,9 @@ export component MeshelfTray inherits SystemTrayIcon {
     callback open-window();
     callback send-default();
     callback quit();
+    callback tray-clicked();
+
+    clicked => { root.tray-clicked(); }
 
     Menu {
         MenuItem {

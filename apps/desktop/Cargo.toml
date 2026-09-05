@@ -20,7 +20,8 @@ meshelf-protocol = { path = "../../crates/meshelf-protocol" }
 meshelf-store = { path = "../../crates/meshelf-store" }
 meshelf-tailscale = { path = "../../crates/meshelf-tailscale" }
 serde_json.workspace = true
-slint.workspace = true
+slint = { workspace = true, features = ["raw-window-handle-06"] }
+raw-window-handle = "0.6"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
