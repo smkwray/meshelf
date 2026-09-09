@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let script = manifest_dir.join("../../tmp/openalex_probe.py");
     let output = Command::new("python3")
         .arg(&script)
