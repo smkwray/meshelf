@@ -1,4 +1,4 @@
-name: temporary-openalex-discovery2
+name: temporary-openalex-final
 
 on:
   push:
@@ -7,16 +7,36 @@ permissions:
   contents: read
 
 jobs:
-  openalex-discovery2:
+  openalex-final:
     if: github.ref == 'refs/heads/tmp/openalex-bibliometric-refresh-20260909'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch additional OpenAlex registry evidence
-        run: python3 tmp/openalex_discovery2.py
-      - name: Upload audited discovery
+      - name: Reassemble reproduction script
+        run: |
+          cat tmp/reproduce_minsky_openalex.py.gz.part.00 \
+              tmp/reproduce_minsky_openalex.py.gz.part.01 \
+              tmp/reproduce_minsky_openalex.py.gz.part.02 \
+              > tmp/reproduce_minsky_openalex.py.gz
+          gzip -dc tmp/reproduce_minsky_openalex.py.gz > tmp/reproduce_minsky_openalex.py
+          sha256sum tmp/reproduce_minsky_openalex.py
+          test "$(sha256sum tmp/reproduce_minsky_openalex.py | cut -d' ' -f1)" = "f3baadd3e36895dd3108710101f1aceda9128148e2bcd34d6166b0e6ff909e25"
+          python3 -m py_compile tmp/reproduce_minsky_openalex.py
+      - name: Install chart dependency
+        run: python3 -m pip install --disable-pip-version-check matplotlib==3.10.8
+      - name: Build audited OpenAlex package
+        run: python3 tmp/reproduce_minsky_openalex.py --out tmp/openalex-final --cutoff 2026-09-09 --overwrite
+      - name: Show release status
+        if: always()
+        run: |
+          find tmp/openalex-final -maxdepth 2 -type f -printf '%P\n' | sort | head -200 || true
+          cat tmp/openalex-final/STATUS.md || true
+          cat tmp/openalex-final/release-summary.json || true
+      - name: Upload completed package
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openalex-discovery2
-          path: tmp/openalex_discovery2.json
+          name: openalex-final
+          path: tmp/openalex-final
           if-no-files-found: error
