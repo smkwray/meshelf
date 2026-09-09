@@ -1,4 +1,4 @@
-name: temporary-openalex-probe
+name: temporary-openalex-discovery2
 
 on:
   push:
@@ -7,16 +7,16 @@ permissions:
   contents: read
 
 jobs:
-  openalex-probe:
+  openalex-discovery2:
     if: github.ref == 'refs/heads/tmp/openalex-bibliometric-refresh-20260909'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch OpenAlex registry candidates
-        run: python3 tmp/openalex_probe_artifact.py
-      - name: Upload audited probe
+      - name: Fetch additional OpenAlex registry evidence
+        run: python3 tmp/openalex_discovery2.py
+      - name: Upload audited discovery
         uses: actions/upload-artifact@v4
         with:
-          name: openalex-probe
-          path: tmp/openalex_probe_artifact.json
+          name: openalex-discovery2
+          path: tmp/openalex_discovery2.json
           if-no-files-found: error
