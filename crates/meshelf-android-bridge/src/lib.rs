@@ -1064,13 +1064,7 @@ mod tests {
     }
 
     fn start_args() -> StartArgs {
-        StartArgs::parse(
-            env!("CARGO_MANIFEST_DIR"),
-            "100.64.1.50",
-            HANDLE,
-            "Pixel",
-        )
-        .expect("valid")
+        StartArgs::parse(env!("CARGO_MANIFEST_DIR"), "100.64.1.50", HANDLE, "Pixel").expect("valid")
     }
 
     /// Installs a bridge through the production `launch`, with a plain thread in place of the JVM
