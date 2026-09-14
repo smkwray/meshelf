@@ -17,8 +17,8 @@ jobs:
           toolchain: 1.92.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # meshelf-net links meshelf-platform, whose keyring and clipboard dependencies need D-Bus headers.
-      - run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libxtst-dev
+      # meshelf-net links meshelf-platform, which needs D-Bus, X11, and Wayland headers on Ubuntu.
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libxtst-dev libwayland-dev libxkbcommon-dev
       - run: cargo fmt --all -- --check
       - run: cargo test -p meshelf-core -p meshelf-protocol -p meshelf-store -p meshelf-tailscale -p meshelf-net
       - run: cargo clippy -p meshelf-core -p meshelf-protocol -p meshelf-store -p meshelf-tailscale -p meshelf-net --all-targets -- -D warnings
