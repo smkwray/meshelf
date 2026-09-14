@@ -1,0 +1,80 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+*.log
+*.redb
+*.redb.repair
+/local/
+/dist/
+release/
+Cargo.lock.tmp
+
+# Agent orchestration (contract, state, delegates) — private, never tracked
+do/
+CLAUDE.md
+AGENTS.md
+/.claude/
+/CODEX.md
+/GEMINI.md
+/.github/copilot-instructions.md
+/handoffs/
+/prompts/
+
+# Internal docs not for the repo
+docs/
+
+# Generated source-seed manifests and provenance; keep them local to the
+# development workspace unless a release artifact explicitly requires them.
+/manifests/
+
+# Environment
+.env
+/.venv/
+/~syncthing~*
+**/~syncthing~*
+**/.syncthing*
+**/*.sync-conflict-*
+assets/~syncthing~*
+apps/desktop/assets/~syncthing~*
+/status/
+
+# Plans
+*.plan.md
+plan.md
+plans/
+
+# Data and generated outputs (project-local working state)
+/data/
+/var/
+/outputs/
+/tmp/
+/assets/_icon_work/
+
+# Android build products and generated native libraries
+/apps/android/.gradle/
+/apps/android/build/
+/apps/android/app/build/
+/apps/android/gradle/
+/apps/android/gradlew
+/apps/android/gradlew.bat
+/apps/android/app/src/main/jniLibs/
+
+# Python artifacts (defense in depth)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+
+# .githooks/ is INTENTIONALLY NOT IGNORED — it ships the pre-commit and pre-push hooks
+
+# Agent worktrees (ephemeral, device-local)
+/.worktrees/
+
+# Maintainer-local list of identifiers that must never be published
+/.meshelf-private-denylist

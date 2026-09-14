@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?android:attr/colorBackground"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/pairing_title"
+        android:textAppearance="?android:attr/textAppearanceLarge"
+        android:textColor="?android:attr/textColorPrimary"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/pairing_peer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:textColor="?android:attr/textColorPrimary"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/pairing_code"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:gravity="center"
+        android:textAppearance="?android:attr/textAppearanceLarge"
+        android:textColor="?android:attr/textColorPrimary"
+        android:textIsSelectable="true"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/pairing_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="@string/pairing_unavailable"
+        android:textColor="?android:attr/textColorSecondary" />
+
+    <Button
+        android:id="@+id/pairing_confirm"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:enabled="false"
+        android:text="@string/pairing_confirm" />
+
+    <Button
+        android:id="@+id/pairing_decline"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/pairing_decline" />
+</LinearLayout>

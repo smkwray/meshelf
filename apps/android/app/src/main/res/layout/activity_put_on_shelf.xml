@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/put_root"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:background="?android:attr/colorBackground" android:orientation="vertical">
+
+    <include layout="@layout/view_screen_bar" />
+
+    <ScrollView android:layout_width="match_parent" android:layout_height="0dp"
+        android:layout_weight="1" android:fillViewport="true">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" android:padding="16dp">
+            <EditText android:id="@+id/put_text" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:gravity="top|start"
+                android:hint="@string/put_hint" android:importantForAutofill="no"
+                android:inputType="textMultiLine|textCapSentences" android:minHeight="120dp" />
+
+            <LinearLayout android:id="@+id/put_text_row" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="12dp"
+                android:orientation="horizontal">
+                <Button android:id="@+id/put_add_text" android:layout_width="0dp"
+                    android:layout_height="wrap_content" android:layout_marginEnd="6dp"
+                    android:layout_weight="1" android:minHeight="48dp" android:text="@string/put_add_text" />
+                <Button android:id="@+id/put_paste_add" android:layout_width="0dp"
+                    android:layout_height="wrap_content" android:layout_marginStart="6dp"
+                    android:layout_weight="1" android:minHeight="48dp" android:text="@string/put_paste_add" />
+            </LinearLayout>
+
+            <LinearLayout android:id="@+id/put_photo_row" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="12dp"
+                android:orientation="horizontal">
+                <Button android:id="@+id/put_take_photo" android:layout_width="0dp"
+                    android:layout_height="wrap_content" android:layout_marginEnd="6dp"
+                    android:layout_weight="1" android:minHeight="48dp" android:text="@string/put_take_photo" />
+                <Button android:id="@+id/put_choose_photo" android:layout_width="0dp"
+                    android:layout_height="wrap_content" android:layout_marginStart="6dp"
+                    android:layout_weight="1" android:minHeight="48dp" android:text="@string/put_choose_photo" />
+            </LinearLayout>
+
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="12dp" android:text="@string/put_gallery_note"
+                android:textAppearance="@style/TextAppearance.Meshelf.Secondary" />
+
+            <TextView android:id="@+id/result_strip" style="@style/Widget.Meshelf.Strip"
+                android:layout_marginHorizontal="0dp" android:layout_marginTop="16dp"
+                android:visibility="gone" />
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

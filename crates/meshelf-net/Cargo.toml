@@ -1,0 +1,28 @@
+[package]
+name = "meshelf-net"
+description = "Direct one-message peer transport and deny-by-default trust boundary for meshelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+fs2.workspace = true
+meshelf-identity = { path = "../meshelf-identity" }
+meshelf-core = { path = "../meshelf-core" }
+meshelf-platform = { path = "../meshelf-platform" }
+meshelf-protocol = { path = "../meshelf-protocol" }
+meshelf-store = { path = "../meshelf-store" }
+meshelf-tailscale = { path = "../meshelf-tailscale" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Paused time, so inactivity and expiry bounds are tested without real waiting.
+tokio = { workspace = true, features = ["test-util"] }

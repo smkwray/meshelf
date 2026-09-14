@@ -1,0 +1,617 @@
+//! Typed requests handled by the one resident meshelf process.
+
+use std::{io, path::PathBuf};
+
+use meshelf_core::{
+    ActivationId, ActivationMode, CaptureNotStarted, CaptureRequestId, DeviceId,
+    MAX_CONTROL_REQUEST_BYTES, MAX_TEXT_BYTES, OfferCardRecord, OfferDescriptor, OfferId,
+    UserSettings,
+};
+use serde::{Deserialize, Serialize};
+
+use meshelf_net::ActivationOutcome;
+
+use crate::{
+    capture::{CaptureControl, CaptureReply, CaptureStartInput},
+    coordinator::{ActivationPlan, Coordinator, OfferPlan, PeerAnnouncement},
+    offer_source::OfferInput,
+};
+
+pub const MAX_SERIALIZED_TEXT_REQUEST_BYTES: usize = MAX_CONTROL_REQUEST_BYTES;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "body", rename_all = "snake_case")]
+pub enum LocalRequest {
+    AnnounceText {
+        text: String,
+    },
+    AnnouncePath {
+        path: PathBuf,
+    },
+    RecordExplicitRefusal {
+        offer_id: OfferId,
+        recipient: DeviceId,
+    },
+    GetSettings,
+    SetSettings {
+        settings: UserSettings,
+    },
+    Shelf,
+    ActivateOffer {
+        offer_id: OfferId,
+        mode: ActivationMode,
+    },
+    CancelActivation {
+        activation_id: ActivationId,
+    },
+    /// Start one capture. The resident preflights, writes the durable request, and returns before
+    /// anything network-bound runs; the outcome arrives on the wait channel or from `CaptureQuery`.
+    CaptureStart {
+        input: CaptureStartInput,
+    },
+    /// The durable row, and its outcome once it has one. Marks a finished outcome reported.
+    CaptureQuery {
+        request_id: CaptureRequestId,
+    },
+    /// A wait slot for a request that is already running, for `meshelfctl capture wait ID`.
+    CaptureWaitTicket {
+        request_id: CaptureRequestId,
+    },
+    CaptureCancel {
+        request_id: CaptureRequestId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "body", rename_all = "snake_case")]
+pub enum LocalResponse {
+    OfferCreated {
+        offer_id: OfferId,
+        descriptor: OfferDescriptor,
+        announcements: Vec<PeerAnnouncement>,
+        status: String,
+    },
+    NoPeers,
+    RefusalRecorded,
+    Settings {
+        settings: UserSettings,
+    },
+    Shelf {
+        offers: Vec<OfferCardRecord>,
+    },
+    ActivationCompleted {
+        activation_id: ActivationId,
+        offer_id: OfferId,
+        mode: ActivationMode,
+        files_processed: u32,
+        bytes_processed: u64,
+    },
+    ActivationCancelled {
+        activation_id: ActivationId,
+    },
+    ActivationRefused {
+        message: String,
+    },
+    Capture {
+        reply: CaptureReply,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// Runtime-owned side effects for the resident control channel. The coordinator remains the
+/// durable authority; these hooks are the only place a binary attaches network fan-out and a real
+/// fetch worker.
+pub trait LocalRuntime: Send + Sync + 'static {
+    fn announce(&self, plan: &OfferPlan) -> Result<String, String>;
+    fn activate(&self, plan: &ActivationPlan) -> Result<ActivationOutcome, String>;
+
+    /// The resident's capture engine, when this binary has one. A resident without one answers
+    /// every capture request `resident_unavailable` rather than pretending a capture started.
+    fn capture(&self) -> Option<&dyn CaptureControl> {
+        None
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct NoopRuntime;
+
+impl LocalRuntime for NoopRuntime {
+    fn announce(&self, _plan: &OfferPlan) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    fn activate(&self, _plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
+        Ok(ActivationOutcome::Completed)
+    }
+}
+
+pub fn encode_request(request: &LocalRequest) -> io::Result<Vec<u8>> {
+    if let LocalRequest::AnnounceText { text } = request
+        && text.len() > MAX_TEXT_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "text exceeds the 1 MiB meshelf limit",
+        ));
+    }
+    let encoded = serde_json::to_vec(request)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if encoded.len() > MAX_SERIALIZED_TEXT_REQUEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "serialized control request is {} bytes; maximum is {MAX_SERIALIZED_TEXT_REQUEST_BYTES}",
+                encoded.len()
+            ),
+        ));
+    }
+    Ok(encoded)
+}
+
+pub fn decode_request(bytes: &[u8]) -> io::Result<LocalRequest> {
+    if bytes.len() > MAX_SERIALIZED_TEXT_REQUEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "serialized control request is {} bytes; maximum is {MAX_SERIALIZED_TEXT_REQUEST_BYTES}",
+                bytes.len()
+            ),
+        ));
+    }
+    serde_json::from_slice(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub fn dispatch(coordinator: &Coordinator, request: LocalRequest) -> LocalResponse {
+    dispatch_with_runtime(coordinator, request, &NoopRuntime)
+}
+
+pub fn dispatch_with_runtime(
+    coordinator: &Coordinator,
+    request: LocalRequest,
+    runtime: &dyn LocalRuntime,
+) -> LocalResponse {
+    match request {
+        LocalRequest::AnnounceText { text } => {
+            if text.len() > MAX_TEXT_BYTES {
+                return LocalResponse::Error {
+                    message: "text exceeds the 1 MiB meshelf limit".to_owned(),
+                };
+            }
+            match coordinator.create_offer(OfferInput::Text(text)) {
+                Ok(Some(plan)) => match runtime.announce(&plan) {
+                    Ok(status) => LocalResponse::OfferCreated {
+                        offer_id: plan.offer_id,
+                        descriptor: plan.descriptor,
+                        announcements: plan.announcements,
+                        status,
+                    },
+                    Err(message) => LocalResponse::Error { message },
+                },
+                Ok(None) => LocalResponse::NoPeers,
+                Err(message) => LocalResponse::Error { message },
+            }
+        }
+        LocalRequest::AnnouncePath { path } => {
+            match coordinator.create_offer(OfferInput::Path(path)) {
+                Ok(Some(plan)) => match runtime.announce(&plan) {
+                    Ok(status) => LocalResponse::OfferCreated {
+                        offer_id: plan.offer_id,
+                        descriptor: plan.descriptor,
+                        announcements: plan.announcements,
+                        status,
+                    },
+                    Err(message) => LocalResponse::Error { message },
+                },
+                Ok(None) => LocalResponse::NoPeers,
+                Err(message) => LocalResponse::Error { message },
+            }
+        }
+        LocalRequest::RecordExplicitRefusal {
+            offer_id,
+            recipient,
+        } => match coordinator.record_explicit_refusal(offer_id, recipient) {
+            Ok(()) => LocalResponse::RefusalRecorded,
+            Err(message) => LocalResponse::Error { message },
+        },
+        LocalRequest::GetSettings => match coordinator.settings() {
+            Ok(settings) => LocalResponse::Settings { settings },
+            Err(message) => LocalResponse::Error { message },
+        },
+        LocalRequest::SetSettings { settings } => match coordinator.update_settings(settings) {
+            Ok(settings) => LocalResponse::Settings { settings },
+            Err(message) => LocalResponse::Error { message },
+        },
+        LocalRequest::Shelf => match coordinator.read_shelf() {
+            Ok(offers) => LocalResponse::Shelf { offers },
+            Err(message) => LocalResponse::Error { message },
+        },
+        LocalRequest::ActivateOffer { offer_id, mode } => {
+            match coordinator.plan_activation(offer_id, mode) {
+                Ok(plan) => match runtime.activate(&plan) {
+                    Ok(ActivationOutcome::Completed) => {
+                        let (files_processed, bytes_processed) =
+                            descriptor_counts(&plan.descriptor);
+                        LocalResponse::ActivationCompleted {
+                            activation_id: plan.activation_id,
+                            offer_id: plan.offer_id,
+                            mode: plan.mode,
+                            files_processed,
+                            bytes_processed,
+                        }
+                    }
+                    Ok(ActivationOutcome::Cancelled) => LocalResponse::ActivationCancelled {
+                        activation_id: plan.activation_id,
+                    },
+                    Ok(outcome) => LocalResponse::ActivationRefused {
+                        message: outcome.desktop_status(),
+                    },
+                    Err(message) => LocalResponse::ActivationRefused { message },
+                },
+                Err(message) => LocalResponse::ActivationRefused { message },
+            }
+        }
+        LocalRequest::CancelActivation { activation_id } => {
+            // The desktop owns active connection handles. This response is a routed
+            // acknowledgement; the UI cancellation path aborts the in-process fetch task.
+            LocalResponse::ActivationCancelled { activation_id }
+        }
+        LocalRequest::CaptureStart { input } => {
+            capture_reply(runtime, |capture| capture.start(input))
+        }
+        LocalRequest::CaptureQuery { request_id } => {
+            capture_reply(runtime, |capture| capture.status(request_id))
+        }
+        LocalRequest::CaptureWaitTicket { request_id } => {
+            capture_reply(runtime, |capture| capture.wait_ticket(request_id))
+        }
+        LocalRequest::CaptureCancel { request_id } => {
+            capture_reply(runtime, |capture| capture.cancel(request_id))
+        }
+    }
+}
+
+/// Routes one capture operation, or reports that this resident has no capture transport.
+fn capture_reply(
+    runtime: &dyn LocalRuntime,
+    operation: impl FnOnce(&dyn CaptureControl) -> CaptureReply,
+) -> LocalResponse {
+    let reply = match runtime.capture() {
+        Some(capture) => operation(capture),
+        None => CaptureReply::NotStarted {
+            reason: CaptureNotStarted::ResidentUnavailable,
+        },
+    };
+    LocalResponse::Capture { reply }
+}
+
+fn descriptor_counts(descriptor: &OfferDescriptor) -> (u32, u64) {
+    match descriptor {
+        OfferDescriptor::Text { utf8_bytes, .. } => (0, u64::from(*utf8_bytes)),
+        OfferDescriptor::File { total_bytes, .. } => (1, *total_bytes),
+        OfferDescriptor::Folder {
+            file_count,
+            total_bytes,
+            ..
+        } => (*file_count, *total_bytes),
+    }
+}
+
+pub fn dispatch_bytes(coordinator: &Coordinator, bytes: &[u8]) -> io::Result<Vec<u8>> {
+    dispatch_bytes_with_runtime(coordinator, bytes, &NoopRuntime)
+}
+
+pub fn dispatch_bytes_with_runtime(
+    coordinator: &Coordinator,
+    bytes: &[u8],
+    runtime: &dyn LocalRuntime,
+) -> io::Result<Vec<u8>> {
+    let response = dispatch_with_runtime(coordinator, decode_request(bytes)?, runtime);
+    serde_json::to_vec(&response).map_err(io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use meshelf_core::{CardAvailability, OfferCardInput, OfferDescriptor};
+    use meshelf_identity::InstallationIdentity;
+    use meshelf_store::RedbV2Store;
+    use meshelf_tailscale::{InstallationStore, TailNode};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        announces: AtomicUsize,
+        activations: AtomicUsize,
+    }
+
+    impl LocalRuntime for RecordingRuntime {
+        fn announce(&self, _plan: &OfferPlan) -> Result<String, String> {
+            self.announces.fetch_add(1, Ordering::SeqCst);
+            Ok(String::new())
+        }
+
+        fn activate(&self, _plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
+            self.activations.fetch_add(1, Ordering::SeqCst);
+            Ok(ActivationOutcome::Completed)
+        }
+    }
+
+    struct ClipboardFailingRuntime;
+
+    impl LocalRuntime for ClipboardFailingRuntime {
+        fn announce(&self, _plan: &OfferPlan) -> Result<String, String> {
+            unreachable!("clipboard failure runtime does not announce")
+        }
+
+        fn activate(&self, _plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
+            Ok(ActivationOutcome::Failed(
+                meshelf_net::ActivationFailCode::ClipboardFailed,
+            ))
+        }
+    }
+
+    #[test]
+    fn one_mib_worst_case_text_serializes_within_control_bound() {
+        let request = LocalRequest::AnnounceText {
+            text: "\0".repeat(MAX_TEXT_BYTES),
+        };
+        let encoded = encode_request(&request).expect("bounded worst-case request");
+        assert!(encoded.len() > 64 * 1024);
+        assert!(encoded.len() <= MAX_SERIALIZED_TEXT_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn local_request_dispatches_to_resident_coordinator() {
+        let directory = tempdir().expect("temporary directory");
+        let identity = InstallationIdentity::generate();
+        let peer = InstallationIdentity::generate();
+        let state_store = InstallationStore::new(directory.path().join("state.json"));
+        state_store
+            .update(identity.device_id, |state| {
+                state.peers.accept_signed(
+                    &TailNode {
+                        node_id: Some("peer-node".to_owned()),
+                        hostname: "peer".to_owned(),
+                        dns_name: None,
+                        addresses: vec!["100.64.0.2".parse().expect("address")],
+                        online: true,
+                        active: true,
+                    },
+                    peer.device_id,
+                    peer.public_key().to_vec(),
+                )
+            })
+            .expect("pair peer");
+        let coordinator = Coordinator::new(
+            identity.device_id,
+            state_store,
+            Arc::new(RedbV2Store::open(directory.path().join("offers.redb")).expect("open offers")),
+        );
+        let response = dispatch(
+            &coordinator,
+            LocalRequest::AnnounceText {
+                text: "resident text".to_owned(),
+            },
+        );
+        assert!(matches!(
+            response,
+            LocalResponse::OfferCreated { announcements, .. } if announcements.len() == 1
+        ));
+    }
+
+    fn coordinator_with_peer(
+        directory: &tempfile::TempDir,
+    ) -> (
+        Coordinator,
+        Arc<RedbV2Store>,
+        InstallationIdentity,
+        DeviceId,
+    ) {
+        let identity = InstallationIdentity::generate();
+        let peer = InstallationIdentity::generate();
+        let state_store = InstallationStore::new(directory.path().join("state.json"));
+        state_store
+            .update(identity.device_id, |state| {
+                state.peers.accept_signed(
+                    &TailNode {
+                        node_id: Some("peer-node".to_owned()),
+                        hostname: "peer".to_owned(),
+                        dns_name: None,
+                        addresses: vec!["100.64.0.2".parse().expect("address")],
+                        online: true,
+                        active: true,
+                    },
+                    peer.device_id,
+                    peer.public_key().to_vec(),
+                )
+            })
+            .expect("pair peer");
+        let store =
+            Arc::new(RedbV2Store::open(directory.path().join("offers.redb")).expect("open offers"));
+        let coordinator = Coordinator::new(identity.device_id, state_store, store.clone())
+            .with_card_store(store.clone());
+        (coordinator, store, identity, peer.device_id)
+    }
+
+    #[test]
+    fn production_paste_calls_announce_not_push() {
+        let directory = tempdir().expect("temporary directory");
+        let (coordinator, _store, _identity, _peer) = coordinator_with_peer(&directory);
+        let runtime = RecordingRuntime::default();
+        let response = dispatch_with_runtime(
+            &coordinator,
+            LocalRequest::AnnounceText {
+                text: "paste".to_owned(),
+            },
+            &runtime,
+        );
+        assert!(matches!(response, LocalResponse::OfferCreated { .. }));
+        assert_eq!(runtime.announces.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.activations.load(Ordering::SeqCst), 0);
+    }
+
+    struct PartialAnnounceRuntime;
+
+    impl LocalRuntime for PartialAnnounceRuntime {
+        fn announce(&self, _plan: &OfferPlan) -> Result<String, String> {
+            Ok(
+                "Added to 1 device; FERN is running Meshelf protocol 1; update it to protocol 2."
+                    .to_owned(),
+            )
+        }
+
+        fn activate(&self, _plan: &ActivationPlan) -> Result<ActivationOutcome, String> {
+            unreachable!("partial announce runtime does not activate")
+        }
+    }
+
+    #[test]
+    fn offer_created_carries_the_announce_outcome_status() {
+        let directory = tempdir().expect("temporary directory");
+        let (coordinator, _store, _identity, _peer) = coordinator_with_peer(&directory);
+        let response = dispatch_with_runtime(
+            &coordinator,
+            LocalRequest::AnnounceText {
+                text: "partial".to_owned(),
+            },
+            &PartialAnnounceRuntime,
+        );
+        let LocalResponse::OfferCreated { status, .. } = response else {
+            panic!("expected offer created, got {response:?}");
+        };
+        assert!(status.contains("1 device"));
+        assert!(status.contains("FERN"));
+        assert!(status.contains("protocol 1"));
+        assert!(status.to_ascii_lowercase().contains("update"));
+    }
+
+    #[test]
+    fn production_card_activation_calls_fetch() {
+        let directory = tempdir().expect("temporary directory");
+        let (coordinator, store, _identity, source_device) = coordinator_with_peer(&directory);
+        store
+            .insert_offer_card(OfferCardInput::new(
+                source_device,
+                OfferId::new(),
+                OfferDescriptor::text("card").expect("descriptor"),
+                CardAvailability::Available,
+            ))
+            .expect("card");
+        let offer_id = store.read_offer_shelf().expect("shelf")[0].offer_id;
+        let runtime = RecordingRuntime::default();
+        let response = dispatch_with_runtime(
+            &coordinator,
+            LocalRequest::ActivateOffer {
+                offer_id,
+                mode: ActivationMode::Clipboard,
+            },
+            &runtime,
+        );
+        assert!(matches!(
+            response,
+            LocalResponse::ActivationCompleted {
+                files_processed: 0,
+                bytes_processed: 4,
+                ..
+            }
+        ));
+        assert_eq!(runtime.activations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn clipboard_failure_cannot_be_reported_as_activation_completed() {
+        let directory = tempdir().expect("temporary directory");
+        let (coordinator, store, _identity, source_device) = coordinator_with_peer(&directory);
+        store
+            .insert_offer_card(OfferCardInput::new(
+                source_device,
+                OfferId::new(),
+                OfferDescriptor::text("x".repeat(440)).expect("descriptor"),
+                CardAvailability::Available,
+            ))
+            .expect("card");
+        let offer_id = store.read_offer_shelf().expect("shelf")[0].offer_id;
+
+        let response = dispatch_with_runtime(
+            &coordinator,
+            LocalRequest::ActivateOffer {
+                offer_id,
+                mode: ActivationMode::Clipboard,
+            },
+            &ClipboardFailingRuntime,
+        );
+
+        assert!(matches!(
+            response,
+            LocalResponse::ActivationRefused { message }
+                if message.contains("clipboard failed") && !message.contains("completed")
+        ));
+    }
+
+    #[test]
+    fn a_resident_with_no_capture_transport_says_so_instead_of_pretending() {
+        let directory = tempdir().expect("temporary directory");
+        let (coordinator, _store, _identity, _peer) = coordinator_with_peer(&directory);
+        let requests = [
+            LocalRequest::CaptureStart {
+                input: CaptureStartInput {
+                    peer: "amber".to_owned(),
+                    purpose: "Photograph the router label".to_owned(),
+                    lens: None,
+                    timeout_ms: 60_000,
+                    output_path: directory.path().join("photo.jpg"),
+                    wait: true,
+                },
+            },
+            LocalRequest::CaptureQuery {
+                request_id: CaptureRequestId::new(),
+            },
+            LocalRequest::CaptureWaitTicket {
+                request_id: CaptureRequestId::new(),
+            },
+            LocalRequest::CaptureCancel {
+                request_id: CaptureRequestId::new(),
+            },
+        ];
+        for request in requests {
+            // Round-trip the request as the control channel does, so the wire shape is exercised.
+            let encoded = encode_request(&request).expect("encode");
+            let decoded = decode_request(&encoded).expect("decode");
+            assert_eq!(decoded, request);
+            assert_eq!(
+                dispatch(&coordinator, decoded),
+                LocalResponse::Capture {
+                    reply: CaptureReply::NotStarted {
+                        reason: meshelf_core::CaptureNotStarted::ResidentUnavailable
+                    }
+                },
+                "a resident without a capture engine must refuse rather than answer for one"
+            );
+        }
+    }
+
+    #[test]
+    fn no_v1_push_symbol_is_reachable_from_production_composition() {
+        let directory = tempdir().expect("temporary directory");
+        let (coordinator, _store, _identity, _peer) = coordinator_with_peer(&directory);
+        let runtime = RecordingRuntime::default();
+        let response = dispatch_with_runtime(
+            &coordinator,
+            LocalRequest::AnnounceText {
+                text: "production".to_owned(),
+            },
+            &runtime,
+        );
+        assert!(matches!(response, LocalResponse::OfferCreated { .. }));
+        assert_eq!(runtime.announces.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.activations.load(Ordering::SeqCst), 0);
+    }
+}

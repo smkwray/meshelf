@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "apps/desktop",
+    "apps/meshelfctl",
+    "crates/meshelf-core",
+    "crates/meshelf-control",
+    "crates/meshelf-android-bridge",
+    "crates/meshelf-identity",
+    "crates/meshelf-net",
+    "crates/meshelf-platform",
+    "crates/meshelf-protocol",
+    "crates/meshelf-store",
+    "crates/meshelf-tailscale",
+    "tools/meshelf-sim",
+]
+resolver = "3"
+
+# Build-size policy. `target/` reached 18 GB before this: 7.3 GB of dependency
+# rlibs carrying full DWARF, 4.5 GB of incremental state. Line tables keep
+# backtraces useful while dropping the variable/type debug info nothing here
+# reads, and the gate scripts are full builds where incremental buys nothing.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92.0"
+license-file = "LICENSE.md"
+authors = ["meshelf contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+arboard = "3.6.1"
+async-trait = "0.1.89"
+atomic-write-file = "0.3.0"
+dirs = "6.0.0"
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+fs2 = "0.4.3"
+keyring = "3.6.3"
+jni = "=0.22.4"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+redb = "4.2.0"
+renamore = "0.3.2"
+rfd = "=0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+slint = "=1.17.1"
+slint-build = "=1.17.1"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+winresource = "0.1.20"
+windows-dpapi = "0.2.0"

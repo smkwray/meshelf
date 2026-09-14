@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Compact card: the whole card is the primary action. No fixed height; it grows with font scale. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/card_root"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:layout_marginTop="8dp" android:background="@drawable/bg_card"
+    android:clickable="true" android:focusable="true"
+    android:foreground="?android:attr/selectableItemBackground"
+    android:minHeight="72dp" android:orientation="horizontal"
+    android:paddingStart="12dp" android:paddingTop="10dp" android:paddingBottom="10dp">
+
+    <ImageView android:id="@+id/card_kind_icon" android:layout_width="24dp" android:layout_height="24dp"
+        android:layout_marginTop="2dp" android:layout_marginEnd="12dp"
+        android:importantForAccessibility="no" android:tint="?android:attr/textColorSecondary" />
+
+    <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
+        android:layout_weight="1" android:orientation="vertical">
+        <TextView android:id="@+id/card_title" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:ellipsize="end" android:maxLines="2"
+            android:importantForAccessibility="no"
+            android:textAppearance="@style/TextAppearance.Meshelf.CardTitle" />
+        <TextView android:id="@+id/card_body" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="2dp"
+            android:ellipsize="end" android:maxLines="2" android:importantForAccessibility="no"
+            android:textAppearance="@style/TextAppearance.Meshelf.Body" />
+        <TextView android:id="@+id/card_meta" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="2dp"
+            android:importantForAccessibility="no"
+            android:textAppearance="@style/TextAppearance.Meshelf.Secondary" />
+        <LinearLayout android:id="@+id/card_status_row" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="4dp"
+            android:gravity="center_vertical" android:orientation="horizontal" android:visibility="gone">
+            <ProgressBar android:id="@+id/card_status_progress" style="?android:attr/progressBarStyleSmall"
+                android:layout_width="16dp" android:layout_height="16dp" android:layout_marginEnd="6dp"
+                android:importantForAccessibility="no" android:visibility="gone" />
+            <ImageView android:id="@+id/card_status_icon" android:layout_width="16dp"
+                android:layout_height="16dp" android:layout_marginEnd="6dp"
+                android:importantForAccessibility="no" android:visibility="gone" />
+            <TextView android:id="@+id/card_status_text" android:layout_width="0dp"
+                android:layout_height="wrap_content" android:layout_weight="1"
+                android:accessibilityLiveRegion="polite"
+                android:textAppearance="@style/TextAppearance.Meshelf.Secondary" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <ImageButton android:id="@+id/card_save" style="@style/Widget.Meshelf.IconButton"
+        android:src="@drawable/ic_save" android:visibility="gone" />
+    <ImageButton android:id="@+id/card_more" style="@style/Widget.Meshelf.IconButton"
+        android:src="@drawable/ic_more" />
+</LinearLayout>

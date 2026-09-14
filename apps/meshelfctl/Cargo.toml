@@ -1,0 +1,23 @@
+[package]
+name = "meshelfctl"
+description = "Headless meshelf enrollment helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+meshelf-control = { path = "../../crates/meshelf-control" }
+meshelf-core = { path = "../../crates/meshelf-core" }
+meshelf-identity = { path = "../../crates/meshelf-identity" }
+meshelf-net = { path = "../../crates/meshelf-net" }
+meshelf-platform = { path = "../../crates/meshelf-platform" }
+meshelf-protocol = { path = "../../crates/meshelf-protocol" }
+meshelf-store = { path = "../../crates/meshelf-store" }
+meshelf-tailscale = { path = "../../crates/meshelf-tailscale" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

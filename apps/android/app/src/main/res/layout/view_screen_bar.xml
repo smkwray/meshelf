@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:gravity="center_vertical" android:minHeight="56dp" android:orientation="horizontal"
+    android:paddingStart="4dp" android:paddingEnd="16dp">
+    <ImageButton android:id="@+id/screen_back" style="@style/Widget.Meshelf.IconButton"
+        android:contentDescription="@string/action_back" android:src="@drawable/ic_back" />
+    <TextView android:id="@+id/screen_title" android:layout_width="0dp"
+        android:layout_height="wrap_content" android:layout_marginStart="8dp" android:layout_weight="1"
+        android:accessibilityHeading="true" android:textAppearance="@style/TextAppearance.Meshelf.AppTitle" />
+</LinearLayout>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Meshelf" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:colorBackground">@color/meshelf_background</item>
+        <item name="android:windowBackground">@color/meshelf_background</item>
+        <item name="android:colorPrimary">@color/meshelf_accent</item>
+        <item name="android:colorPrimaryDark">@color/meshelf_accent</item>
+        <item name="android:colorAccent">@color/meshelf_accent</item>
+        <item name="android:textColorPrimary">@color/meshelf_text_primary</item>
+        <item name="android:textColorSecondary">@color/meshelf_text_secondary</item>
+        <item name="android:textColorHint">@color/meshelf_text_secondary</item>
+        <item name="android:editTextColor">@color/meshelf_text_primary</item>
+        <item name="android:buttonStyle">@style/Widget.Meshelf.Button</item>
+    </style>
+
+    <style name="Widget.Meshelf.Button" parent="android:Widget.Material.Button">
+        <item name="android:backgroundTint">@color/meshelf_accent</item>
+        <item name="android:textColor">@color/meshelf_accent_text</item>
+    </style>
+</resources>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="meshelf_background">#FFF7F4EF</color>
+    <color name="meshelf_surface">#FFFFFFFF</color>
+    <color name="meshelf_text_primary">#FF1A1A1A</color>
+    <color name="meshelf_text_secondary">#FF5C5C5C</color>
+    <color name="meshelf_accent">#FF2F5D50</color>
+    <color name="meshelf_accent_text">#FFFFFFFF</color>
+    <color name="meshelf_control_track">#FFB7C4BF</color>
+    <color name="meshelf_card_stroke">#FFE0DBD2</color>
+    <color name="meshelf_strip_background">#FFEDE8DF</color>
+    <color name="meshelf_state_success">#FF2E7D4F</color>
+    <color name="meshelf_state_info">#FF2F6DB5</color>
+    <color name="meshelf_state_warning">#FF8F5B00</color>
+    <color name="meshelf_state_error">#FFB3261E</color>
+    <color name="meshelf_peer_unavailable">#FF7C827C</color>
+</resources>

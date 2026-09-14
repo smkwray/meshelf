@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Widget.Meshelf.IconButton" parent="android:Widget.Material.ImageButton">
+        <item name="android:layout_width">48dp</item>
+        <item name="android:layout_height">48dp</item>
+        <item name="android:minWidth">48dp</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>
+        <item name="android:scaleType">center</item>
+        <item name="android:tint">?android:attr/textColorPrimary</item>
+    </style>
+
+    <style name="Widget.Meshelf.TextButton" parent="android:Widget.Material.Button.Borderless.Colored">
+        <item name="android:textColor">@color/meshelf_accent</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:minWidth">64dp</item>
+    </style>
+
+    <style name="Widget.Meshelf.Strip" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginHorizontal">12dp</item>
+        <item name="android:layout_marginTop">4dp</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:paddingHorizontal">12dp</item>
+        <item name="android:paddingVertical">8dp</item>
+        <item name="android:background">@drawable/bg_result_strip</item>
+        <item name="android:textAppearance">@style/TextAppearance.Meshelf.Body</item>
+        <item name="android:accessibilityLiveRegion">polite</item>
+    </style>
+
+    <style name="TextAppearance.Meshelf.AppTitle" parent="android:TextAppearance.Material.Title">
+        <item name="android:textColor">?android:attr/textColorPrimary</item>
+    </style>
+
+    <style name="TextAppearance.Meshelf.Section" parent="android:TextAppearance.Material.Subhead">
+        <item name="android:textColor">@color/meshelf_accent</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="TextAppearance.Meshelf.CardTitle" parent="android:TextAppearance.Material.Body2">
+        <item name="android:textColor">?android:attr/textColorSecondary</item>
+        <item name="android:textSize">13sp</item>
+    </style>
+
+    <style name="TextAppearance.Meshelf.Body" parent="android:TextAppearance.Material.Body1">
+        <item name="android:textColor">?android:attr/textColorPrimary</item>
+    </style>
+
+    <style name="TextAppearance.Meshelf.Secondary" parent="android:TextAppearance.Material.Body1">
+        <item name="android:textColor">?android:attr/textColorSecondary</item>
+        <item name="android:textSize">14sp</item>
+    </style>
+</resources>

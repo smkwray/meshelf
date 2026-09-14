@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">meshelf</string>
+    <string name="capture_title">meshelf capture requests</string>
+    <string name="capture_boundary">Availability is off by default. Turning it on starts a visible connected-device service. The camera opens only after you tap a request notification. Computers on your Tailscale network that run meshelf can send requests while you are available.</string>
+    <string name="device_name_label">This phone</string>
+    <string name="availability_toggle">Available for capture requests</string>
+    <string name="availability_explainer">While enabled, a persistent notification remains visible. There is no polling, heartbeat, alarm, worker, second VPN, clipboard access, or automatic camera opening.</string>
+    <string name="requester_label">Requested by</string>
+    <string name="purpose_label">Purpose</string>
+    <string name="switch_lens">Switch lens</string>
+    <string name="flash_off">Flash: off</string>
+    <string name="flash_auto">Flash: auto</string>
+    <string name="flash_on">Flash: on</string>
+    <string name="take_photo">Take photo</string>
+    <string name="pairing_title">Pair a computer</string>
+    <string name="pairing_unavailable">Turn on availability before pairing.</string>
+    <string name="pairing_confirm">Codes match</string>
+    <string name="pairing_decline">Reject</string>
+</resources>

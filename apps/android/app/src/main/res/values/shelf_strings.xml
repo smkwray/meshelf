@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Shelf surface -->
+    <string name="shelf_title">meshelf</string>
+    <string name="action_refresh">Refresh</string>
+    <string name="action_put_on_shelf">Put on shelf</string>
+    <string name="action_settings">Settings</string>
+    <string name="action_back">Back</string>
+    <string name="action_copy">Copy</string>
+    <string name="action_share">Share</string>
+    <string name="action_save">Save</string>
+    <string name="action_details">Details</string>
+    <string name="action_explain">Explain</string>
+    <string name="action_more">More actions</string>
+    <string name="details_close">Close</string>
+    <string name="peer_more">+%1$d</string>
+    <string name="peer_more_description">%1$d more devices</string>
+    <string name="peer_reached">%1$s, reached</string>
+    <string name="peer_pending">%1$s, pending</string>
+    <string name="peer_unavailable">%1$s, unavailable</string>
+    <string name="empty_title">Shelf empty</string>
+    <string name="empty_body_items">Items sent to this phone appear here.</string>
+    <string name="empty_body_clipboard">Nothing changes your clipboard until you tap a card.</string>
+    <string name="empty_action">Put something on the shelf</string>
+
+    <!-- Cards -->
+    <string name="kind_text">Text</string>
+    <string name="kind_file">File</string>
+    <string name="kind_photo">Photo</string>
+    <string name="kind_folder">Folder</string>
+    <string name="source_this_phone">On this phone</string>
+    <string name="card_title">%1$s · %2$s</string>
+    <string name="card_untitled">Untitled</string>
+    <string name="card_a11y_from">%1$s from %2$s</string>
+    <string name="card_a11y_own">%1$s on this phone</string>
+    <string name="card_save_description">Save %1$s</string>
+    <string name="card_more_description">More actions for %1$s</string>
+    <string name="explain_source_unavailable">The device that offered this item can’t be reached right now. Nothing was pulled.</string>
+    <string name="explain_source_changed">The original changed after it was offered, so it won’t be pulled.</string>
+    <string name="explain_unsupported">This phone saves single files, not folders. On the computer, zip the folder and put the zip on the shelf. Save it here, then open it with a file app such as My Files.</string>
+    <string name="details_card">Offer ID: %1$s\nSource device ID: %2$s\nOwnership: %3$s\nKind: %4$s\nAvailability: %5$s\nActions: %6$s\nSize: %7$d bytes\nShelf sequence: %8$d\nLast attempt: %9$s\nLatest result: %10$s</string>
+
+    <!-- Card and strip feedback -->
+    <string name="status_getting_ready">Meshelf is getting ready…</string>
+    <string name="progress_copying">Copying…</string>
+    <string name="progress_opening_share">Opening share sheet…</string>
+    <string name="progress_saving">Saving…</string>
+    <string name="result_copied">Copied</string>
+    <string name="result_share_opened">Share sheet opened</string>
+    <string name="result_saved_to">Saved to %1$s</string>
+    <string name="result_saved">Saved</string>
+    <string name="downloads">Downloads</string>
+    <string name="state_source_unavailable">Source unavailable</string>
+    <string name="state_source_changed">Source changed</string>
+    <string name="state_folder_unsupported">Folders can’t be saved here · zip it first</string>
+    <string name="state_unsupported">This item isn’t supported on this phone</string>
+    <string name="result_busy">Busy — try again</string>
+    <string name="result_canceled">Canceled</string>
+    <string name="result_copy_failed">Couldn’t copy</string>
+    <string name="result_verify_failed">Couldn’t verify the file</string>
+    <string name="result_save_failed">Couldn’t save the file</string>
+    <string name="result_share_failed">Couldn’t open the share sheet</string>
+    <string name="result_foreground_lost">Action stopped before it could apply</string>
+    <string name="result_uncertain">Result unknown — not retried</string>
+    <string name="result_action_unsupported">This action isn’t available on this phone</string>
+    <string name="result_internal">Meshelf couldn’t finish this action</string>
+    <string name="result_choose_save_folder">Choose a save folder in Settings</string>
+    <string name="result_unreadable">Result couldn’t be read — check the shelf</string>
+    <string name="wait_current_action">Wait for the current action to finish</string>
+    <string name="tap_again">Tap again to continue</string>
+    <string name="notice_shelf_unreadable">Shelf data couldn’t be read</string>
+    <string name="notice_invalid_one">1 invalid item</string>
+    <string name="notice_invalid_many">%1$d invalid items</string>
+    <string name="notice_update_app">Update meshelf to read this shelf</string>
+    <string name="notice_peer_unreadable">Peer status couldn’t be read</string>
+
+    <!-- Announce and refresh results -->
+    <string name="announce_added_one">Added to 1 device</string>
+    <string name="announce_added_many">Added to %1$d devices</string>
+    <string name="announce_unavailable">%1$d unavailable</string>
+    <string name="announce_refused">%1$d refused</string>
+    <string name="announce_kept">Kept on this phone</string>
+    <string name="announce_no_devices">no devices reached</string>
+    <string name="announce_not_stored">Meshelf couldn’t keep this item</string>
+    <string name="photo_added">Photo added</string>
+    <string name="photo_sent_one">sent to 1 device</string>
+    <string name="photo_sent_many">sent to %1$d devices</string>
+    <string name="refresh_new_one">1 new item</string>
+    <string name="refresh_new_many">%1$d new items</string>
+    <string name="refresh_up_to_date">Shelf is up to date</string>
+    <string name="refresh_updated">Updated</string>
+    <string name="refresh_device_unavailable_one">1 device unavailable</string>
+    <string name="refresh_device_unavailable_many">%1$d devices unavailable</string>
+    <string name="refresh_no_devices">No devices reached</string>
+    <string name="refresh_not_stored_one">Items from 1 device couldn’t be stored</string>
+    <string name="refresh_not_stored_many">Items from %1$d devices couldn’t be stored</string>
+
+    <!-- Put on shelf -->
+    <string name="put_title">Put on shelf</string>
+    <string name="put_hint">Type text…</string>
+    <string name="put_add_text">Add text</string>
+    <string name="put_paste_add">Paste and add</string>
+    <string name="put_take_photo">Take photo</string>
+    <string name="put_choose_photo">Choose photo</string>
+    <string name="put_gallery_note">A chosen photo stays where it is; meshelf keeps access to it rather than a copy.</string>
+    <string name="put_enter_text">Type some text first</string>
+    <string name="put_text_too_large">Text is too large to add (1 MiB limit)</string>
+    <string name="put_adding">Adding…</string>
+    <string name="clipboard_no_text">Clipboard has no plain text</string>
+    <string name="camera_busy">Camera is already in use for a capture request</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_device_section">This device</string>
+    <string name="settings_rename">Rename</string>
+    <string name="settings_rename_title">Rename this device</string>
+    <string name="settings_rename_note">A new name takes effect the next time meshelf starts.</string>
+    <string name="settings_name_invalid">That name can’t be used</string>
+    <string name="settings_save_section">Save location</string>
+    <string name="settings_change">Change</string>
+    <string name="settings_reset">Reset</string>
+    <string name="settings_save_not_set">Not set</string>
+    <string name="settings_save_pre10">Choose a save folder to save files on this Android version.</string>
+    <string name="settings_folder_grant_failed">Couldn’t keep access to that folder</string>
+    <string name="settings_folder_revoked">Access to the save folder was removed. Choose it again or reset to Downloads.</string>
+    <string name="settings_background_section">Capture requests</string>
+    <string name="availability_switch">Available for capture requests in background</string>
+    <string name="availability_optional">Background availability is optional. The foreground shelf works without it.</string>
+    <string name="availability_on">Background availability is on. Its notification shows route status; the switch doesn’t prove reachability.</string>
+    <string name="availability_off">Background availability is off.</string>
+    <string name="availability_starting">Starting background availability…</string>
+    <string name="availability_stopping">Stopping background availability…</string>
+    <string name="availability_needs_notifications">Notifications are needed for background availability. The foreground shelf works without them.</string>
+    <string name="availability_failed">Background availability didn’t start</string>
+
+    <!-- Ordinary shelf camera -->
+    <string name="shelf_not_connected">Meshelf is getting ready…</string>
+    <string name="shelf_camera_purpose">This new photo goes on the shelf, not into the phone gallery.</string>
+    <string name="shelf_camera_shutter">Take photo</string>
+    <string name="shelf_camera_busy">Camera is already in use for a capture request</string>
+    <string name="camera_permission_denied">Camera permission is needed to take a photo</string>
+    <string name="camera_open_failed">Couldn’t open the camera</string>
+    <string name="camera_capture_failed">Couldn’t take the photo</string>
+    <string name="camera_add_failed">Couldn’t add the photo</string>
+</resources>

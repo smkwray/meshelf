@@ -1,0 +1,19 @@
+[package]
+name = "meshelf-tailscale"
+description = "On-demand local Tailscale status discovery for meshelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[dependencies]
+atomic-write-file.workspace = true
+meshelf-core = { path = "../meshelf-core" }
+meshelf-identity = { path = "../meshelf-identity" }
+meshelf-protocol = { path = "../meshelf-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

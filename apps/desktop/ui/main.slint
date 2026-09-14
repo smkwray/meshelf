@@ -1,0 +1,396 @@
+import {
+    Button,
+    HorizontalBox,
+    Palette,
+    ScrollView,
+    VerticalBox,
+} from "std-widgets.slint";
+
+export struct ShelfRow {
+    icon: string,
+    offer-id: string,
+    kind: string,
+    origin-device: string,
+    name: string,
+    size: string,
+    preview: string,
+    counts: string,
+    availability: string,
+    progress: string,
+    active: bool,
+    can-activate: bool,
+    can-save: bool,
+    detail: string,
+    shortcut: string,
+    save-shortcut: string,
+}
+
+export struct PeerIndicator {
+    name: string,
+    state: string,
+    display-width: length,
+}
+
+component ShelfCard inherits Rectangle {
+    in property <ShelfRow> item-data;
+    callback activated();
+    callback alternate-activated();
+    callback cancelled();
+
+    height: 70px;
+    border-radius: 7px;
+    background: touch.pressed ? #252c35 : touch.has-hover ? #20262e : #181d23;
+    border-width: 1px;
+    border-color: touch.has-hover ? #537f85 : #2a323b;
+
+    HorizontalBox {
+        padding: 8px;
+        spacing: 8px;
+        Text {
+            width: 24px;
+            text: root.item-data.icon;
+            color: #d5eeee;
+            font-size: 16px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        VerticalBox {
+            spacing: 2px;
+            Text {
+                text: root.item-data.kind + "  ·  " + root.item-data.origin-device;
+                color: #eef1f4;
+                font-size: 12px;
+                overflow: elide;
+            }
+            Text {
+                text: root.item-data.preview != "" ? root.item-data.preview : root.item-data.name;
+                color: #8f9aa5;
+                font-size: 10px;
+                overflow: elide;
+            }
+            Text {
+                text: root.item-data.size + (root.item-data.counts != "" ? "  ·  " + root.item-data.counts : "") + "  ·  " + root.item-data.availability;
+                color: #7d8995;
+                font-size: 9px;
+                overflow: elide;
+            }
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        if root.item-data.active: Text {
+            text: root.item-data.progress;
+            color: #d5eeee;
+            font-size: 9px;
+            vertical-alignment: center;
+        }
+        if root.item-data.active: Button {
+            text: "Cancel";
+            clicked => { root.cancelled(); }
+        }
+        if !root.item-data.active && root.item-data.can-save: Button {
+            text: "Save  " + root.item-data.save-shortcut;
+            enabled: root.item-data.can-activate;
+            clicked => { root.alternate-activated(); }
+        }
+        Rectangle {
+            width: 34px;
+            background: transparent;
+            Text {
+                text: root.item-data.shortcut;
+                color: #cbd2da;
+                font-size: 9px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        width: parent.width - 116px;
+        clicked => { root.activated(); }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "meshelf";
+    icon: @image-url("../../../assets/meshelf-256.png");
+    preferred-width: 460px;
+    preferred-height: 400px;
+    min-width: 360px;
+    min-height: 300px;
+    background: #111418;
+    forward-focus: keyboard;
+
+    in property <string> paste-shortcut: "Ctrl+V";
+    in property <string> refresh-shortcut: "Ctrl+R";
+    in property <string> shelf-shortcut-help: "click or Ctrl+1–5 to copy";
+    in property <[ShelfRow]> shelf-items: [];
+    in property <[PeerIndicator]> peer-indicators: [];
+    in-out property <length> peer-indicator-width: 0px;
+    in property <string> peer-overflow: "";
+    in property <length> peer-overflow-width: 0px;
+    in property <string> peer-overflow-names: "";
+    in-out property <string> status-text: "Open meshelf, then paste once to send";
+    in property <string> destination-text: "Downloads";
+
+    callback paste-and-send();
+    callback activate-offer(string, string);
+    callback cancel-activation(string);
+    callback refresh-peers();
+    callback peer-indicator-width-changed(length);
+    callback choose-folder();
+    callback reset-destination();
+
+    init => { keyboard.focus(); }
+
+    keyboard := FocusScope {
+        width: 100%;
+        height: 100%;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(event) => {
+            if (!event.repeat && (event.modifiers.control || event.modifiers.meta)) {
+                if (event.text == "v") {
+                    root.paste-and-send();
+                    return accept;
+                }
+                if (event.text == "r" || event.text == "R") {
+                    root.refresh-peers();
+                    return accept;
+                }
+                if (event.text == "1" && root.shelf-items.length > 0 && root.shelf-items[0].can-activate) {
+                    root.activate-offer(root.shelf-items[0].offer-id, "clipboard");
+                    return accept;
+                }
+                if (event.text == "2" && root.shelf-items.length > 1 && root.shelf-items[1].can-activate) {
+                    root.activate-offer(root.shelf-items[1].offer-id, "clipboard");
+                    return accept;
+                }
+                if (event.text == "3" && root.shelf-items.length > 2 && root.shelf-items[2].can-activate) {
+                    root.activate-offer(root.shelf-items[2].offer-id, "clipboard");
+                    return accept;
+                }
+                if (event.text == "4" && root.shelf-items.length > 3 && root.shelf-items[3].can-activate) {
+                    root.activate-offer(root.shelf-items[3].offer-id, "clipboard");
+                    return accept;
+                }
+                if (event.text == "5" && root.shelf-items.length > 4 && root.shelf-items[4].can-activate) {
+                    root.activate-offer(root.shelf-items[4].offer-id, "clipboard");
+                    return accept;
+                }
+            }
+            if (!event.repeat && event.modifiers.alt) {
+                if (event.text == "1" && root.shelf-items.length > 0 && root.shelf-items[0].can-save && root.shelf-items[0].can-activate) {
+                    root.activate-offer(root.shelf-items[0].offer-id, "save");
+                    return accept;
+                }
+                if (event.text == "2" && root.shelf-items.length > 1 && root.shelf-items[1].can-save && root.shelf-items[1].can-activate) {
+                    root.activate-offer(root.shelf-items[1].offer-id, "save");
+                    return accept;
+                }
+                if (event.text == "3" && root.shelf-items.length > 2 && root.shelf-items[2].can-save && root.shelf-items[2].can-activate) {
+                    root.activate-offer(root.shelf-items[2].offer-id, "save");
+                    return accept;
+                }
+                if (event.text == "4" && root.shelf-items.length > 3 && root.shelf-items[3].can-save && root.shelf-items[3].can-activate) {
+                    root.activate-offer(root.shelf-items[3].offer-id, "save");
+                    return accept;
+                }
+                if (event.text == "5" && root.shelf-items.length > 4 && root.shelf-items[4].can-save && root.shelf-items[4].can-activate) {
+                    root.activate-offer(root.shelf-items[4].offer-id, "save");
+                    return accept;
+                }
+            }
+            return reject;
+        }
+
+        VerticalBox {
+            width: 100%;
+            height: 100%;
+            padding: 12px;
+            spacing: 8px;
+
+        HorizontalBox {
+            spacing: 8px;
+            Text {
+                text: "meshelf";
+                color: #f3f5f7;
+                font-size: 20px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+                clip: true;
+                background: transparent;
+                HorizontalBox {
+                    spacing: 7px;
+                    alignment: end;
+                    for peer in root.peer-indicators: Text {
+                        width: peer.display-width;
+                        text: (peer.state == "offline" ? "○ " : "● ") + peer.name;
+                        color: peer.state == "pending"
+                            ? #78aaff
+                            : peer.state == "offline" ? #7d8995 : #76d69a;
+                        font-size: 10px;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+                    if root.peer-overflow != "": Text {
+                        width: root.peer-overflow-width;
+                        text: root.peer-overflow;
+                        color: #7d8995;
+                        font-size: 10px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                if root.peer-overflow != "": Tooltip {
+                    Text {
+                        text: root.peer-overflow-names;
+                        color: #eef1f4;
+                    }
+                }
+                changed width => {
+                    root.peer-indicator-width = self.width;
+                    root.peer-indicator-width-changed(self.width);
+                }
+            }
+            Button {
+                text: "Paste  " + root.paste-shortcut;
+                clicked => { root.paste-and-send(); }
+            }
+        }
+
+        Rectangle {
+            height: 34px;
+            border-radius: 5px;
+            background: #182025;
+            HorizontalBox {
+                padding: 6px;
+                spacing: 8px;
+                Text {
+                    text: "SAVE DESTINATION  ·  " + root.destination-text;
+                    color: #aab4be;
+                    font-size: 10px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button {
+                    text: "Choose folder…";
+                    clicked => { root.choose-folder(); }
+                }
+                Button {
+                    text: "Reset to Downloads";
+                    clicked => { root.reset-destination(); }
+                }
+            }
+        }
+
+        if root.status-text != "": Rectangle {
+            height: 30px;
+            border-radius: 5px;
+            background: #182025;
+            Text {
+                x: 9px;
+                width: parent.width - 18px;
+                height: parent.height;
+                text: root.status-text;
+                color: #9da9b3;
+                font-size: 10px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+        }
+
+        HorizontalBox {
+            Text {
+                text: "ON THIS DEVICE  ·  " + root.shelf-shortcut-help;
+                color: #8f98a4;
+                font-size: 10px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Refresh  " + root.refresh-shortcut;
+                clicked => { root.refresh-peers(); }
+            }
+        }
+
+        if root.shelf-items.length == 0: Rectangle {
+            vertical-stretch: 1;
+            min-height: 80px;
+            border-radius: 7px;
+            background: #161a20;
+            border-width: 1px;
+            border-color: #282e36;
+            VerticalBox {
+                padding: 12px;
+                alignment: center;
+                Text {
+                    text: "Shelf empty";
+                    color: #d0d5dc;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Incoming items appear here without replacing your clipboard.";
+                    color: #858e99;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        if root.shelf-items.length > 0: ScrollView {
+            vertical-stretch: 1;
+            VerticalBox {
+                spacing: 5px;
+                for row[index] in root.shelf-items: ShelfCard {
+                    item-data: row;
+                    activated => {
+                        if (row.can-activate) { root.activate-offer(row.offer-id, "clipboard"); }
+                    }
+                    alternate-activated => {
+                        if (row.can-save && row.can-activate) { root.activate-offer(row.offer-id, "save"); }
+                    }
+                    cancelled => { root.cancel-activation(row.offer-id); }
+                }
+            }
+        }
+        }
+    }
+}
+
+export component MeshelfTray inherits SystemTrayIcon {
+    in property <string> tooltip-text: "meshelf";
+    icon: Palette.color-scheme == ColorScheme.dark
+        ? @image-url("../assets/meshelf-tray-dark.png")
+        : @image-url("../assets/meshelf-tray-light.png");
+    tooltip: root.tooltip-text;
+    title: "";
+
+    callback open-window();
+    callback send-default();
+    callback quit();
+    callback tray-clicked();
+
+    clicked => { root.tray-clicked(); }
+
+    Menu {
+        MenuItem {
+            title: "Open meshelf";
+            activated => { root.open-window(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "Open meshelf to paste and send";
+            activated => { root.send-default(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "Quit";
+            activated => { root.quit(); }
+        }
+    }
+}

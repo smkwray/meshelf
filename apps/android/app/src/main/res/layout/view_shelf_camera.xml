@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Inflate only after a native ordinary-photo source lease has been reserved. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical">
+    <TextView android:id="@+id/shelf_camera_purpose" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:text="@string/shelf_camera_purpose" />
+    <androidx.camera.view.PreviewView android:id="@+id/shelf_camera_preview"
+        android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" />
+    <Button android:id="@+id/shelf_camera_shutter" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:minHeight="56dp"
+        android:text="@string/shelf_camera_shutter" />
+    <Button android:id="@+id/shelf_camera_cancel" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:minHeight="48dp" android:text="@android:string/cancel" />
+</LinearLayout>

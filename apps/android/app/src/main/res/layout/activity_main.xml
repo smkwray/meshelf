@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/shelf_root"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:background="?android:attr/colorBackground" android:orientation="vertical">
+
+    <!-- Fixed app bar: only the card region scrolls. -->
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:gravity="center_vertical" android:minHeight="56dp" android:orientation="horizontal"
+        android:paddingStart="16dp" android:paddingEnd="4dp">
+        <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+            android:accessibilityHeading="true" android:text="@string/shelf_title"
+            android:textAppearance="@style/TextAppearance.Meshelf.AppTitle" />
+        <ProgressBar android:id="@+id/refresh_progress" style="?android:attr/progressBarStyleSmall"
+            android:layout_width="20dp" android:layout_height="20dp" android:layout_marginEnd="8dp"
+            android:importantForAccessibility="no" android:visibility="gone" />
+        <ImageButton android:id="@+id/app_bar_refresh" style="@style/Widget.Meshelf.IconButton"
+            android:contentDescription="@string/action_refresh" android:src="@drawable/ic_refresh" />
+        <ImageButton android:id="@+id/app_bar_put" style="@style/Widget.Meshelf.IconButton"
+            android:contentDescription="@string/action_put_on_shelf" android:src="@drawable/ic_add" />
+        <ImageButton android:id="@+id/app_bar_settings" style="@style/Widget.Meshelf.IconButton"
+            android:contentDescription="@string/action_settings" android:src="@drawable/ic_settings" />
+    </LinearLayout>
+
+    <!-- Latest explicit peer observation only (O-018/O-019): dot + name, no labels. -->
+    <LinearLayout android:id="@+id/peer_row" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:gravity="center_vertical"
+        android:orientation="horizontal" android:paddingStart="16dp" android:paddingEnd="8dp"
+        android:visibility="gone">
+        <LinearLayout android:id="@+id/peer_chips" android:layout_width="0dp"
+            android:layout_height="wrap_content" android:layout_weight="1"
+            android:gravity="center_vertical" android:orientation="horizontal" />
+        <TextView android:id="@+id/peer_more" android:layout_width="wrap_content"
+            android:layout_height="wrap_content" android:background="?android:attr/selectableItemBackground"
+            android:gravity="center" android:minWidth="48dp" android:minHeight="48dp"
+            android:textAppearance="@style/TextAppearance.Meshelf.Secondary" android:visibility="gone" />
+    </LinearLayout>
+
+    <TextView android:id="@+id/shelf_notice" style="@style/Widget.Meshelf.Strip" android:visibility="gone" />
+    <TextView android:id="@+id/result_strip" style="@style/Widget.Meshelf.Strip" android:visibility="gone" />
+
+    <ScrollView android:id="@+id/shelf_scroll" android:layout_width="match_parent"
+        android:layout_height="0dp" android:layout_weight="1" android:fillViewport="true">
+        <FrameLayout android:layout_width="match_parent" android:layout_height="wrap_content">
+            <LinearLayout android:id="@+id/shelf_cards" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:orientation="vertical"
+                android:paddingHorizontal="12dp" android:paddingTop="4dp" android:paddingBottom="16dp" />
+
+            <LinearLayout android:id="@+id/empty_state" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:gravity="center_horizontal"
+                android:orientation="vertical" android:padding="32dp" android:visibility="gone">
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:accessibilityHeading="true" android:text="@string/empty_title"
+                    android:textAppearance="@style/TextAppearance.Meshelf.AppTitle" />
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp" android:gravity="center" android:text="@string/empty_body_items"
+                    android:textAppearance="@style/TextAppearance.Meshelf.Secondary" />
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp" android:gravity="center" android:text="@string/empty_body_clipboard"
+                    android:textAppearance="@style/TextAppearance.Meshelf.Secondary" />
+                <Button android:id="@+id/empty_put_button" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:layout_marginTop="24dp"
+                    android:minHeight="48dp" android:text="@string/empty_action" />
+            </LinearLayout>
+        </FrameLayout>
+    </ScrollView>
+</LinearLayout>

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="meshelf icon">
+  <rect width="256" height="256" rx="54" fill="#111418"/>
+  <path d="M53 64v128M203 64v128M53 178h150M82 92v61M128 72v81M174 103v50" fill="none" stroke="#F3F5F7" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="82" cy="78" r="10" fill="#76D69A"/>
+  <circle cx="174" cy="89" r="10" fill="#76D69A"/>
+</svg>

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Narrow share staging only; never the whole no_backup tree. -->
+    <cache-path name="meshelf_share" path="meshelf-share/" />
+</paths>

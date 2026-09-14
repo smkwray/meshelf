@@ -1,0 +1,30 @@
+{
+  "Version": "1.88.0",
+  "BackendState": "Running",
+  "Self": {
+    "ID": "self-node",
+    "HostName": "CEDAR",
+    "DNSName": "example.invalid.",
+    "TailscaleIPs": ["100.64.1.10", "fd7a:115c:a1e0::9"],
+    "Online": true,
+    "Active": true
+  },
+  "Peer": {
+    "nodekey:grove": {
+      "ID": "grove-node",
+      "HostName": "GROVE",
+      "DNSName": "example.invalid.",
+      "TailscaleIPs": ["100.64.1.40"],
+      "Online": false,
+      "Active": false
+    },
+    "nodekey:fern": {
+      "ID": "fern-node",
+      "HostName": "FERN",
+      "DNSName": "example.invalid.",
+      "TailscaleIPs": ["100.64.1.30"],
+      "Online": true,
+      "Active": true
+    }
+  }
+}

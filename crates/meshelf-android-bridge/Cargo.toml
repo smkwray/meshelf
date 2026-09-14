@@ -1,0 +1,28 @@
+[package]
+name = "meshelf-android-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+async-trait.workspace = true
+jni.workspace = true
+meshelf-control = { path = "../meshelf-control" }
+meshelf-core = { path = "../meshelf-core" }
+meshelf-identity = { path = "../meshelf-identity" }
+meshelf-net = { path = "../meshelf-net" }
+meshelf-protocol = { path = "../meshelf-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+meshelf-tailscale = { path = "../meshelf-tailscale" }
+tempfile.workspace = true
