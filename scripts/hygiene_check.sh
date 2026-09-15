@@ -170,6 +170,27 @@ fi
 # (Repo-local .venv/cache directories are no longer policed — they're ignored by
 # git, Syncthing, rclone, and remote runners, so they never propagate.)
 
+# Keep the actual maintainer identifiers outside Git, but scan every tracked file
+# with them. Unlike the generic pattern checks above, this intentionally includes
+# this checker so it cannot hide a real identifier in its own source.
+DENYLIST=""
+for candidate in .private-denylist .*-private-denylist; do
+  [[ -f "$candidate" ]] && DENYLIST="$candidate" && break
+done
+if [[ -z "$DENYLIST" || ! -s "$DENYLIST" ]]; then
+  echo "hygiene_check: FAIL — a nonempty ignored private denylist is required." >&2
+  violations=$((violations + 1))
+else
+  while IFS= read -r term; do
+    [[ -z "$term" || "$term" == \#* ]] && continue
+    if hits="$(git grep -n -I -F -- "$term" 2>/dev/null)"; then
+      echo "hygiene_check: FAIL — private denylist match:" >&2
+      printf '%s\n' "$hits" >&2
+      violations=$((violations + 1))
+    fi
+  done < "$DENYLIST"
+fi
+
 if [[ "$violations" -gt 0 ]]; then
   echo "hygiene_check: FAIL ($violations violation(s), $warnings warning(s))" >&2
   exit 1

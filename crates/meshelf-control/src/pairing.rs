@@ -275,7 +275,7 @@ mod tests {
         TailNode {
             node_id: node_id.map(ToOwned::to_owned),
             hostname: hostname.to_owned(),
-            dns_name: Some(format!("{hostname}example.invalid.")),
+            dns_name: Some(format!("{hostname}.example.invalid.")),
             addresses: vec![address.parse().expect("address")],
             online: true,
             active: true,
@@ -434,7 +434,7 @@ mod tests {
         for selector in [
             "amber",
             "AMBER",
-            "example.invalid",
+            "amber.example.invalid",
             "phone-node",
             "100.64.0.9",
         ] {

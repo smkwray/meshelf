@@ -1697,7 +1697,7 @@ mod tests {
         let node = TailNode {
             node_id: Some("fern-node".to_owned()),
             hostname: "FERN".to_owned(),
-            dns_name: Some("example.invalid".to_owned()),
+            dns_name: Some("fern.example.invalid".to_owned()),
             addresses: vec!["100.64.1.30".parse().expect("address")],
             online: true,
             active: true,

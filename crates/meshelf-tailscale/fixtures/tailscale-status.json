@@ -4,7 +4,7 @@
   "Self": {
     "ID": "self-node",
     "HostName": "CEDAR",
-    "DNSName": "example.invalid.",
+    "DNSName": "cedar.example.invalid.",
     "TailscaleIPs": ["100.64.1.10", "fd7a:115c:a1e0::9"],
     "Online": true,
     "Active": true
@@ -13,7 +13,7 @@
     "nodekey:grove": {
       "ID": "grove-node",
       "HostName": "GROVE",
-      "DNSName": "example.invalid.",
+      "DNSName": "grove.example.invalid.",
       "TailscaleIPs": ["100.64.1.40"],
       "Online": false,
       "Active": false
@@ -21,7 +21,7 @@
     "nodekey:fern": {
       "ID": "fern-node",
       "HostName": "FERN",
-      "DNSName": "example.invalid.",
+      "DNSName": "fern.example.invalid.",
       "TailscaleIPs": ["100.64.1.30"],
       "Online": true,
       "Active": true
