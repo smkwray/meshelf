@@ -148,7 +148,10 @@ def main() -> int:
     scope.add_argument("--repo", action="store_true")
     scope.add_argument("--outgoing", action="store_true")
     args = parser.parse_args()
-    root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip())
+    try:
+        root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip())
+    except subprocess.CalledProcessError:
+        root = Path(git(Path.cwd(), "rev-parse", "--git-dir").decode().strip()).resolve()
     try:
         if args.public_ci:
             if args.require_private or args.cached or args.repo or args.outgoing:
