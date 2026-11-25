@@ -4,104 +4,64 @@
   <img src="assets/meshelf-256.png" alt="meshelf logo" width="160">
 </p>
 
-meshelf is a small, symmetric, peer-to-peer offer shelf for devices connected through Tailscale.
-There is no controller, server, primary, leader, canonical store, or mandatory relay.
+meshelf shares text, files and folders between your own devices over [Tailscale](https://tailscale.com), and photos from an Android phone. Paste an item into the meshelf window on one device and a card for it appears on your other devices; the data moves directly from the sending device when you open the card on another. There is no server, and meshelf reads your clipboard only when you paste into its window or run a command.
 
-The current production composition speaks protocol 2 only:
+meshelf is an early test version. There are no published binaries, so you build it from source, and those builds are unsigned. Desktop transfers have been tested between macOS and Windows, Linux desktop builds are untested, and the Android app has been tested on one phone. Do not use it for passwords, keys or other sensitive material.
+
+Any meshelf installation on your tailnet with a valid signed identity joins your shelf automatically when you refresh, without a pairing code, so use meshelf only on a tailnet whose devices you control. meshelf listens only on the device's Tailscale address, on TCP port 45832. See [SECURITY.md](SECURITY.md).
+
+## Use
 
 ```text
 sender:   focus meshelf -> press Cmd/Ctrl+V once
 receiver: open the shelf -> activate a card or press Cmd/Ctrl+1–5
 ```
 
-The sender stores text captured at the explicit paste and announces bounded metadata to its paired
-peers. File and folder offers store a canonical path and metadata commitment, never a sender payload
-copy. Every receiver may store a metadata card; payload bytes move only when that receiver activates
-the card and pulls them directly from the origin. A failed direct operation is not queued or resumed.
+| Keys | Action |
+|---|---|
+| Cmd/Ctrl+V | Offer the clipboard's text, files or folders to your other devices |
+| Cmd/Ctrl+1 to 5 | Copy that card's item to the local clipboard |
+| Alt/Option+1 to 5 | Save that card's file or folder to the save destination (Downloads unless you choose another folder) |
+| Cmd/Ctrl+R | Refresh the list of reachable devices |
 
-The shelf retains ten live entries per device; the eleventh purges the oldest and there is no
-time-based expiry. Text cards show a bounded 256-byte UTF-8 preview. File/folder cards can activate
-to the local native clipboard or to Downloads/the configured absolute save destination. The status
-line reports peers that answered the latest reachability probe, not every paired device.
+Each device keeps its ten most recent items, and an eleventh replaces the oldest. Text can be up to 1 MiB, a file up to 8 GiB, and a folder up to 4,096 entries and 16 GiB. A file or folder is offered from where it sits on disk, not copied, so keep it in place and unchanged until the other device has opened it, and keep the sending device running until then.
 
-Clipboard reads are explicit only: an active-window control or a foreground command the user typed.
-Copy events, idle polling, discovery timers, network heartbeats, global hotkeys, notifications, and
-start-at-login are not part of the contract.
+The Android app puts typed or pasted text, camera photos and gallery picks on the shelf, and copies, saves or shares an item when you tap it. It cannot save folders; zip the folder first. It is reachable only while open, unless you turn on background availability, which switches off whenever the app restarts. A computer can ask the phone for a photo with `meshelfctl capture photo --peer PHONE --purpose TEXT --output PATH`; the phone opens its camera and sends nothing until you press the shutter.
 
-This is an early functional candidate, not a production-ready release. Desktop transfers have been
-exercised between macOS and Windows machines, and the Android app is in device testing on a single
-phone. Full native failure-mode proof, recovery and resource hardening, Linux desktop evidence, and the
-security and release review remain open. Admission is an interim functional-testing policy; see
-`SECURITY.md`. Do not use this candidate for sensitive material.
+## Build and install
 
-## Candidate releases
+You need [rustup](https://rustup.rs) (the bootstrap script installs the toolchain pinned in `rust-toolchain.toml`), Python 3, and Tailscale running on every device.
 
-No candidate binaries are currently published. Build from source with the commands below; any build you
-make is unsigned and carries the limitations above.
+On macOS, this builds `meshelf.app` and installs it in `~/Applications`:
 
-## Start here
+```bash
+./scripts/bootstrap.sh
+./scripts/package-macos.sh --install
+```
 
-1. Read [`START_HERE.md`](START_HERE.md), [`SECURITY.md`](SECURITY.md), and [`CONTRIBUTING.md`](CONTRIBUTING.md).
-2. Read the crate source and tests for the area you intend to change.
-3. Run the platform-appropriate bootstrap and check command before submitting a change.
+On Windows, this installs meshelf in `%LOCALAPPDATA%\Programs\meshelf`, adds desktop and Start menu shortcuts, and puts `meshelfctl` on your `PATH`. `uninstall-windows.ps1` in that folder removes it.
+
+```bat
+scripts\bootstrap.bat
+powershell -ExecutionPolicy Bypass -File scripts\package-windows.ps1 -Install
+```
+
+To run from the checkout instead, use `./scripts/dev.sh` (`scripts\dev.bat` on Windows). `./scripts/check.sh` (`scripts\check.bat`) runs formatting, lint and tests. Linux desktop builds may need extra native packages from your distribution. The Android app builds on Linux; see [apps/android/README.md](apps/android/README.md).
+
+`meshelfctl` is a command-line client for the same actions; run it without arguments to see its commands.
 
 ## Repository map
 
 ```text
-apps/desktop/             Slint desktop UI and tray shell
-apps/android/             Android shelf peer and capture-request app
-apps/meshelfctl/          Headless resident and explicit CLI operations
-crates/meshelf-core/      Domain, offer, activation, and destination semantics
-crates/meshelf-control/   Offer planning, local control, and composition
-crates/meshelf-net/       Protocol-2 announcement/fetch transport
-crates/meshelf-platform/  Clipboard and filesystem adapters
-crates/meshelf-protocol/  Version-2 messages and bounded framing
-crates/meshelf-store/     redb v2 offer/card/activation storage
-crates/meshelf-tailscale/ On-demand discovery and peer state
-crates/meshelf-android-bridge/  Android JNI bridge (ABI 8) and phone resident host
-tools/meshelf-sim/        Local simulation
-config/                   Example state shape and Tailscale policy
-scripts/                  Bootstrap, validation, packaging, and source-archive helpers
+apps/desktop/        Desktop window and tray app (Slint)
+apps/android/        Android app
+apps/meshelfctl/     Command-line client and headless resident
+crates/              Shared Rust libraries: offers, storage, network protocol, Tailscale discovery, clipboard and file adapters
+tools/meshelf-sim/   Local simulation
+config/              Example state file and an optional Tailscale access rule
+scripts/             Bootstrap, checks, packaging and install scripts
 ```
 
-## Build commands
+## License
 
-macOS/Linux:
-
-```bash
-./scripts/bootstrap.sh
-./scripts/check.sh
-./scripts/dev.sh
-```
-
-Windows:
-
-```bat
-scripts\bootstrap.bat
-scripts\check.bat
-scripts\dev.bat
-```
-
-The pinned toolchain is in `rust-toolchain.toml`. Linux desktop builds may require additional
-native packages from the platform package manager.
-
-## Current implementation boundary
-
-The source includes bounded text and native file/folder offers, signed protocol-2 hellos, Tailscale-
-only listener binding, metadata announcements, receiver-initiated fetch, descriptor/manifest/hash
-validation, atomic no-replace publication, startup migration/cleanup, explicit clipboard/save
-activation, and local simulation/tests.
-
-The Android app is a shelf peer. It puts typed or pasted text, camera photos, and gallery picks on
-the shelf, lists offers from other devices, and copies, saves, or shares one only when the user taps
-it. It cannot save a folder; zip the folder on the computer and send the zip. It also answers a
-photo request from a desktop command: the camera opens and the shutter is the user's consent. The
-app links the Rust bridge over JNI ABI 8 and has been exercised on one Android phone only. There is
-no signed or store distribution.
-
-An uncertain platform action (for example a copy or save whose result was never reported) is never
-repeated; it blocks only that item, and other items keep working.
-
-The candidate still needs the complete native failure and recovery proof, broader security and release
-review, Linux desktop evidence, and wider mobile-device testing. Do not infer those from a local green
-source check or from individual device trials.
+MIT. See [LICENSE.md](LICENSE.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
