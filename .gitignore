@@ -78,3 +78,4 @@ build/
 
 # Maintainer-local list of identifiers that must never be published
 /.meshelf-private-denylist
+/.private-denylist
